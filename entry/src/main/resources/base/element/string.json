@@ -1,0 +1,40 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "IPCamera RTSP streaming module"
+    },
+    {
+      "name": "entry_ability_desc",
+      "value": "IPCamera main ability"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "IPCamera"
+    },
+    {
+      "name": "permission_internet_reason",
+      "value": "RTSP streaming requires network access"
+    },
+    {
+      "name": "permission_wifi_info_reason",
+      "value": "Show the device IP address for the RTSP URL"
+    },
+    {
+      "name": "permission_camera_reason",
+      "value": "Stream the camera picture over RTSP"
+    },
+    {
+      "name": "permission_mic_reason",
+      "value": "Stream the microphone audio over RTSP"
+    },
+    {
+      "name": "permission_background_reason",
+      "value": "Keep RTSP streaming alive in background"
+    },
+    {
+      "name": "permission_location_reason",
+      "value": "Show GPS coordinates on the OSD overlay"
+    }
+  ]
+}

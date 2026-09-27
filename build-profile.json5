@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\24790\\.ohos\\config\\default_harmony-IPCamera_f8WBZrKl55Fl0OupqHv36Nx9cVaqa34lU9LTTxUtTdA=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BCD39544CAE9ACAE85103C61D60D15C3400ECD2C3AC9C16030597B5EF374C63D542FC4006215A93",
+          "profile": "C:\\Users\\24790\\.ohos\\config\\default_harmony-IPCamera_f8WBZrKl55Fl0OupqHv36Nx9cVaqa34lU9LTTxUtTdA=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\24790\\.ohos\\config\\default_harmony-IPCamera_f8WBZrKl55Fl0OupqHv36Nx9cVaqa34lU9LTTxUtTdA=.p12",
+          "storePassword": "0000001B17D0A117D1FD7467ABFDB82B567CD14ED757843CFA6AE10048F7A5562345E9101547BB9F21543B"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "targetSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

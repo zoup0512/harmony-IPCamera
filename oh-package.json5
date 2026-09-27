@@ -1,0 +1,11 @@
+{
+  "modelVersion": "6.1.0",
+  "name": "harmony_ipcamera",
+  "version": "1.0.0",
+  "description": "IPCamera HarmonyOS port - RTSP streaming POC",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {}
+}

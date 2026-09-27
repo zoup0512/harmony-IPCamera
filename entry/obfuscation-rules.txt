@@ -1,0 +1,1 @@
+# Obfuscation disabled for the POC; rules file kept for buildOptionSet reference.
