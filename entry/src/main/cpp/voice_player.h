@@ -2,29 +2,37 @@
 #define IPCAMERA_VOICE_PLAYER_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
-#include <string>
-#include <vector>
 
 namespace ipcam {
 
-// Talk-back playback for /put_voice: HTTP body is a stream of AAC ADTS
-// frames; frames are decoded with the system AAC decoder and the PCM is
-// played through OH_AudioRenderer (callback-driven pull from a ring buffer).
+// Talk-back playback for /put_voice: HTTP bodies contain AAC ADTS bytes. Feed
+// accepts arbitrary chunk boundaries and queues complete raw AAC frames for the
+// system decoder.
 class VoicePlayer {
  public:
+  enum class FeedResult {
+    Accepted,
+    Invalid,
+    Busy,
+    Unavailable,
+  };
+
+  VoicePlayer();
   ~VoicePlayer();
-  // Feed a chunk of the uploaded body (ADTS frames; may contain partial
-  // frames — chunks are concatenated internally).
-  void Feed(const uint8_t* data, size_t size);
+
+  FeedResult Feed(const uint8_t* data, size_t size);
   void Stop();
   bool Active() const { return active_.load(); }
 
   struct Impl;
 
  private:
-  Impl* impl_ = nullptr;
+  std::mutex apiMu_;
+  std::unique_ptr<Impl> impl_;
   std::atomic<bool> active_{false};
 };
 

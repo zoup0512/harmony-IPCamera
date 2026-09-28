@@ -30,6 +30,7 @@ export const rtspSendAdts: (server: object, data: ArrayBuffer, tsUs: number) => 
  */
 export const rtspSetStatusCallback: (server: object,
   callback: (event: number, clients: number, detail: string) => void) => void;
+export const rtspClearStatusCallback: (server: object) => void;
 
 /** Feed an internally encoded color-bar test pattern (OH_AVCodec H.264) into the server. */
 export const rtspStartTestPattern: (server: object, width: number, height: number,
@@ -47,7 +48,7 @@ export const rtspStartMic: (server: object) => boolean;
 export const rtspStopMic: (server: object) => void;
 
 /** Publish the same video/audio to an RTMP URL (rtmp://host[:port]/app/streamKey). */
-export const rtmpStart: (server: object, url: string) => boolean;
+export const rtmpStart: (server: object, url: string) => Promise<boolean>;
 export const rtmpStop: (server: object) => void;
 
 /** Record the shared streams into an MP4 file (H.264/H.265 + AAC). */

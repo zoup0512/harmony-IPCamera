@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "media_time.h"
+
 namespace ipcam {
 
 struct RtspConfig {
@@ -46,8 +48,8 @@ class RtspServer {
   bool IsRunning() const { return running_.load(); }
   int ClientCount();
 
-  void PushH264(const uint8_t* data, size_t size, uint64_t tsUs);
-  void PushAdts(const uint8_t* data, size_t size, uint64_t tsUs);
+  void PushH264(const uint8_t* data, size_t size, TimestampUs tsUs);
+  void PushAdts(const uint8_t* data, size_t size, TimestampUs tsUs);
 
   struct VideoParams {
     bool h265 = false;
@@ -65,7 +67,7 @@ class RtspServer {
 
   void AcceptLoop();
   void AddSession(const std::shared_ptr<Session>& session);
-  void RemoveSession(Session* session);
+  void ReapFinishedSessions();
   void Notify(RtspEvent event, int clients, const std::string& detail);
   std::string BuildSdp() const;
 
@@ -89,11 +91,13 @@ class RtspServer {
   AacInfo GetAacInfo() const;
   void UpdateAacInfo(int profile, int sfIndex, int channels);
 
-  static uint64_t NowUs();
+  static TimestampUs NowUs();
 
   std::atomic<bool> running_{false};
-  int listenFd_ = -1;
+  std::atomic<int> listenFd_{-1};
+  mutable std::mutex lifecycleMu_;
   std::thread acceptThread_;
+  mutable std::mutex configMu_;
   RtspConfig config_{};
 
   mutable std::mutex sessionsMu_;

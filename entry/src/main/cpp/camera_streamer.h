@@ -16,6 +16,8 @@
 #include <ohcamera/capture_session.h>
 #include <ohcamera/preview_output.h>
 
+#include "media_time.h"
+
 namespace ipcam {
 
 class OsdPipeline;
@@ -28,7 +30,7 @@ class OsdPipeline;
 // Replaces the test pattern of the POC with real device camera content.
 class CameraStreamer {
  public:
-  using FrameSink = std::function<void(const uint8_t*, size_t, uint64_t)>;
+  using FrameSink = std::function<void(const uint8_t*, size_t, TimestampUs)>;
   using ErrorSink = std::function<void(const std::string&)>;
 
   CameraStreamer();

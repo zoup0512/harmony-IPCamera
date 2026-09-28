@@ -1,5 +1,6 @@
 import { createRtspServer, rtspStart, rtspStop, rtspIsRunning, rtspClientCount,
-  rtspSendH264, rtspSendAdts, rtspSetStatusCallback, rtspStartTestPattern,
+  rtspSendH264, rtspSendAdts, rtspSetStatusCallback, rtspClearStatusCallback,
+  rtspStartTestPattern,
   rtspStopTestPattern, rtspStartCamera, rtspStopCamera, rtspStartMic, rtspStopMic,
   rtmpStart, rtmpStop, rtspStartRecord, rtspStopRecord, rtspTakeSnapshot,
   rtspStartHttp, rtspStopHttp, rtspSetMotion, rtspSetMotionTimeout,
@@ -49,6 +50,10 @@ export class RtspServer {
     rtspSetStatusCallback(this.handle, callback);
   }
 
+  clearStatusCallback(): void {
+    rtspClearStatusCallback(this.handle);
+  }
+
   startTestPattern(width: number, height: number, fps: number, bitrate: number): boolean {
     return rtspStartTestPattern(this.handle, width, height, fps, bitrate);
   }
@@ -75,7 +80,7 @@ export class RtspServer {
     rtspStopMic(this.handle);
   }
 
-  startRtmp(url: string): boolean {
+  startRtmp(url: string): Promise<boolean> {
     return rtmpStart(this.handle, url);
   }
 

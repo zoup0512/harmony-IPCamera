@@ -16,6 +16,8 @@
 
 #include "osd_pipeline.h"
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "CameraStreamer"
 
@@ -99,8 +101,7 @@ void CameraStreamer::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuffer*
       sink = self->sink_;
     }
     if (sink) {
-      sink(OH_AVBuffer_GetAddr(buffer), static_cast<size_t>(attr.size),
-           static_cast<uint64_t>(attr.pts));
+      sink(OH_AVBuffer_GetAddr(buffer), static_cast<size_t>(attr.size), attr.pts);
     }
   }
   OH_VideoEncoder_FreeOutputBuffer(self->encoder_, index);
@@ -154,11 +155,12 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
     sink_ = std::move(sink);
     onError_ = std::move(onError);
   }
+  std::string mime = mimeType != nullptr ? mimeType : "video/avc";
   lastWidth_ = width;
   lastHeight_ = height;
   lastBitrate_ = bitrate;
   lastIFrameMs_ = iFrameIntervalMs > 0 ? iFrameIntervalMs : 2000;
-  lastMime_ = mimeType;
+  lastMime_ = mime;
   lastFront_ = frontCamera;
   lastOsd_ = osdEnabled;
   if (previewSurfaceId != 0) {
@@ -220,7 +222,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   // NOTE: devices/capability stay alive until the camera input is created below
   // (chosen points into the devices array).
 
-  encoder_ = OH_VideoEncoder_CreateByMime(mimeType);
+  encoder_ = OH_VideoEncoder_CreateByMime(mime.c_str());
   if (encoder_ == nullptr) {
     Fail("CreateVideoEncoder", 0);
     Cleanup();

@@ -4,8 +4,10 @@
 #include <atomic>
 #include <functional>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ipcam {
@@ -16,19 +18,25 @@ namespace ipcam {
 // so ArkTS never blocks.
 class Snapshotter {
  public:
+  ~Snapshotter();
   void FeedVideo(const uint8_t* data, size_t size);  // Annex-B, both codecs
   // Inject parameter sets captured at stream start (Annex-B built by caller).
   void SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB);
   // Asynchronous: spawns a thread, reports via the returned... fire-and-forget.
   void CaptureAsync(const std::string& bmpPath, int width, int height,
                     std::function<void(bool, const std::string&)> done);
+  void Stop();
 
  private:
-  void DecodeWorker(std::string bmpPath, int width, int height,
-                    std::function<void(bool, const std::string&)> done,
-                    std::vector<uint8_t> params, std::vector<uint8_t> idr, bool h265);
+  static void DecodeWorker(std::string bmpPath, int width, int height,
+                           std::function<void(bool, const std::string&)> done,
+                           std::vector<uint8_t> params, std::vector<uint8_t> idr, bool h265);
 
   std::mutex stateMu_;
+  std::mutex workerMu_;
+  std::thread worker_;
+  std::shared_ptr<std::atomic<bool>> workerBusy_ =
+      std::make_shared<std::atomic<bool>>(false);
   bool h265_ = false;
   std::vector<uint8_t> params_;  // Annex-B: VPS+SPS+PPS or SPS+PPS
   std::vector<uint8_t> lastIdr_; // Annex-B IDR frame

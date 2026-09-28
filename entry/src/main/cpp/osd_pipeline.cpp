@@ -1,6 +1,8 @@
 #include "osd_pipeline.h"
 
 #include <cstring>
+#include <limits>
+#include <new>
 #include <string>
 #include <unistd.h>
 #include <poll.h>
@@ -9,6 +11,8 @@
 #include <native_buffer/native_buffer.h>
 #include <native_window/external_window.h>
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "OsdPipeline"
 
@@ -16,6 +20,23 @@ namespace {
 
 constexpr uint64_t kCpuUsage =
     NATIVEBUFFER_USAGE_CPU_READ | NATIVEBUFFER_USAGE_CPU_WRITE;
+
+bool CheckedMul(size_t a, size_t b, size_t* result) {
+  if (result == nullptr ||
+      (a != 0 && b > std::numeric_limits<size_t>::max() / a)) {
+    return false;
+  }
+  *result = a * b;
+  return true;
+}
+
+bool CheckedAdd(size_t a, size_t b, size_t* result) {
+  if (result == nullptr || b > std::numeric_limits<size_t>::max() - a) {
+    return false;
+  }
+  *result = a + b;
+  return true;
+}
 
 // BT.601 limited range. Good enough for OSD text/watermark color fidelity.
 inline void RgbToYuv(int r, int g, int b, uint8_t* y, uint8_t* u, uint8_t* v) {
@@ -119,8 +140,6 @@ void OsdPipeline::Fail(const char* what) {
 
 bool OsdPipeline::Start(int outWidth, int outHeight, uint64_t* cameraSurfaceId,
                         FrameSink sink, ErrorSink onError) {
-  outW_ = outWidth;
-  outH_ = outHeight;
   {
     std::lock_guard<std::mutex> lk(mu_);
     sink_ = std::move(sink);
@@ -130,7 +149,34 @@ bool OsdPipeline::Start(int outWidth, int outHeight, uint64_t* cameraSurfaceId,
     initOk_ = false;
     cameraSurfaceId_ = 0;
   }
-  nv12_.assign(static_cast<size_t>(outW_) * outH_ * 3 / 2, 0);
+  if (outWidth <= 0 || outHeight <= 0 || (outWidth & 1) != 0 ||
+      (outHeight & 1) != 0) {
+    Fail("invalid OSD output dimensions");
+    return false;
+  }
+  size_t outputYBytes = 0;
+  size_t outputUvBytes = 0;
+  size_t outputBytes = 0;
+  if (!CheckedMul(static_cast<size_t>(outWidth), static_cast<size_t>(outHeight),
+                  &outputYBytes) ||
+      !CheckedMul(static_cast<size_t>(outWidth),
+                  static_cast<size_t>(outHeight / 2), &outputUvBytes) ||
+      !CheckedAdd(outputYBytes, outputUvBytes, &outputBytes)) {
+    Fail("OSD output buffer size overflow");
+    return false;
+  }
+  if (outputBytes > nv12_.max_size()) {
+    Fail("OSD output buffer size is unsupported");
+    return false;
+  }
+  outW_ = outWidth;
+  outH_ = outHeight;
+  try {
+    nv12_.assign(outputBytes, 0);
+  } catch (const std::bad_alloc&) {
+    Fail("OSD output buffer allocation failed");
+    return false;
+  }
 
   // CPU-consumer surface. Created with OH_NativeImage_Create (same queue
   // flavor the GL path used — the camera produces into it stably);
@@ -226,12 +272,62 @@ void OsdPipeline::CompositeOne() {
     OH_NativeImage_ReleaseNativeWindowBuffer(image_, latest, -1);
     return;
   }
-  bool nv21Cam = (ch->format == static_cast<int>(NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP));
+  const int camW = ch->width;
+  const int camH = ch->height;
+  const int camStride = ch->stride;
+  const bool nv12Cam =
+      ch->format == static_cast<int>(NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP);
+  const bool nv21Cam =
+      ch->format == static_cast<int>(NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP);
+  auto dropInvalid = [&](const char* reason) {
+    OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
+                 "drop camera buffer: %{public}s (w=%{public}d h=%{public}d "
+                 "stride=%{public}d size=%{public}d fmt=%{public}d)",
+                 reason, camW, camH, camStride, ch->size, ch->format);
+    OH_NativeImage_ReleaseNativeWindowBuffer(image_, latest, -1);
+  };
+  if (!nv12Cam && !nv21Cam) {
+    dropInvalid("unsupported format");
+    return;
+  }
+  if (camW <= 0 || camH <= 0 || (camW & 1) != 0 || (camH & 1) != 0 ||
+      camStride < camW) {
+    dropInvalid("invalid dimensions or stride");
+    return;
+  }
+
+  size_t camYBytes = 0;
+  size_t camUvBytes = 0;
+  size_t camBytes = 0;
+  if (!CheckedMul(static_cast<size_t>(camStride), static_cast<size_t>(camH),
+                  &camYBytes) ||
+      !CheckedMul(static_cast<size_t>(camStride),
+                  static_cast<size_t>(camH / 2), &camUvBytes) ||
+      !CheckedAdd(camYBytes, camUvBytes, &camBytes) || ch->size < 0 ||
+      static_cast<size_t>(ch->size) < camBytes) {
+    dropInvalid("buffer is too small or size overflowed");
+    return;
+  }
+
+  size_t outputYBytes = 0;
+  size_t outputUvBytes = 0;
+  size_t outputBytes = 0;
+  if (outW_ <= 0 || outH_ <= 0 || (outW_ & 1) != 0 || (outH_ & 1) != 0 ||
+      !CheckedMul(static_cast<size_t>(outW_), static_cast<size_t>(outH_),
+                  &outputYBytes) ||
+      !CheckedMul(static_cast<size_t>(outW_), static_cast<size_t>(outH_ / 2),
+                  &outputUvBytes) ||
+      !CheckedAdd(outputYBytes, outputUvBytes, &outputBytes) ||
+      nv12_.size() < outputBytes) {
+    dropInvalid("invalid OSD output buffer");
+    return;
+  }
+
   ++frameCount_;
   if (frameCount_ <= 2 || frameCount_ % 300 == 0) {
     OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
                  "cam %{public}dx%{public}d stride=%{public}d fmt=%{public}d frame=%{public}d",
-                 ch->width, ch->height, ch->stride, ch->format, frameCount_);
+                 camW, camH, camStride, ch->format, frameCount_);
   }
 
   OsdSnapshot snap = GetOsd();
@@ -239,33 +335,47 @@ void OsdPipeline::CompositeOne() {
 
   // 1) Copy the camera frame into the tightly packed NV12 target (output is
   //    always NV12; a camera NV21 source gets its UV pair swapped).
-  const int camW = ch->width;
-  const int camH = ch->height;
-  const int camStride = ch->stride;
   const uint8_t* camY = camAddr;
-  const uint8_t* camUv = camY + static_cast<size_t>(camStride) * camH;
-
+  const uint8_t* camUv = camY + camYBytes;
   uint8_t* encY = nv12_.data();
-  uint8_t* encUv = encY + static_cast<size_t>(outW_) * outH_;
-  const int sameSize = (camW == outW_ && camH == outH_);
+  uint8_t* encUv = encY + outputYBytes;
+  const bool sameSize = camW == outW_ && camH == outH_;
   for (int row = 0; row < outH_; ++row) {
-    int sy = sameSize ? row : row * camH / outH_;
+    int sy = sameSize
+                 ? row
+                 : static_cast<int>(static_cast<int64_t>(row) * camH / outH_);
     const uint8_t* srcY = camY + static_cast<size_t>(camStride) * sy;
     uint8_t* dstY = encY + static_cast<size_t>(outW_) * row;
     if (sameSize) {
       memcpy(dstY, srcY, static_cast<size_t>(outW_));
     } else {
-      for (int x = 0; x < outW_; ++x) dstY[x] = srcY[x * camW / outW_];
+      for (int x = 0; x < outW_; ++x) {
+        int sx =
+            static_cast<int>(static_cast<int64_t>(x) * camW / outW_);
+        dstY[x] = srcY[sx];
+      }
     }
   }
-  for (int row = 0; row < (outH_ + 1) / 2; ++row) {
-    int sy = sameSize ? row : row * ((camH + 1) / 2) / ((outH_ + 1) / 2);
+
+  const int outChromaW = outW_ / 2;
+  const int outChromaH = outH_ / 2;
+  const int camChromaW = camW / 2;
+  const int camChromaH = camH / 2;
+  for (int row = 0; row < outChromaH; ++row) {
+    int sy = sameSize ? row
+                      : static_cast<int>(static_cast<int64_t>(row) * camChromaH /
+                                         outChromaH);
     const uint8_t* srcUv = camUv + static_cast<size_t>(camStride) * sy;
     uint8_t* dstUv = encUv + static_cast<size_t>(outW_) * row;
-    for (int x = 0; x < outW_; ++x) {
-      int sx = x * camW / outW_;
-      dstUv[x * 2] = nv21Cam ? srcUv[sx * 2 + 1] : srcUv[sx * 2];
-      dstUv[x * 2 + 1] = nv21Cam ? srcUv[sx * 2] : srcUv[sx * 2 + 1];
+    for (int pair = 0; pair < outChromaW; ++pair) {
+      int sx = sameSize
+                   ? pair
+                   : static_cast<int>(static_cast<int64_t>(pair) * camChromaW /
+                                      outChromaW);
+      size_t srcOffset = static_cast<size_t>(sx) * 2;
+      size_t dstOffset = static_cast<size_t>(pair) * 2;
+      dstUv[dstOffset] = nv21Cam ? srcUv[srcOffset + 1] : srcUv[srcOffset];
+      dstUv[dstOffset + 1] = nv21Cam ? srcUv[srcOffset] : srcUv[srcOffset + 1];
     }
   }
 
@@ -329,13 +439,36 @@ void OsdPipeline::BlendRgbaIntoYuv(const uint8_t* rgba, int srcW, int srcH,
                                    int dstH, uint8_t* yPlane, uint8_t* uvPlane,
                                    int yStride, int uvStride, int frameW,
                                    int frameH) {
-  int x0 = dstX < 0 ? 0 : dstX;
-  int y0 = dstY < 0 ? 0 : dstY;
-  int x1 = dstX + dstW > frameW ? frameW : dstX + dstW;
-  int y1 = dstY + dstH > frameH ? frameH : dstY + dstH;
+  if (rgba == nullptr || yPlane == nullptr || uvPlane == nullptr || srcW <= 0 ||
+      srcH <= 0 || dstW <= 0 || dstH <= 0 || frameW <= 0 || frameH <= 0 ||
+      (frameW & 1) != 0 || (frameH & 1) != 0 || yStride <= 0 ||
+      uvStride <= 0 || yStride < frameW || uvStride < frameW) {
+    return;
+  }
+  size_t checkedBytes = 0;
+  if (!CheckedMul(static_cast<size_t>(srcW), static_cast<size_t>(srcH),
+                  &checkedBytes) ||
+      !CheckedMul(checkedBytes, static_cast<size_t>(4), &checkedBytes) ||
+      !CheckedMul(static_cast<size_t>(yStride), static_cast<size_t>(frameH),
+                  &checkedBytes) ||
+      !CheckedMul(static_cast<size_t>(uvStride),
+                  static_cast<size_t>(frameH / 2), &checkedBytes)) {
+    return;
+  }
+  int64_t dstRight = static_cast<int64_t>(dstX) + dstW;
+  int64_t dstBottom = static_cast<int64_t>(dstY) + dstH;
+  int x0 = dstX <= 0 ? 0 : (dstX >= frameW ? frameW : dstX);
+  int y0 = dstY <= 0 ? 0 : (dstY >= frameH ? frameH : dstY);
+  int x1 = dstRight <= 0
+               ? 0
+               : (dstRight >= frameW ? frameW : static_cast<int>(dstRight));
+  int y1 = dstBottom <= 0
+               ? 0
+               : (dstBottom >= frameH ? frameH : static_cast<int>(dstBottom));
+  if (x0 >= x1 || y0 >= y1) return;
   auto sample = [&](int px, int py, int* r, int* g, int* b, int* a) {
-    int sx = (px - dstX) * srcW / dstW;
-    int sy = (py - dstY) * srcH / dstH;
+    int sx = static_cast<int>((static_cast<int64_t>(px) - dstX) * srcW / dstW);
+    int sy = static_cast<int>((static_cast<int64_t>(py) - dstY) * srcH / dstH);
     const uint8_t* s = rgba + (static_cast<size_t>(sy) * srcW + sx) * 4;
     int alpha = s[3];
     if (premul && alpha > 0) {
@@ -354,6 +487,7 @@ void OsdPipeline::BlendRgbaIntoYuv(const uint8_t* rgba, int srcW, int srcH,
       long sr = 0, sg = 0, sb = 0;
       int n = 0;
       for (int py = by; py < by + 2 && py < y1; ++py) {
+        if (py < y0) continue;
         for (int px = bx; px < bx + 2 && px < x1; ++px) {
           if (px < x0) continue;
           uint8_t* yp = yPlane + static_cast<size_t>(yStride) * py + px;

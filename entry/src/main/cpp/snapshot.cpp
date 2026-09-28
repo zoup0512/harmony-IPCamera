@@ -159,6 +159,8 @@ void OnDecStreamChange(OH_AVCodec*, OH_AVFormat*, void*) {}
 
 }  // namespace
 
+Snapshotter::~Snapshotter() { Stop(); }
+
 void Snapshotter::FeedVideo(const uint8_t* data, size_t size) {
   if (data == nullptr || size < 5) return;
   std::vector<NalView> nals = SplitAnnexB(data, size);
@@ -213,9 +215,36 @@ void Snapshotter::CaptureAsync(const std::string& bmpPath, int width, int height
     if (done) done(false, "no keyframe cached yet");
     return;
   }
-  std::thread([this, bmpPath, width, height, done, params, idr, h265]() {
-    DecodeWorker(bmpPath, width, height, done, params, idr, h265);
-  }).detach();
+  if (workerBusy_->exchange(true)) {
+    if (done) done(false, "snapshot already in progress");
+    return;
+  }
+  std::lock_guard<std::mutex> workerLock(workerMu_);
+  if (worker_.joinable()) worker_.join();
+  try {
+    auto busy = workerBusy_;
+    worker_ = std::thread([busy, bmpPath, width, height, done, params, idr, h265]() {
+      Snapshotter::DecodeWorker(bmpPath, width, height, done, params, idr, h265);
+      busy->store(false);
+    });
+  } catch (...) {
+    workerBusy_->store(false);
+    if (done) done(false, "snapshot worker start failed");
+  }
+}
+
+void Snapshotter::Stop() {
+  std::thread worker;
+  {
+    std::lock_guard<std::mutex> workerLock(workerMu_);
+    if (worker_.joinable()) worker = std::move(worker_);
+  }
+  if (!worker.joinable()) return;
+  if (worker.get_id() == std::this_thread::get_id()) {
+    worker.detach();
+  } else {
+    worker.join();
+  }
 }
 
 void Snapshotter::DecodeWorker(std::string bmpPath, int width, int height,

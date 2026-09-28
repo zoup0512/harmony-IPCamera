@@ -11,6 +11,8 @@
 #include <ohaudio/native_audiostream_base.h>
 #include <ohaudio/native_audiostreambuilder.h>
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "MicStreamer"
 
@@ -57,37 +59,21 @@ void MicStreamer::Fail(const std::string& what, int err) {
 int32_t MicStreamer::OnReadData(OH_AudioCapturer*, void* userData, void* buffer,
                                 int32_t bufferLen) {
   auto self = static_cast<MicStreamer*>(userData);
-  if (buffer != nullptr && bufferLen > 0) {
+  if (buffer != nullptr && bufferLen > 0 && self->running_.load()) {
     const uint8_t* p = static_cast<const uint8_t*>(buffer);
-    std::lock_guard<std::mutex> lk(self->pcmMu_);
-    self->pcmQueue_.insert(self->pcmQueue_.end(), p, p + bufferLen);
-    // Cap the queue: drop oldest PCM if the encoder falls far behind.
-    if (self->pcmQueue_.size() > 1u << 20) {
-      self->pcmQueue_.erase(self->pcmQueue_.begin(), self->pcmQueue_.end() - (1u << 19));
-    }
-    if (self->hasPendingInput_ && self->pendingMem_ != nullptr) {
-      // Drain queued PCM into the held encoder input buffer and push it.
-      uint8_t* dst = OH_AVMemory_GetAddr(self->pendingMem_);
-      int32_t capacity = OH_AVMemory_GetSize(self->pendingMem_);
-      size_t filled = 0;
-      if (dst != nullptr && capacity > 0) {
-        filled = std::min(static_cast<size_t>(capacity), self->pcmQueue_.size());
-        if (filled > 0) {
-          memcpy(dst, self->pcmQueue_.data(), filled);
-          self->pcmQueue_.erase(self->pcmQueue_.begin(),
-                                self->pcmQueue_.begin() + static_cast<long>(filled));
-        }
+    const size_t frameBytes = 2 * static_cast<size_t>(self->channels_);
+    {
+      std::lock_guard<std::mutex> lk(self->pcmMu_);
+      self->pcmQueue_.insert(self->pcmQueue_.end(), p, p + bufferLen);
+      if (self->pcmQueue_.size() > (1u << 20)) {
+        size_t drop = self->pcmQueue_.size() - (1u << 19);
+        drop -= drop % frameBytes;
+        self->pcmQueue_.erase(self->pcmQueue_.begin(),
+                              self->pcmQueue_.begin() + static_cast<long>(drop));
+        self->nextSampleFrame_ += drop / frameBytes;
       }
-      OH_AVCodecBufferAttr attr{};
-      attr.size = static_cast<int32_t>(filled);
-      attr.pts = static_cast<int64_t>((self->totalSamples_ * 1000000ULL) /
-                                      static_cast<uint64_t>(self->sampleRate_));
-      attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-      OH_AudioEncoder_PushInputData(self->encoder_, self->pendingIndex_, attr);
-      self->totalSamples_ += filled / (2 * static_cast<size_t>(self->channels_));
-      self->hasPendingInput_ = false;
-      self->pendingMem_ = nullptr;
     }
+    self->DrainPendingInputs();
   }
   return AUDIOSTREAM_SUCCESS;
 }
@@ -113,34 +99,66 @@ void MicStreamer::OnNeedInputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data
     OH_AudioEncoder_PushInputData(self->encoder_, index, attr);
     return;
   }
-  uint8_t* dst = OH_AVMemory_GetAddr(data);
-  int32_t capacity = OH_AVMemory_GetSize(data);
-  size_t filled = 0;
   {
     std::lock_guard<std::mutex> lk(self->pcmMu_);
-    if (dst != nullptr && capacity > 0) {
-      filled = std::min(static_cast<size_t>(capacity), self->pcmQueue_.size());
-      if (filled > 0) {
-        memcpy(dst, self->pcmQueue_.data(), filled);
-        self->pcmQueue_.erase(self->pcmQueue_.begin(),
-                              self->pcmQueue_.begin() + static_cast<long>(filled));
+    self->pendingInputs_.push_back({index, data});
+  }
+  self->DrainPendingInputs();
+}
+
+void MicStreamer::DrainPendingInputs() {
+  {
+    std::lock_guard<std::mutex> lk(pcmMu_);
+    if (drainActive_) return;
+    drainActive_ = true;
+  }
+
+  for (;;) {
+    PendingInput pending;
+    size_t filled = 0;
+    TimestampUs ptsUs = 0;
+    {
+      std::lock_guard<std::mutex> lk(pcmMu_);
+      if (!running_.load() || pendingInputs_.empty() || pcmQueue_.empty()) {
+        drainActive_ = false;
+        pcmCv_.notify_all();
+        return;
       }
+      pending = pendingInputs_.front();
+      uint8_t* dst = pending.memory != nullptr ? OH_AVMemory_GetAddr(pending.memory) : nullptr;
+      int32_t capacity = pending.memory != nullptr ? OH_AVMemory_GetSize(pending.memory) : 0;
+      if (dst == nullptr || capacity <= 0) {
+        pendingInputs_.pop_front();
+        continue;
+      }
+      const size_t frameBytes = 2 * static_cast<size_t>(channels_);
+      filled = std::min(static_cast<size_t>(capacity), pcmQueue_.size());
+      filled -= filled % frameBytes;
+      if (filled == 0) {
+        drainActive_ = false;
+        pcmCv_.notify_all();
+        return;
+      }
+      ptsUs = static_cast<TimestampUs>((nextSampleFrame_ * 1000000ULL) /
+                                      static_cast<uint64_t>(sampleRate_));
+      memcpy(dst, pcmQueue_.data(), filled);
+      pcmQueue_.erase(pcmQueue_.begin(),
+                      pcmQueue_.begin() + static_cast<long>(filled));
+      pendingInputs_.pop_front();
+      nextSampleFrame_ += filled / frameBytes;
     }
-    if (filled == 0) {
-      // No PCM yet: hold this input buffer for the mic callback to fill.
-      self->hasPendingInput_ = true;
-      self->pendingIndex_ = index;
-      self->pendingMem_ = data;
+
+    OH_AVCodecBufferAttr attr{};
+    attr.size = static_cast<int32_t>(filled);
+    attr.pts = ptsUs;
+    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+    if (OH_AudioEncoder_PushInputData(encoder_, pending.index, attr) != AV_ERR_OK) {
+      std::lock_guard<std::mutex> lk(pcmMu_);
+      drainActive_ = false;
+      pcmCv_.notify_all();
       return;
     }
   }
-  OH_AVCodecBufferAttr attr{};
-  attr.size = static_cast<int32_t>(filled);
-  attr.pts = static_cast<int64_t>((self->totalSamples_ * 1000000ULL) /
-                                  static_cast<uint64_t>(self->sampleRate_));
-  attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-  OH_AudioEncoder_PushInputData(self->encoder_, index, attr);
-  self->totalSamples_ += filled / (2 * static_cast<size_t>(self->channels_));
 }
 
 void MicStreamer::OnNewOutputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data,
@@ -159,8 +177,7 @@ void MicStreamer::OnNewOutputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data
         uint8_t frame[7 + 8192];
         BuildAdts(frame, 1 /* AAC-LC */, sfIndex, self->channels_, attr->size);
         memcpy(frame + 7, aac, static_cast<size_t>(attr->size));
-        sink(frame, static_cast<size_t>(attr->size) + 7,
-             static_cast<uint64_t>(attr->pts));
+        sink(frame, static_cast<size_t>(attr->size) + 7, attr->pts);
       }
     }
   }
@@ -198,10 +215,11 @@ bool MicStreamer::Start(int sampleRate, int channels, int bitrate, FrameSink sin
   }
   sampleRate_ = sampleRate;
   channels_ = channels;
-  totalSamples_ = 0;
   {
     std::lock_guard<std::mutex> lk(pcmMu_);
+    nextSampleFrame_ = 0;
     pcmQueue_.clear();
+    pendingInputs_.clear();
   }
   running_ = true;
 
@@ -294,10 +312,10 @@ void MicStreamer::Stop() {
     onError_ = nullptr;
   }
   {
-    std::lock_guard<std::mutex> lk(pcmMu_);
+    std::unique_lock<std::mutex> lk(pcmMu_);
+    pcmCv_.wait(lk, [this] { return !drainActive_; });
     pcmQueue_.clear();
-    hasPendingInput_ = false;
-    pendingMem_ = nullptr;
+    pendingInputs_.clear();
   }
   Cleanup();
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "mic streaming stopped");

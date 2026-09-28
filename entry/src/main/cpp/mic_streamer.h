@@ -2,7 +2,9 @@
 #define IPCAMERA_MIC_STREAMER_H
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -13,6 +15,8 @@
 #include <ohaudio/native_audiostreambuilder.h>
 #include <ohaudio/native_audio_common.h>
 
+#include "media_time.h"
+
 namespace ipcam {
 
 // Microphone capture (OH_AudioCapturer, PCM S16LE) -> OH_AudioEncoder AAC ->
@@ -22,7 +26,7 @@ namespace ipcam {
 // exposes.
 class MicStreamer {
  public:
-  using FrameSink = std::function<void(const uint8_t*, size_t, uint64_t)>;
+  using FrameSink = std::function<void(const uint8_t*, size_t, TimestampUs)>;
   using ErrorSink = std::function<void(const std::string&)>;
 
   MicStreamer() = default;
@@ -47,6 +51,7 @@ class MicStreamer {
                               OH_AVCodecBufferAttr* attr, void* userData);
 
   void Cleanup();
+  void DrainPendingInputs();
 
   OH_AVCodec* encoder_ = nullptr;
   OH_AudioStreamBuilder* builder_ = nullptr;
@@ -54,14 +59,18 @@ class MicStreamer {
   std::atomic<bool> running_{false};
   int sampleRate_ = 48000;
   int channels_ = 1;
-  uint64_t totalSamples_ = 0;
+  uint64_t nextSampleFrame_ = 0;
   // Input-buffer handoff: never push zero-size input (the encoder would spin
-  // empty output frames). Hold the buffer until the mic callback provides PCM.
+  // empty output frames). Hold buffers until the mic callback provides PCM.
+  struct PendingInput {
+    uint32_t index = 0;
+    OH_AVMemory* memory = nullptr;
+  };
   std::mutex pcmMu_;
+  std::condition_variable pcmCv_;
+  bool drainActive_ = false;
   std::vector<uint8_t> pcmQueue_;
-  bool hasPendingInput_ = false;
-  uint32_t pendingIndex_ = 0;
-  OH_AVMemory* pendingMem_ = nullptr;
+  std::deque<PendingInput> pendingInputs_;
   FrameSink sink_;
   ErrorSink onError_;
   std::mutex stateMu_;

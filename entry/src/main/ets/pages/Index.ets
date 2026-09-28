@@ -21,6 +21,13 @@ const FACING: string[] = ['后置', '前置'];
 const OSD_POSITIONS: string[] = ['左上', '右上', '左下', '右下'];
 const OSD_FONT_STYLES: string[] = ['常规', '加粗', '斜体', '粗斜体'];
 
+enum RtmpState {
+  Idle,
+  Connecting,
+  Publishing,
+  Stopping
+}
+
 interface Settings {
   resolution: number;
   bitrate: number;
@@ -78,7 +85,7 @@ struct Index {
   @State patternRunning: boolean = false;
   @State cameraRunning: boolean = false;
   @State micRunning: boolean = false;
-  @State rtmpRunning: boolean = false;
+  @State rtmpState: RtmpState = RtmpState.Idle;
   @State recording: boolean = false;
   @State httpRunning: boolean = false;
   @State motionEnabled: boolean = false;
@@ -118,8 +125,11 @@ struct Index {
   private osdWatermarkPm: image.PixelMap | null = null;
   private gpsTimerId: number = -1;
   private batteryTimerId: number = -1;
+  private rtmpGeneration: number = 0;
+  private pageActive: boolean = false;
 
   aboutToAppear(): void {
+    this.pageActive = true;
     const ctx = getContext(this) as common.UIAbilityContext;
     const s: Settings = loadSettings(ctx);
     this.resolutionIdx = s.resolution;
@@ -149,6 +159,10 @@ struct Index {
         name = 'ERROR';
       }
       this.clients = clients;
+      if (event === RtspEvent.Error && detail.startsWith('rtmp:')) {
+        this.rtmpGeneration++;
+        this.rtmpState = RtmpState.Idle;
+      }
       if (detail.startsWith('snapshot') || detail === 'MOTION detected') {
         this.appendLog(detail);
       } else {
@@ -159,16 +173,23 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.pageActive = false;
+    this.rtmpGeneration++;
     this.stopGpsTimer();
     this.stopBatteryTimer();
-    this.server.stopTestPattern();
-    this.server.stopCamera();
-    this.server.stopMic();
-    this.server.stopRtmp();
-    this.rtmpRunning = false;
     this.server.stopHttp();
     this.httpRunning = false;
+    if (this.recording) {
+      this.server.stopRecord();
+      this.recording = false;
+    }
+    this.server.stopRtmp();
+    this.rtmpState = RtmpState.Idle;
+    this.server.stopMic();
+    this.server.stopCamera();
+    this.server.stopTestPattern();
     this.server.stop();
+    this.server.clearStatusCallback();
     if (this.keepAliveOn) {
       this.keepAliveOn = false;
       this.stopKeepAlive();
@@ -264,14 +285,21 @@ struct Index {
   }
 
   onStopServer(): void {
-    this.server.stopTestPattern();
-    this.server.stopCamera();
-    this.server.stopMic();
+    this.rtmpGeneration++;
+    this.server.stopHttp();
+    this.httpRunning = false;
+    if (this.recording) {
+      this.server.stopRecord();
+      this.recording = false;
+    }
     this.server.stopRtmp();
+    this.rtmpState = RtmpState.Idle;
+    this.server.stopMic();
+    this.server.stopCamera();
+    this.server.stopTestPattern();
     this.patternRunning = false;
     this.cameraRunning = false;
     this.micRunning = false;
-    this.rtmpRunning = false;
     this.server.stop();
     this.running = false;
     this.clients = 0;
@@ -334,7 +362,7 @@ struct Index {
     this.appendLog('microphone stopped');
   }
 
-  onStartRtmp(): void {
+  async onStartRtmp(): Promise<void> {
     hilog.info(DOMAIN, TAG, 'onStartRtmp url=%{public}s', this.rtmpUrl);
     const url = this.rtmpUrl.trim();
     if (url === '') {
@@ -342,17 +370,32 @@ struct Index {
       return;
     }
     this.saveSetting('rtmpUrl', url);
-    if (this.rtmpRunning) {
-      this.server.stopRtmp();
+    const generation = ++this.rtmpGeneration;
+    this.server.stopRtmp();
+    this.rtmpState = RtmpState.Connecting;
+    this.appendLog(`RTMP connecting to ${url}`);
+    try {
+      const ok: boolean = await this.server.startRtmp(url);
+      if (!this.pageActive || generation !== this.rtmpGeneration) {
+        if (ok) this.server.stopRtmp();
+        return;
+      }
+      this.rtmpState = ok ? RtmpState.Publishing : RtmpState.Idle;
+      this.appendLog(ok ? `RTMP publishing to ${url}` : 'RTMP publish failed');
+    } catch (err) {
+      if (this.pageActive && generation === this.rtmpGeneration) {
+        this.rtmpState = RtmpState.Idle;
+        const e = err as BusinessError;
+        this.appendLog(`RTMP publish failed${e.message ? `: ${e.message}` : ''}`);
+      }
     }
-    const ok: boolean = this.server.startRtmp(url);
-    this.rtmpRunning = ok;
-    this.appendLog(ok ? `RTMP publishing to ${url}` : 'RTMP publish failed');
   }
 
   onStopRtmp(): void {
+    this.rtmpGeneration++;
+    this.rtmpState = RtmpState.Stopping;
     this.server.stopRtmp();
-    this.rtmpRunning = false;
+    this.rtmpState = RtmpState.Idle;
     this.appendLog('RTMP publish stopped');
   }
 
@@ -651,7 +694,9 @@ struct Index {
           if (this.micRunning) {
             Text('mic ●').fontSize(13).fontColor('#B3261E')
           }
-          if (this.rtmpRunning) {
+          if (this.rtmpState === RtmpState.Connecting) {
+            Text('rtmp …').fontSize(13).fontColor('#B26A00')
+          } else if (this.rtmpState === RtmpState.Publishing) {
             Text('rtmp ●').fontSize(13).fontColor('#B3261E')
           }
         }
@@ -706,10 +751,14 @@ struct Index {
             .onChange((value: string) => {
               this.rtmpUrl = value;
             })
-          if (!this.rtmpRunning) {
-            Button('开启推流').onClick(() => this.onStartRtmp())
+          if (this.rtmpState === RtmpState.Idle) {
+            Button('开启推流').onClick(async () => {
+              await this.onStartRtmp();
+            })
           } else {
-            Button('停止推流').onClick(() => this.onStopRtmp())
+            Button(this.rtmpState === RtmpState.Connecting ? '取消连接' : '停止推流')
+              .onClick(() => this.onStopRtmp())
+              .enabled(this.rtmpState !== RtmpState.Stopping)
           }
         }
 

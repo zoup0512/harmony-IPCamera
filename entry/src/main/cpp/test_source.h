@@ -10,6 +10,8 @@
 
 #include <multimedia/player_framework/native_avcodec_base.h>
 
+#include "media_time.h"
+
 namespace ipcam {
 
 // Color-bar test pattern encoded with the system H.264 hardware/software
@@ -17,7 +19,7 @@ namespace ipcam {
 // This is the Route-B evaluation piece: capture/encode replaced by system Kit.
 class TestPatternSource {
  public:
-  using FrameSink = std::function<void(const uint8_t*, size_t, uint64_t)>;
+  using FrameSink = std::function<void(const uint8_t*, size_t, TimestampUs)>;
   using ErrorSink = std::function<void(const std::string&)>;
 
   TestPatternSource() = default;

@@ -2,7 +2,10 @@
 #define IPCAMERA_RECORDER_H
 
 #include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -31,8 +34,9 @@ class StreamRecorder {
   void Stop();
   bool IsRecording() const { return running_.load(); }
 
-  void FeedVideo(const uint8_t* data, size_t size, uint64_t tsUs);  // Annex-B
-  void FeedAudio(const uint8_t* adts, size_t size, uint64_t tsUs);  // one ADTS frame
+  // tsUs is an absolute monotonic timestamp in microseconds; -1 means missing.
+  void FeedVideo(const uint8_t* data, size_t size, int64_t tsUs);  // Annex-B
+  void FeedAudio(const uint8_t* adts, size_t size, int64_t tsUs);  // one ADTS frame
 
   // Inject codec params captured at stream start (encoders emit them once).
   void SetVideoParams(bool h265, const std::vector<uint8_t>& vps,
@@ -43,21 +47,48 @@ class StreamRecorder {
   struct Item {
     bool audio = false;
     std::vector<uint8_t> data;
-    uint64_t tsUs = 0;
+    int64_t tsUs = -1;
+  };
+
+  struct VideoParams {
+    bool h265 = false;
+    bool ready = false;
+    std::vector<uint8_t> vps;
+    std::vector<uint8_t> sps;
+    std::vector<uint8_t> pps;
+    int width = 0;
+    int height = 0;
+  };
+
+  struct AudioCfg {
+    int profileBits = 1;
+    int sfIndex = 4;
+    int channels = 2;
+    int sampleRate = 44100;
   };
 
   void WriterLoop();
-  void CreateMuxer();
-  void Enqueue(Item item);
+  bool CreateMuxer(const VideoParams& videoParams, bool audioSeen,
+                   const AudioCfg& audioCfg);
+  bool WriteItem(const Item& item, bool videoIsH265);
+  bool Enqueue(Item item);
+  void ReportFatalError(const std::string& message);
+  void DestroyMuxerAndClose();
 
   std::atomic<bool> running_{false};
+  std::atomic<bool> accepting_{false};
   std::string filePath_;
   int rotation_ = 0;
+  int outputFd_ = -1;
   ErrorSink onError_;
   std::mutex errMu_;
+  bool errorReported_ = false;
 
   std::mutex queueMu_;
-  std::vector<Item> queue_;
+  std::condition_variable queueCv_;
+  std::deque<Item> queue_;
+  VideoParams configuredVideoParams_;
+  uint64_t videoParamsGeneration_ = 0;
   std::thread writerThread_;
 
   // muxer state, owned by the writer thread
@@ -65,24 +96,10 @@ class StreamRecorder {
   int videoTrack_ = -1;
   int audioTrack_ = -1;
   bool started_ = false;
-  bool videoIsH265_ = false;
-  bool videoParamsReady_ = false;
-  bool audioSeen_ = false;
-  struct AudioCfg {
-    int profileBits = 1;
-    int sfIndex = 4;
-    int channels = 2;
-    int sampleRate = 44100;
-  };
-  AudioCfg audioCfg_;
-
-  std::vector<uint8_t> vps_;
-  std::vector<uint8_t> sps_;
-  std::vector<uint8_t> pps_;
-  int width_ = 0;
-  int height_ = 0;
-  uint64_t tsBaseUs_ = 0;
+  int64_t tsBaseUs_ = 0;
   bool tsBaseSet_ = false;
+  int64_t lastVideoPtsUs_ = -1;
+  int64_t lastAudioPtsUs_ = -1;
 };
 
 }  // namespace ipcam

@@ -8,6 +8,8 @@
 #include <multimedia/player_framework/native_avcodec_videoencoder.h>
 #include <multimedia/player_framework/native_avformat.h>
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "TestPattern"
 
@@ -141,7 +143,7 @@ void TestPatternSource::OnNeedInputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuff
     return;
   }
   self->WaitNextFrameSlot();
-  uint64_t ptsUs = static_cast<uint64_t>(self->nextPtsUs_);
+  TimestampUs ptsUs = self->nextPtsUs_;
   int32_t capacity = OH_AVBuffer_GetCapacity(buffer);
   self->FillFrame(OH_AVBuffer_GetAddr(buffer), static_cast<size_t>(capacity), ptsUs);
   OH_AVCodecBufferAttr attr{};
@@ -166,8 +168,7 @@ void TestPatternSource::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuff
       sink = self->sink_;
     }
     if (sink) {
-      sink(OH_AVBuffer_GetAddr(buffer), static_cast<size_t>(attr.size),
-           static_cast<uint64_t>(attr.pts));
+      sink(OH_AVBuffer_GetAddr(buffer), static_cast<size_t>(attr.size), attr.pts);
     }
   }
   OH_VideoEncoder_FreeOutputBuffer(self->encoder_, index);

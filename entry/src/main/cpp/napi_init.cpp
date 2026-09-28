@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -17,6 +19,7 @@
 
 #include "camera_streamer.h"
 #include "http_server.h"
+#include "media_time.h"
 #include "mic_streamer.h"
 #include "osd_state.h"
 #include "recorder.h"
@@ -27,6 +30,8 @@
 #include "voice_player.h"
 #include "web_stream.h"
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "StreamingNapi"
 
@@ -34,38 +39,59 @@ namespace {
 
 constexpr int kTsfnQueueSize = 16;
 
+struct StatusEventData {
+  int event = 0;
+  int clients = 0;
+  std::string detail;
+  std::shared_ptr<std::atomic<uint64_t>> generation;
+  uint64_t expectedGeneration = 0;
+};
+
 struct ServerHolder;
+void PostEvent(ServerHolder* holder, ipcam::RtspEvent event, int clients,
+               const std::string& detail);
 ServerHolder* g_holder = nullptr;  // single-server app; used by XComponent callbacks
+std::mutex g_holderMu;
 // XComponent surfaces are created at page load, usually before the camera
 // starts; remember the id and attach it when (or after) the camera starts.
-uint64_t g_pendingPreviewId = 0;  // single-server app; used by XComponent callbacks
+std::atomic<uint64_t> g_pendingPreviewId{0};
 
 struct ServerHolder {
   ipcam::RtspServer server;
   std::unique_ptr<ipcam::TestPatternSource> pattern;
   std::unique_ptr<ipcam::CameraStreamer> camera;
+  std::mutex cameraMu;
   std::unique_ptr<ipcam::MicStreamer> mic;
-  std::unique_ptr<ipcam::RtmpPublisher> rtmp;
-  std::unique_ptr<ipcam::StreamRecorder> recorder;
+  std::shared_ptr<ipcam::RtmpPublisher> rtmp;
+  std::shared_ptr<ipcam::RtmpPublisher> pendingRtmp;
+  std::shared_ptr<ipcam::StreamRecorder> recorder;
+  std::mutex outputsMu;
+  std::shared_ptr<std::atomic<uint64_t>> rtmpGeneration =
+      std::make_shared<std::atomic<uint64_t>>(0);
+  ipcam::RelativeTimestampMapper patternClock;
+  ipcam::RelativeTimestampMapper audioClock;
   std::unique_ptr<ipcam::Snapshotter> snapshot = std::make_unique<ipcam::Snapshotter>();
   std::unique_ptr<ipcam::WebStream> webStream = std::make_unique<ipcam::WebStream>();
   std::unique_ptr<ipcam::HttpServer> http;
   ipcam::VoicePlayer voice;
   std::string filesDir;
   std::chrono::steady_clock::time_point startWall = std::chrono::steady_clock::now();
-  bool torchOn = false;
+  std::atomic<bool> torchOn{false};
   napi_threadsafe_function tsfn = nullptr;
   std::mutex tsfnMu;
-  int streamWidth = 1280;
-  int streamHeight = 720;
-  bool videoIsH265 = false;  // last camera mime, used as RTMP hint
-  bool webParamsInjected = false;
+  std::atomic<int> streamWidth{1280};
+  std::atomic<int> streamHeight{720};
+  std::atomic<bool> videoIsH265{false};  // last camera mime, used as RTMP hint
+  std::atomic<bool> webParamsInjected{false};
+  bool httpWebStreamActive = false;
 
-  void PushVideo(const uint8_t* data, size_t size, uint64_t tsUs) {
+  void PushVideo(const uint8_t* data, size_t size, ipcam::TimestampUs tsUs) {
+    if (tsUs == ipcam::kNoTimestampUs) tsUs = ipcam::NowMonotonicUs();
+    if (tsUs < 0) return;
     server.PushH264(data, size, tsUs);
     // The RTSP server caches codec params from the first frame; inject them
     // into the web decoder lazily once they are available.
-    if (!webParamsInjected) {
+    if (!webParamsInjected.load()) {
       auto vp = server.GetVideoParams();
       if (vp.ready) {
         std::vector<uint8_t> annexB;
@@ -78,45 +104,145 @@ struct ServerHolder {
         if (vp.h265) append(vp.vps);
         append(vp.sps);
         append(vp.pps);
-        webStream->SetParams(vp.h265, annexB, streamWidth, streamHeight);
-        webParamsInjected = true;
+        webStream->SetParams(vp.h265, annexB, streamWidth.load(), streamHeight.load());
+        webParamsInjected.store(true);
       }
     }
     webStream->FeedVideo(data, size);
     snapshot->FeedVideo(data, size);
-    // enhanced-RTMP carries H.265 via the hvc1 fourCC
-    if (rtmp && rtmp->IsRunning()) rtmp->SendH264Packet(data, size, tsUs);
-    if (recorder && recorder->IsRecording()) recorder->FeedVideo(data, size, tsUs);
+
+    std::shared_ptr<ipcam::RtmpPublisher> rtmpSnapshot;
+    std::shared_ptr<ipcam::StreamRecorder> recorderSnapshot;
+    {
+      std::lock_guard<std::mutex> lk(outputsMu);
+      rtmpSnapshot = rtmp;
+      recorderSnapshot = recorder;
+    }
+    if (rtmpSnapshot) rtmpSnapshot->SendH264Packet(data, size, tsUs);
+    if (recorderSnapshot) recorderSnapshot->FeedVideo(data, size, tsUs);
   }
 
-  void PushAudio(const uint8_t* data, size_t size, uint64_t tsUs) {
+  void PushAudio(const uint8_t* data, size_t size, ipcam::TimestampUs tsUs) {
+    if (tsUs == ipcam::kNoTimestampUs) tsUs = ipcam::NowMonotonicUs();
+    if (tsUs < 0) return;
     server.PushAdts(data, size, tsUs);
-    if (rtmp && rtmp->IsRunning()) rtmp->SendAdtsPacket(data, size, tsUs);
-    if (recorder && recorder->IsRecording()) recorder->FeedAudio(data, size, tsUs);
+
+    std::shared_ptr<ipcam::RtmpPublisher> rtmpSnapshot;
+    std::shared_ptr<ipcam::StreamRecorder> recorderSnapshot;
+    {
+      std::lock_guard<std::mutex> lk(outputsMu);
+      rtmpSnapshot = rtmp;
+      recorderSnapshot = recorder;
+    }
+    if (rtmpSnapshot) rtmpSnapshot->SendAdtsPacket(data, size, tsUs);
+    if (recorderSnapshot) recorderSnapshot->FeedAudio(data, size, tsUs);
+  }
+
+  void StopCameraOutput() {
+    std::unique_ptr<ipcam::CameraStreamer> current;
+    {
+      std::lock_guard<std::mutex> lk(cameraMu);
+      current = std::move(camera);
+    }
+    if (current) current->Stop();
+  }
+
+  int CameraOrientation() {
+    std::lock_guard<std::mutex> lk(cameraMu);
+    return camera ? camera->Orientation() : 0;
+  }
+
+  bool CameraIsRunning() {
+    std::lock_guard<std::mutex> lk(cameraMu);
+    return camera && camera->IsRunning();
+  }
+
+  bool RestartCamera() {
+    std::lock_guard<std::mutex> lk(cameraMu);
+    return camera && camera->Restart();
+  }
+
+  bool AttachCameraPreview(uint64_t surfaceId) {
+    std::lock_guard<std::mutex> lk(cameraMu);
+    return camera && camera->AttachPreview(surfaceId);
+  }
+
+  void HandleCameraCommand(const std::string& command) {
+    std::lock_guard<std::mutex> lk(cameraMu);
+    if (!camera) return;
+    if (command == "light") {
+      bool nextTorch = !torchOn.load();
+      torchOn.store(nextTorch);
+      camera->SetTorch(nextTorch);
+      PostEvent(this, ipcam::RtspEvent::kClientPlaying, 0,
+                std::string("torch ") + (nextTorch ? "on" : "off"));
+    } else if (command == "camswitch") {
+      camera->SwitchFacing();
+      PostEvent(this, ipcam::RtspEvent::kClientPlaying, 0, "camera switched");
+    }
+  }
+
+  void StopRtmpOutputs() {
+    std::shared_ptr<ipcam::RtmpPublisher> active;
+    std::shared_ptr<ipcam::RtmpPublisher> pending;
+    {
+      std::lock_guard<std::mutex> lk(outputsMu);
+      rtmpGeneration->fetch_add(1);
+      active = std::move(rtmp);
+      pending = std::move(pendingRtmp);
+    }
+    if (pending && pending != active) pending->Cancel();
+    if (active) active->Stop();
+  }
+
+  void StopRecorderOutput() {
+    std::shared_ptr<ipcam::StreamRecorder> current;
+    {
+      std::lock_guard<std::mutex> lk(outputsMu);
+      current = std::move(recorder);
+    }
+    if (current) current->Stop();
   }
 };
 
 void PostEvent(ServerHolder* holder, ipcam::RtspEvent event, int clients,
                const std::string& detail) {
-  napi_threadsafe_function tsfn = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(holder->tsfnMu);
-    tsfn = holder->tsfn;
+  auto* ev = new StatusEventData{static_cast<int>(event), clients, detail, nullptr, 0};
+  std::lock_guard<std::mutex> lk(holder->tsfnMu);
+  if (holder->tsfn == nullptr ||
+      napi_call_threadsafe_function(holder->tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
+    delete ev;
   }
-  if (tsfn == nullptr) return;
-  auto* ev = new std::tuple<int, int, std::string>(static_cast<int>(event), clients, detail);
-  if (napi_call_threadsafe_function(tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
+}
+
+void PostRtmpEvent(ServerHolder* holder, uint64_t generation,
+                   const std::string& detail) {
+  auto* ev = new StatusEventData{static_cast<int>(ipcam::RtspEvent::kServerError),
+                                 holder->server.ClientCount(), detail,
+                                 holder->rtmpGeneration, generation};
+  std::lock_guard<std::mutex> lk(holder->tsfnMu);
+  if (holder->tsfn == nullptr ||
+      napi_call_threadsafe_function(holder->tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
     delete ev;
   }
 }
 
 void CallJsStatus(napi_env env, napi_value jsCb, void* /*context*/, void* data) {
-  auto* ev = static_cast<std::tuple<int, int, std::string>*>(data);
+  auto* ev = static_cast<StatusEventData*>(data);
   if (ev == nullptr) return;
+  if (ev->generation != nullptr &&
+      ev->generation->load() != ev->expectedGeneration) {
+    delete ev;
+    return;
+  }
+  if (env == nullptr || jsCb == nullptr) {
+    delete ev;
+    return;
+  }
   napi_value args[3];
-  napi_create_int32(env, std::get<0>(*ev), &args[0]);
-  napi_create_int32(env, std::get<1>(*ev), &args[1]);
-  napi_create_string_utf8(env, std::get<2>(*ev).c_str(), std::get<2>(*ev).size(), &args[2]);
+  napi_create_int32(env, ev->event, &args[0]);
+  napi_create_int32(env, ev->clients, &args[1]);
+  napi_create_string_utf8(env, ev->detail.c_str(), ev->detail.size(), &args[2]);
   napi_value undef;
   napi_get_undefined(env, &undef);
   napi_value result;
@@ -127,31 +253,30 @@ void CallJsStatus(napi_env env, napi_value jsCb, void* /*context*/, void* data) 
 void ServerFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
   auto* holder = static_cast<ServerHolder*>(data);
   if (holder == nullptr) return;
-  if (g_holder == holder) g_holder = nullptr;
-  if (holder->pattern) {
-    holder->pattern->Stop();
-    holder->pattern.reset();
-  }
-  if (holder->camera) {
-    holder->camera->Stop();
-    holder->camera.reset();
-  }
-  if (holder->mic) {
-    holder->mic->Stop();
-    holder->mic.reset();
-  }
-  if (holder->rtmp) {
-    holder->rtmp->Stop();
-    holder->rtmp.reset();
-  }
-  if (holder->recorder) {
-    holder->recorder->Stop();
-    holder->recorder.reset();
+  {
+    std::lock_guard<std::mutex> lk(g_holderMu);
+    if (g_holder == holder) g_holder = nullptr;
   }
   if (holder->http) {
     holder->http->Stop();
     holder->http.reset();
   }
+  if (holder->httpWebStreamActive) {
+    holder->webStream->DecClients();
+    holder->httpWebStreamActive = false;
+  }
+  if (holder->pattern) {
+    holder->pattern->Stop();
+    holder->pattern.reset();
+  }
+  holder->StopCameraOutput();
+  if (holder->mic) {
+    holder->mic->Stop();
+    holder->mic.reset();
+  }
+  holder->StopRtmpOutputs();
+  holder->StopRecorderOutput();
+  holder->snapshot->Stop();
   holder->voice.Stop();
   holder->server.Stop();
   {
@@ -203,7 +328,10 @@ napi_value InvalidArgs(napi_env env) {
 napi_value CreateServer(napi_env env, napi_callback_info info) {
   (void)info;
   auto* holder = new ServerHolder();
-  g_holder = holder;
+  {
+    std::lock_guard<std::mutex> lk(g_holderMu);
+    g_holder = holder;
+  }
   napi_value out = nullptr;
   napi_status st = napi_create_external(env, holder, ServerFinalize, nullptr, &out);
   if (st != napi_ok) {
@@ -331,7 +459,13 @@ napi_value RtspSendH264(napi_env env, napi_callback_info info) {
   }
   double tsUs = 0;
   napi_get_value_double(env, argv[2], &tsUs);
-  holder->server.PushH264(ptr, size, static_cast<uint64_t>(tsUs));
+  if (!std::isfinite(tsUs) || tsUs < 0) {
+    napi_throw_range_error(env, nullptr, "timestamp must be a finite non-negative number");
+    return nullptr;
+  }
+  ipcam::TimestampUs timestamp = tsUs == 0 ? ipcam::NowMonotonicUs()
+                                             : static_cast<ipcam::TimestampUs>(tsUs);
+  holder->PushVideo(ptr, size, timestamp);
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -352,7 +486,13 @@ napi_value RtspSendAdts(napi_env env, napi_callback_info info) {
   }
   double tsUs = 0;
   napi_get_value_double(env, argv[2], &tsUs);
-  holder->server.PushAdts(ptr, size, static_cast<uint64_t>(tsUs));
+  if (!std::isfinite(tsUs) || tsUs < 0) {
+    napi_throw_range_error(env, nullptr, "timestamp must be a finite non-negative number");
+    return nullptr;
+  }
+  ipcam::TimestampUs timestamp = tsUs == 0 ? ipcam::NowMonotonicUs()
+                                             : static_cast<ipcam::TimestampUs>(tsUs);
+  holder->PushAudio(ptr, size, timestamp);
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -390,6 +530,25 @@ napi_value RtspSetStatusCallback(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+napi_value RtspClearStatusCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1) return InvalidArgs(env);
+  ServerHolder* holder = HolderFromArg(env, argv[0]);
+  if (holder == nullptr) return InvalidArgs(env);
+  {
+    std::lock_guard<std::mutex> lk(holder->tsfnMu);
+    if (holder->tsfn != nullptr) {
+      napi_release_threadsafe_function(holder->tsfn, napi_tsfn_abort);
+      holder->tsfn = nullptr;
+    }
+  }
+  napi_value undef;
+  napi_get_undefined(env, &undef);
+  return undef;
+}
+
 napi_value RtspStartTestPattern(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5];
@@ -407,12 +566,13 @@ napi_value RtspStartTestPattern(napi_env env, napi_callback_info info) {
     holder->pattern->Stop();
     holder->pattern.reset();
   }
+  holder->patternClock.Reset();
   auto pattern = std::make_unique<ipcam::TestPatternSource>();
   bool ok = pattern->Start(
       static_cast<int>(width), static_cast<int>(height), static_cast<int>(fps),
       static_cast<int>(bitrate),
-      [holder](const uint8_t* data, size_t size, uint64_t ptsUs) {
-        holder->PushVideo(data, size, ptsUs);
+      [holder](const uint8_t* data, size_t size, ipcam::TimestampUs ptsUs) {
+        holder->PushVideo(data, size, holder->patternClock.Map(ptsUs));
       },
       [holder](const std::string& err) {
         PostEvent(holder, ipcam::RtspEvent::kServerError, holder->server.ClientCount(), err);
@@ -463,28 +623,29 @@ napi_value RtspStartCamera(napi_env env, napi_callback_info info) {
     holder->pattern->Stop();
     holder->pattern.reset();
   }
-  if (holder->camera) {
-    holder->camera->Stop();
-    holder->camera.reset();
-  }
+  holder->StopCameraOutput();
+  holder->streamWidth.store(static_cast<int>(width));
+  holder->streamHeight.store(static_cast<int>(height));
+  holder->videoIsH265.store(std::string(mime) == "video/hevc");
+  holder->webParamsInjected.store(false);
   auto camera = std::make_unique<ipcam::CameraStreamer>();
   bool ok = camera->Start(
       static_cast<int>(width), static_cast<int>(height), static_cast<int>(bitrate),
-      mime, front, static_cast<int>(iFrameMs), g_pendingPreviewId,
+      mime, front, static_cast<int>(iFrameMs), g_pendingPreviewId.load(),
       ipcam::OsdEnabled(),
-      [holder](const uint8_t* data, size_t size, uint64_t /*ptsUs*/) {
-        // Surface-mode encoder pts is unreliable; 0 lets both servers stamp
-        // frames with their own monotonic clock.
-        holder->PushVideo(data, size, 0);
+      [holder](const uint8_t* data, size_t size, ipcam::TimestampUs /*ptsUs*/) {
+        // Surface-mode encoder PTS is device-dependent; sample the shared clock
+        // once so every downstream consumer receives the same timestamp.
+        holder->PushVideo(data, size, ipcam::NowMonotonicUs());
       },
       [holder](const std::string& err) {
         PostEvent(holder, ipcam::RtspEvent::kServerError, holder->server.ClientCount(), err);
       });
   if (ok) {
-    holder->streamWidth = static_cast<int>(width);
-    holder->streamHeight = static_cast<int>(height);
-    holder->videoIsH265 = (std::string(mime) == "video/hevc");
-    holder->camera = std::move(camera);
+    {
+      std::lock_guard<std::mutex> lk(holder->cameraMu);
+      holder->camera = std::move(camera);
+    }
     auto vp = holder->server.GetVideoParams();
     if (vp.ready) {
       std::vector<uint8_t> annexB;
@@ -497,12 +658,11 @@ napi_value RtspStartCamera(napi_env env, napi_callback_info info) {
       if (vp.h265) append(vp.vps);
       append(vp.sps);
       append(vp.pps);
-      holder->webStream->SetParams(vp.h265, annexB, holder->streamWidth,
-                                   holder->streamHeight);
+      holder->webStream->SetParams(vp.h265, annexB, holder->streamWidth.load(),
+                                   holder->streamHeight.load());
     }
-    if (g_pendingPreviewId != 0) {
-      holder->camera->AttachPreview(g_pendingPreviewId);
-    }
+    uint64_t previewId = g_pendingPreviewId.load();
+    if (previewId != 0) holder->AttachCameraPreview(previewId);
   }
   napi_value result;
   napi_get_boolean(env, ok, &result);
@@ -515,10 +675,7 @@ napi_value RtspStopCamera(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr && holder->camera) {
-    holder->camera->Stop();
-    holder->camera.reset();
-  }
+  if (holder != nullptr) holder->StopCameraOutput();
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -536,11 +693,12 @@ napi_value RtspStartMic(napi_env env, napi_callback_info info) {
     holder->mic->Stop();
     holder->mic.reset();
   }
+  holder->audioClock.Reset();
   auto mic = std::make_unique<ipcam::MicStreamer>();
   bool ok = mic->Start(
       48000, 1, 64000,
-      [holder](const uint8_t* data, size_t size, uint64_t ptsUs) {
-        holder->PushAudio(data, size, ptsUs);
+      [holder](const uint8_t* data, size_t size, ipcam::TimestampUs ptsUs) {
+        holder->PushAudio(data, size, holder->audioClock.Map(ptsUs));
       },
       [holder](const std::string& err) {
         PostEvent(holder, ipcam::RtspEvent::kServerError, holder->server.ClientCount(), err);
@@ -568,6 +726,82 @@ napi_value RtspStopMic(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+struct RtmpStartContext {
+  ServerHolder* holder = nullptr;
+  napi_deferred deferred = nullptr;
+  napi_async_work work = nullptr;
+  napi_ref holderRef = nullptr;
+  std::shared_ptr<ipcam::RtmpPublisher> publisher;
+  std::string url;
+  uint64_t generation = 0;
+  int width = 0;
+  int height = 0;
+  bool h265 = false;
+  bool ok = false;
+};
+
+void ExecuteRtmpStart(napi_env /*env*/, void* data) {
+  auto* ctx = static_cast<RtmpStartContext*>(data);
+  if (ctx == nullptr || ctx->publisher == nullptr) return;
+  const std::weak_ptr<ipcam::RtmpPublisher> weakPublisher = ctx->publisher;
+  ctx->ok = ctx->publisher->Start(
+      ctx->url, ctx->width, ctx->height, ctx->h265,
+      [holder = ctx->holder, generation = ctx->generation,
+       weakPublisher](const std::string& err) {
+        auto publisher = weakPublisher.lock();
+        if (!publisher) return;
+        {
+          std::lock_guard<std::mutex> lk(holder->outputsMu);
+          if (holder->rtmpGeneration->load() != generation ||
+              (holder->rtmp != publisher && holder->pendingRtmp != publisher)) {
+            return;
+          }
+        }
+        PostRtmpEvent(holder, generation, "rtmp: " + err);
+      });
+}
+
+void CompleteRtmpStart(napi_env env, napi_status status, void* data) {
+  std::unique_ptr<RtmpStartContext> ctx(static_cast<RtmpStartContext*>(data));
+  if (ctx == nullptr) return;
+
+  bool installed = false;
+  bool superseded = false;
+  if (ctx->holder != nullptr) {
+    std::lock_guard<std::mutex> lk(ctx->holder->outputsMu);
+    bool current = ctx->holder->rtmpGeneration->load() == ctx->generation &&
+                   ctx->holder->pendingRtmp == ctx->publisher;
+    if (current) {
+      ctx->holder->pendingRtmp.reset();
+      if (status == napi_ok && ctx->ok && ctx->publisher->IsRunning()) {
+        ctx->holder->rtmp = ctx->publisher;
+        installed = true;
+      }
+    } else {
+      superseded = true;
+    }
+  }
+
+  if (!installed && ctx->publisher != nullptr) ctx->publisher->Stop();
+
+  napi_value result = nullptr;
+  if (installed || superseded || status == napi_cancelled) {
+    napi_get_boolean(env, installed, &result);
+    napi_resolve_deferred(env, ctx->deferred, result);
+  } else {
+    std::string message = ctx->publisher != nullptr ? ctx->publisher->LastError() : std::string();
+    if (message.empty()) message = "RTMP start failed";
+    napi_value text = nullptr;
+    napi_value error = nullptr;
+    napi_create_string_utf8(env, message.c_str(), message.size(), &text);
+    napi_create_error(env, nullptr, text, &error);
+    napi_reject_deferred(env, ctx->deferred, error);
+  }
+
+  if (ctx->holderRef != nullptr) napi_delete_reference(env, ctx->holderRef);
+  if (ctx->work != nullptr) napi_delete_async_work(env, ctx->work);
+}
+
 napi_value RtmpStart(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
@@ -581,23 +815,74 @@ napi_value RtmpStart(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, nullptr, "expect url string");
     return nullptr;
   }
-  if (holder->rtmp) {
-    holder->rtmp->Stop();
-    holder->rtmp.reset();
+
+  auto ctx = std::make_unique<RtmpStartContext>();
+  ctx->holder = holder;
+  ctx->publisher = std::make_shared<ipcam::RtmpPublisher>();
+  ctx->url.assign(url, len);
+  ctx->width = holder->streamWidth.load();
+  ctx->height = holder->streamHeight.load();
+  ctx->h265 = holder->videoIsH265.load();
+  auto params = holder->server.GetVideoParams();
+  if (params.ready) {
+    ctx->publisher->SetVideoParams(params.h265, params.vps, params.sps, params.pps);
   }
-  auto rtmp = std::make_unique<ipcam::RtmpPublisher>();
-  bool ok = rtmp->Start(std::string(url, len), holder->streamWidth, holder->streamHeight,
-                        holder->videoIsH265,
-                        [holder](const std::string& err) {
-                          PostEvent(holder, ipcam::RtspEvent::kServerError,
-                                    holder->server.ClientCount(), "rtmp: " + err);
-                        });
-  if (ok) {
-    holder->rtmp = std::move(rtmp);
+
+  std::shared_ptr<ipcam::RtmpPublisher> oldActive;
+  std::shared_ptr<ipcam::RtmpPublisher> oldPending;
+  {
+    std::lock_guard<std::mutex> lk(holder->outputsMu);
+    ctx->generation = holder->rtmpGeneration->fetch_add(1) + 1;
+    oldActive = std::move(holder->rtmp);
+    oldPending = std::move(holder->pendingRtmp);
+    holder->pendingRtmp = ctx->publisher;
   }
-  napi_value result;
-  napi_get_boolean(env, ok, &result);
-  return result;
+  if (oldPending && oldPending != oldActive) oldPending->Cancel();
+  if (oldActive) oldActive->Stop();
+
+  napi_value promise = nullptr;
+  if (napi_create_reference(env, argv[0], 1, &ctx->holderRef) != napi_ok) {
+    ctx->publisher->Stop();
+    {
+      std::lock_guard<std::mutex> lk(holder->outputsMu);
+      if (holder->pendingRtmp == ctx->publisher) holder->pendingRtmp.reset();
+    }
+    napi_throw_error(env, nullptr, "retain RTMP server handle failed");
+    return nullptr;
+  }
+  if (napi_create_promise(env, &ctx->deferred, &promise) != napi_ok) {
+    ctx->publisher->Stop();
+    {
+      std::lock_guard<std::mutex> lk(holder->outputsMu);
+      if (holder->pendingRtmp == ctx->publisher) holder->pendingRtmp.reset();
+    }
+    napi_delete_reference(env, ctx->holderRef);
+    napi_throw_error(env, nullptr, "create RTMP promise failed");
+    return nullptr;
+  }
+  napi_value resourceName = nullptr;
+  napi_create_string_utf8(env, "rtmp_start", NAPI_AUTO_LENGTH, &resourceName);
+  napi_status workStatus = napi_create_async_work(
+      env, nullptr, resourceName, ExecuteRtmpStart, CompleteRtmpStart,
+      ctx.get(), &ctx->work);
+  if (workStatus == napi_ok) workStatus = napi_queue_async_work(env, ctx->work);
+  if (workStatus != napi_ok) {
+    if (ctx->work != nullptr) napi_delete_async_work(env, ctx->work);
+    ctx->publisher->Stop();
+    {
+      std::lock_guard<std::mutex> lk(holder->outputsMu);
+      if (holder->pendingRtmp == ctx->publisher) holder->pendingRtmp.reset();
+    }
+    napi_delete_reference(env, ctx->holderRef);
+    napi_value text = nullptr;
+    napi_value error = nullptr;
+    napi_create_string_utf8(env, "queue RTMP work failed", NAPI_AUTO_LENGTH, &text);
+    napi_create_error(env, nullptr, text, &error);
+    napi_reject_deferred(env, ctx->deferred, error);
+    return promise;
+  }
+  ctx.release();
+  return promise;
 }
 
 napi_value RtmpStop(napi_env env, napi_callback_info info) {
@@ -606,10 +891,7 @@ napi_value RtmpStop(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr && holder->rtmp) {
-    holder->rtmp->Stop();
-    holder->rtmp.reset();
-  }
+  if (holder != nullptr) holder->StopRtmpOutputs();
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -628,15 +910,13 @@ napi_value RtspStartRecord(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, nullptr, "expect path string");
     return nullptr;
   }
-  if (holder->recorder && holder->recorder->IsRecording()) {
-    holder->recorder->Stop();
-  }
-  auto rec = std::make_unique<ipcam::StreamRecorder>();
-  int rotation = holder->camera ? holder->camera->Orientation() : 0;
+  holder->StopRecorderOutput();
+  auto rec = std::make_shared<ipcam::StreamRecorder>();
+  int rotation = holder->CameraOrientation();
   auto vp = holder->server.GetVideoParams();
   if (vp.ready) {
-    rec->SetVideoParams(vp.h265, vp.vps, vp.sps, vp.pps, holder->streamWidth,
-                        holder->streamHeight);
+    rec->SetVideoParams(vp.h265, vp.vps, vp.sps, vp.pps, holder->streamWidth.load(),
+                        holder->streamHeight.load());
   }
   bool ok = rec->Start(std::string(path, len), rotation,
                        [holder](const std::string& err) {
@@ -644,6 +924,7 @@ napi_value RtspStartRecord(napi_env env, napi_callback_info info) {
                                    holder->server.ClientCount(), "record: " + err);
                        });
   if (ok) {
+    std::lock_guard<std::mutex> lk(holder->outputsMu);
     holder->recorder = std::move(rec);
   }
   napi_value result;
@@ -657,10 +938,7 @@ napi_value RtspStopRecord(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr && holder->recorder) {
-    holder->recorder->Stop();
-    holder->recorder.reset();
-  }
+  if (holder != nullptr) holder->StopRecorderOutput();
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -679,8 +957,8 @@ napi_value RtspTakeSnapshot(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, nullptr, "expect path string");
     return nullptr;
   }
-  int w = holder->streamWidth;
-  int h = holder->streamHeight;
+  int w = holder->streamWidth.load();
+  int h = holder->streamHeight.load();
   auto vp = holder->server.GetVideoParams();
   if (vp.ready) {
     std::vector<uint8_t> annexB;
@@ -736,11 +1014,12 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
   if (napi_get_named_property(env, opts, "filesDir", &v) == napi_ok && v != nullptr) {
     napi_get_value_string_utf8(env, v, dir, sizeof(dir), &len);
   }
-  holder->filesDir = dir;
-
-  if (holder->http && holder->http->IsRunning()) {
-    holder->http->Stop();
+  if (holder->http) holder->http->Stop();
+  if (holder->httpWebStreamActive) {
+    holder->webStream->DecClients();
+    holder->httpWebStreamActive = false;
   }
+  holder->filesDir = dir;
   if (!holder->http) holder->http = std::make_unique<ipcam::HttpServer>();
   std::string userStr = user;
   std::string passStr = pass;
@@ -751,7 +1030,6 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
     // frame: hold a client reference and wait up to 3 s for the first JPEG.
     // The web console holds a client reference for its whole lifetime, so
     // the decoder stays warm for snapshot/MJPEG.
-    weakHolder->webStream->IncClients();
     std::vector<uint8_t> jpg;
     for (int i = 0; i < 30; ++i) {
       jpg = weakHolder->webStream->LatestJpeg();
@@ -766,29 +1044,32 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
                     std::chrono::steady_clock::now() - weakHolder->startWall)
                     .count();
     std::string s = "uptime_s=" + std::to_string(secs);
-    s += "\nresolution=" + std::to_string(weakHolder->streamWidth) + "x" +
-         std::to_string(weakHolder->streamHeight);
-    s += "\ncodec=" + std::string(weakHolder->videoIsH265 ? "h265" : "h264");
+    s += "\nresolution=" + std::to_string(weakHolder->streamWidth.load()) + "x" +
+         std::to_string(weakHolder->streamHeight.load());
+    s += "\ncodec=" +
+         std::string(weakHolder->videoIsH265.load() ? "h265" : "h264");
     s += "\nrtsp_clients=" + std::to_string(weakHolder->server.ClientCount());
     s += "\nmotion=" + std::string(weakHolder->webStream->MotionActive() ? "active" : "idle");
-    s += "\ntorch=" + std::string(weakHolder->torchOn ? "on" : "off");
+    s += "\ntorch=" + std::string(weakHolder->torchOn.load() ? "on" : "off");
     s += "\nosd=" + std::string(ipcam::OsdEnabled() ? "on" : "off");
     s += "\nencoder=rear";
     return s;
   });
   holder->http->SetCommandSink([weakHolder](const std::string& cmd) {
-    if (cmd == "light" && weakHolder->camera) {
-      weakHolder->torchOn = !weakHolder->torchOn;
-      weakHolder->camera->SetTorch(weakHolder->torchOn);
-      PostEvent(weakHolder, ipcam::RtspEvent::kClientPlaying, 0,
-                std::string("torch ") + (weakHolder->torchOn ? "on" : "off"));
-    } else if (cmd == "camswitch" && weakHolder->camera) {
-      weakHolder->camera->SwitchFacing();
-      PostEvent(weakHolder, ipcam::RtspEvent::kClientPlaying, 0, "camera switched");
-    }
+    weakHolder->HandleCameraCommand(cmd);
   });
   holder->http->SetVoiceSink([weakHolder](const std::vector<uint8_t>& body) {
-    weakHolder->voice.Feed(body.data(), body.size());
+    switch (weakHolder->voice.Feed(body.data(), body.size())) {
+      case ipcam::VoicePlayer::FeedResult::Accepted:
+        return ipcam::HttpServer::VoiceResult::Accepted;
+      case ipcam::VoicePlayer::FeedResult::Invalid:
+        return ipcam::HttpServer::VoiceResult::Invalid;
+      case ipcam::VoicePlayer::FeedResult::Busy:
+        return ipcam::HttpServer::VoiceResult::Busy;
+      case ipcam::VoicePlayer::FeedResult::Unavailable:
+        return ipcam::HttpServer::VoiceResult::Unavailable;
+    }
+    return ipcam::HttpServer::VoiceResult::Unavailable;
   });
   holder->http->SetArchiveSource([weakHolder]() {
     std::string out;
@@ -829,10 +1110,11 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
                                 holder->filesDir);
   if (ok) {
     holder->webStream->IncClients();  // keep the web decoder warm
-    if (holder->camera && holder->camera->IsRunning()) {
+    holder->httpWebStreamActive = true;
+    if (holder->CameraIsRunning()) {
       // Surface-mode encoders emit their only IDR at stream start; restart so
       // the web decoder (just started) can begin decoding immediately.
-      holder->camera->Restart();
+      holder->RestartCamera();
     }
   }
   napi_value result;
@@ -848,7 +1130,10 @@ napi_value RtspStopHttp(napi_env env, napi_callback_info info) {
   ServerHolder* holder = HolderFromArg(env, argv[0]);
   if (holder != nullptr && holder->http) {
     holder->http->Stop();
-    holder->webStream->DecClients();
+    if (holder->httpWebStreamActive) {
+      holder->webStream->DecClients();
+      holder->httpWebStreamActive = false;
+    }
   }
   napi_value undef;
   napi_get_undefined(env, &undef);
@@ -1062,6 +1347,8 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"rtspSetStatusCallback", nullptr, RtspSetStatusCallback, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"rtspClearStatusCallback", nullptr, RtspClearStatusCallback, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
       {"rtspStartTestPattern", nullptr, RtspStartTestPattern, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"rtspStopTestPattern", nullptr, RtspStopTestPattern, nullptr, nullptr, nullptr,
@@ -1118,10 +1405,9 @@ napi_value Init(napi_env env, napi_value exports) {
         if (window != nullptr &&
             OH_NativeWindow_GetSurfaceId(reinterpret_cast<OHNativeWindow*>(window), &sid) ==
                 0) {
-          g_pendingPreviewId = sid;
-          if (g_holder != nullptr && g_holder->camera) {
-            g_holder->camera->AttachPreview(sid);
-          }
+          g_pendingPreviewId.store(sid);
+          std::lock_guard<std::mutex> lk(g_holderMu);
+          if (g_holder != nullptr) g_holder->AttachCameraPreview(sid);
         }
       };
       OH_NativeXComponent_RegisterCallback(xc, &cb);
