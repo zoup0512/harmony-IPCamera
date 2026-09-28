@@ -21,6 +21,8 @@
 #include "http_server.h"
 #include "media_time.h"
 #include "mic_streamer.h"
+#include "onvif_client.h"
+#include "opus_stream.h"
 #include "osd_state.h"
 #include "recorder.h"
 #include "rtmp_publisher.h"
@@ -62,6 +64,7 @@ struct ServerHolder {
   std::unique_ptr<ipcam::CameraStreamer> camera;
   std::mutex cameraMu;
   std::unique_ptr<ipcam::MicStreamer> mic;
+  std::unique_ptr<ipcam::OpusStream> opus = std::make_unique<ipcam::OpusStream>();
   std::shared_ptr<ipcam::RtmpPublisher> rtmp;
   std::shared_ptr<ipcam::RtmpPublisher> pendingRtmp;
   std::shared_ptr<ipcam::StreamRecorder> recorder;
@@ -278,6 +281,7 @@ void ServerFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
   holder->StopRecorderOutput();
   holder->snapshot->Stop();
   holder->voice.Stop();
+  holder->opus->Shutdown();
   holder->server.Stop();
   {
     std::lock_guard<std::mutex> lk(holder->tsfnMu);
@@ -705,7 +709,11 @@ napi_value RtspStartMic(napi_env env, napi_callback_info info) {
       });
   if (ok) {
     holder->mic = std::move(mic);
+    holder->mic->SetPcmTap([holder](const uint8_t* pcm, size_t bytes, int rate, int ch) {
+      holder->opus->FeedPcm(pcm, bytes, rate, ch);
+    });
   }
+  holder->opus->SetSourceActive(ok);
   napi_value result;
   napi_get_boolean(env, ok, &result);
   return result;
@@ -721,6 +729,7 @@ napi_value RtspStopMic(napi_env env, napi_callback_info info) {
     holder->mic->Stop();
     holder->mic.reset();
   }
+  if (holder != nullptr) holder->opus->SetSourceActive(false);
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -898,8 +907,8 @@ napi_value RtmpStop(napi_env env, napi_callback_info info) {
 }
 
 napi_value RtspStartRecord(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2];
+  size_t argc = 3;
+  napi_value argv[3];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 2) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
@@ -910,8 +919,27 @@ napi_value RtspStartRecord(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, nullptr, "expect path string");
     return nullptr;
   }
+  ipcam::StreamRecorder::Options recordOptions;  // four_gb_limit / segment defaults
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_valuetype optType = napi_undefined;
+    napi_typeof(env, argv[2], &optType);
+    if (optType == napi_object) {
+      napi_value v = nullptr;
+      if (napi_get_named_property(env, argv[2], "fourGbLimit", &v) == napi_ok &&
+          v != nullptr) {
+        napi_get_value_bool(env, v, &recordOptions.fourGbLimit);
+      }
+      double minutes = 10;
+      if (napi_get_named_property(env, argv[2], "segmentMinutes", &v) == napi_ok &&
+          v != nullptr) {
+        napi_get_value_double(env, v, &minutes);
+        recordOptions.segmentMinutes = static_cast<int>(minutes);
+      }
+    }
+  }
   holder->StopRecorderOutput();
   auto rec = std::make_shared<ipcam::StreamRecorder>();
+  rec->SetOptions(recordOptions);
   int rotation = holder->CameraOrientation();
   auto vp = holder->server.GetVideoParams();
   if (vp.ready) {
@@ -1071,6 +1099,7 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
     }
     return ipcam::HttpServer::VoiceResult::Unavailable;
   });
+  holder->http->SetOpusStream(holder->opus.get());
   holder->http->SetArchiveSource([weakHolder]() {
     std::string out;
     DIR* d = opendir((weakHolder->filesDir).c_str());
@@ -1331,6 +1360,112 @@ napi_value OsdSetWatermark(napi_env env, napi_callback_info info) {
   return result;
 }
 
+// ---- ONVIF discovery (global module state, no server handle needed) ----
+
+struct OnvifScanContext {
+  napi_deferred deferred = nullptr;
+  napi_async_work work = nullptr;
+  int timeoutMs = 4000;
+  std::string resultJson;  // array of device objects, or error text in `error`
+  bool ok = true;
+};
+
+std::string JsonEscapeStr(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (unsigned char c : in) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  return out;
+}
+
+void ExecuteOnvifScan(napi_env /*env*/, void* data) {
+  auto* ctx = static_cast<OnvifScanContext*>(data);
+  std::vector<ipcam::OnvifClient::Device> devices =
+      ipcam::OnvifClient::Discover(ctx->timeoutMs, 1000);
+  std::string json = "[";
+  bool first = true;
+  for (auto& dev : devices) {
+    ipcam::OnvifClient::ResolveMedia(&dev);
+    if (!first) json += ",";
+    first = false;
+    json += "{\"xaddrs\":\"" + JsonEscapeStr(dev.xaddrs) + "\"" +
+            ",\"model\":\"" + JsonEscapeStr(dev.model) + "\"" +
+            ",\"profile\":\"" + JsonEscapeStr(dev.profile) + "\"" +
+            ",\"streamUri\":\"" + JsonEscapeStr(dev.streamUri) + "\"" +
+            ",\"error\":\"" + JsonEscapeStr(dev.lastError) + "\"}";
+  }
+  json += "]";
+  ctx->resultJson = std::move(json);
+  ctx->ok = true;
+}
+
+void CompleteOnvifScan(napi_env env, napi_status status, void* data) {
+  auto* ctx = static_cast<OnvifScanContext*>(data);
+  if (status == napi_ok && ctx->ok) {
+    napi_value text = nullptr;
+    napi_create_string_utf8(env, ctx->resultJson.c_str(), ctx->resultJson.size(), &text);
+    napi_resolve_deferred(env, ctx->deferred, text);
+  } else {
+    napi_value text = nullptr;
+    napi_value error = nullptr;
+    napi_create_string_utf8(env, "onvif scan failed", NAPI_AUTO_LENGTH, &text);
+    napi_create_error(env, nullptr, text, &error);
+    napi_reject_deferred(env, ctx->deferred, error);
+  }
+  if (ctx->work != nullptr) napi_delete_async_work(env, ctx->work);
+  delete ctx;
+}
+
+napi_value OnvifScan(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* ctx = new OnvifScanContext();
+  if (argc >= 1 && argv[0] != nullptr) {
+    double t = 4000;
+    napi_get_value_double(env, argv[0], &t);
+    ctx->timeoutMs = static_cast<int>(t);
+  }
+  napi_value promise = nullptr;
+  if (napi_create_promise(env, &ctx->deferred, &promise) != napi_ok) {
+    delete ctx;
+    napi_throw_error(env, nullptr, "create promise failed");
+    return nullptr;
+  }
+  napi_value resourceName = nullptr;
+  napi_create_string_utf8(env, "onvif_scan", NAPI_AUTO_LENGTH, &resourceName);
+  napi_status st = napi_create_async_work(env, nullptr, resourceName,
+                                          ExecuteOnvifScan, CompleteOnvifScan,
+                                          ctx, &ctx->work);
+  if (st == napi_ok) st = napi_queue_async_work(env, ctx->work);
+  if (st != napi_ok) {
+    if (ctx->work != nullptr) napi_delete_async_work(env, ctx->work);
+    napi_value text = nullptr;
+    napi_value error = nullptr;
+    napi_create_string_utf8(env, "queue onvif work failed", NAPI_AUTO_LENGTH, &text);
+    napi_create_error(env, nullptr, text, &error);
+    napi_reject_deferred(env, ctx->deferred, error);
+    delete ctx;
+    return promise;
+  }
+  return promise;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
       {"createRtspServer", nullptr, CreateServer, nullptr, nullptr, nullptr,
@@ -1388,6 +1523,8 @@ napi_value Init(napi_env env, napi_value exports) {
       {"osdSetGps", nullptr, OsdSetGps, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"osdSetWatermark", nullptr, OsdSetWatermark, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"onvifScan", nullptr, OnvifScan, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
   };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
 

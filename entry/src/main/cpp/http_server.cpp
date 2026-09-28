@@ -19,6 +19,8 @@
 
 #include <hilog/log.h>
 
+#include "opus_stream.h"
+
 #undef LOG_DOMAIN
 #undef LOG_TAG
 #define LOG_DOMAIN 0xC010
@@ -43,6 +45,7 @@ const char* kDashboardHtml =
     "<title>IPCamera</title></head><body>"
     "<h2>IPCamera Live</h2>"
     "<img src='/video'><p>"
+    "<audio src='/audio.opus' controls preload='none'></audio><p>"
     "<a href='/snapshot.jpg'>snapshot.jpg</a> | "
     "<a href='/serverinfo'>serverinfo</a> | "
     "<a href='/size'>size</a> | "
@@ -417,6 +420,11 @@ void HttpServer::SetArchiveFile(ArchiveFile file) {
   archiveFile_ = std::move(file);
 }
 
+void HttpServer::SetOpusStream(OpusStream* stream) {
+  std::lock_guard<std::mutex> lock(cbMu_);
+  opusStream_ = stream;
+}
+
 void HttpServer::BeginLifecycleOperation() {
   std::unique_lock<std::mutex> lock(lifecycleMu_);
   lifecycleCv_.wait(lock, [this]() { return !lifecycleBusy_; });
@@ -665,6 +673,7 @@ bool HttpServer::HandleRequest(int fd, const std::string& method, const std::str
   VoiceSink voiceSink;
   ArchiveSource archiveSource;
   ArchiveFile archiveFile;
+  OpusStream* opusStream = nullptr;
   {
     std::lock_guard<std::mutex> lock(cbMu_);
     jpegSource = jpegSource_;
@@ -673,6 +682,7 @@ bool HttpServer::HandleRequest(int fd, const std::string& method, const std::str
     voiceSink = voiceSink_;
     archiveSource = archiveSource_;
     archiveFile = archiveFile_;
+    opusStream = opusStream_;
   }
 
   if (path == "/" || path == "/index" || path == "/main.html") {
@@ -718,6 +728,23 @@ bool HttpServer::HandleRequest(int fd, const std::string& method, const std::str
       }
     }
     return false;
+  }
+  if (path == "/audio.opus") {
+    if (opusStream == nullptr || !opusStream->SourceActive()) {
+      // mirror of the Android behavior: no audio source -> service unavailable
+      Respond(fd, 503, "text/plain", std::vector<uint8_t>({'n', 'o', ' ', 'a', 'u', 'd', 'i', 'o'}));
+      return true;
+    }
+    if (!opusStream->EnsureReady()) {
+      Respond(fd, 501, "text/plain",
+              std::vector<uint8_t>({'o', 'p', 'u', 's', ' ', 'u', 'n', 'a', 'v', 'a', 'i', 'l'}));
+      return true;
+    }
+    std::string head =
+        "HTTP/1.1 200 OK\r\nContent-Type: audio/ogg\r\nConnection: close\r\n\r\n";
+    if (!SendAll(fd, head)) return false;
+    // Blocks this worker until the client disconnects (like /video).
+    return opusStream->Serve(fd, running_);
   }
   if (path == "/serverinfo") {
     RespondText(fd, infoSource ? infoSource() : "no info");
@@ -796,18 +823,36 @@ void HttpServer::HandleConnection(int fd) {
     return;
   }
 
-  auto auth = request.headers.find("Authorization");
-  if (auth == request.headers.end() || auth->second.size() != 1 ||
-      !CheckAuth(auth->second.front())) {
-    Respond401(fd);
-    return;
-  }
-
   std::string route = request.path;
   size_t query = route.find('?');
+  std::string queryString = query == std::string::npos ? "" : route.substr(query + 1);
   if (query != std::string::npos) route.erase(query);
   route = ToLower(route);
   const bool isVoice = route == "/put_voice";
+
+  // Token auth for media routes: /video?pw=<password> and
+  // /snapshot.jpg?pw=<password> bypass Basic auth (embedded <img>/<audio>
+  // tags cannot send headers). Equivalent access level, narrower surface.
+  const bool isMediaRoute = route == "/video" || route == "/snapshot.jpg" ||
+                            route == "/getsnapshot" || route == "/audio.opus";
+  bool tokenOk = false;
+  if (isMediaRoute) {
+    size_t pwPos = queryString.find("pw=");
+    if (pwPos != std::string::npos) {
+      std::string pw = queryString.substr(pwPos + 3);
+      size_t amp = pw.find('&');
+      if (amp != std::string::npos) pw = pw.substr(0, amp);
+      tokenOk = pw == password_;
+    }
+  }
+
+  auto auth = request.headers.find("Authorization");
+  if (!tokenOk &&
+      (auth == request.headers.end() || auth->second.size() != 1 ||
+       !CheckAuth(auth->second.front()))) {
+    Respond401(fd);
+    return;
+  }
 
   auto transferEncoding = request.headers.find("Transfer-Encoding");
   if (transferEncoding != request.headers.end()) {

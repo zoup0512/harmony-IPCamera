@@ -227,6 +227,85 @@ Typography 每秒栅格化一次文字层(系统全局 FontCollection)→ 文字
 模式下 pts 由本机单调钟生成;测试机存在微信浮窗抢前台导致后台被杀(与 OSD 无关,开麦克风
 连续任务保活可规避)。
 
+## P2 自动启动系列(已完成,真机验证通过 2026-09-28)
+
+对照 Android 四项自启动设置(沿用原 key 持久化):
+
+| 设置项 | Android Key | 鸿蒙实现 |
+|---|---|---|
+| 启动即开服务 | `auto_rtsp_after_turn_on` | 页面加载后自动 `rtspStart`(Index.aboutToAppear) |
+| 启动即推 RTMP | `auto_rtmp_after_turn_on` | 服务起来后自动 `rtmpStart`(连接异步化,失败走错误回调) |
+| 客户端连入自动开摄 | `start_camera_on_connect`(默认开) | 状态回调 Connected 事件 → `startCameraNow()` |
+| 开机自启 | `Start_on_boot` | **平台受限**:HarmonyOS 第三方应用无法编程式授权自启,`autoStartupManager` 仅提供 `getAutoStartupStatusForSelf()` 查询(API 21)。UI 保留开关并持久化,开启时提示用户到 系统设置>应用>IPCamera>启动管理 手动放行,并回读系统状态输出到日志 |
+
+**真机验证**(华为畅享 90 Plus):拉起应用零点击即 "● RUNNING"(自启服务);PC 端
+Python RTMP 测试服务器收到完整 handshake→connect→createStream→publish→onMetaData(自启
+RTMP);停相机后 PC 端 ffplay 连入 RTSP,4 秒内相机自动重启推流(连入开摄)。
+
+## P3 录制增强(已完成,真机验证通过 2026-09-28)
+
+| 设置项 | Android Key | 鸿蒙实现 |
+|---|---|---|
+| 4GB 限制 | `four_gb_limit`(默认开) | StreamRecorder 计字节数,≥3968MiB(32 位 sample offset 安全线)关闭当前文件并滚动到下一段 |
+| 定时分段 | `each_segment_length`(分钟,默认 10) | 每段可配时长,到点滚动;`0` 关闭 |
+| 分段命名 | — | `ipc_<ts>.mp4 → ipc_<ts>_2.mp4 → _3…`,天然匹配 `/getarchives` 的 `ipc_*.mp4` 过滤 |
+| 段间连续性 | — | 复用启动时捕获的 VPS/SPS/PPS 与音频配置重建 muxer;PTS 在新段从 0 重锚(下一写样本作为新基准),不丢样本(同线程紧邻完成关闭与重开) |
+| 接口 | — | `rtspStartRecord(handle, path, {fourGbLimit, segmentMinutes})` 可选第三参 |
+
+**不移植项(平台限制)**:`save_to_mkv`——OH_AVMuxer 仅支持 MP4/M4A,无 MKV 封装;`save_to_sdcard`——鸿蒙三方应用无公共存储写权限(沙盒 filesDir 即存档目录);`mp4_format` 独立录像编码选择——录像跟随 RTSP 编码(单编码器架构,与 Android 行为一致化)。
+
+**真机验证**(分段=1 分钟,录约 95 秒):`ipc_232304.mp4`(60.04s,92.6MB)+
+`ipc_232304_2.mp4`(35.3s,55MB),分段边界精确到帧;两段 ffprobe 均为 h264+aac
+1280x720 双轨、结构完整可独立播放。
+
+## /audio.opus 实时音频流(实现完成;真机受限,端点行为已验证)
+
+Android Web 控制台的听声端点,鸿蒙补齐:
+
+- **无需移植 libopus**:系统 `OH_AudioEncoder` 自带 `audio/opus` 编码器(API 11+,`OH_AVCODEC_MIMETYPE_AUDIO_OPUS`),48k 单声道 32kbps。
+- `opus_stream.cpp`:MicStreamer 新增 PCM tap(采集回调直通)→ Opus 编码器(旧式 audio data API,与 AAC 编码同款)→ **自研 Ogg Opus 封装**(Ogg 页/CRC32 多项式 0x04c11db7/段表/OpusHead+OpusTags 头,granule 由源 pts 换算)→ 多客户端广播(每客户端有界队列,慢客户端 8s 队满断开)。
+- 生命周期:编码器随首个客户端建、末个客户端销毁;`/audio.opus` 在麦克风未运行时返回 503,设备无 Opus 编码器时返回 501(运行时探测一次)。
+- Web 面板新增 `<audio src='/audio.opus' controls>`,与 Android `/audio.opus` 语义一致。
+
+**真机结论(华为畅享 90 Plus,HarmonyOS 7.0/JDY-AL50)**:该固件把 Opus 编码器注册进了
+系统能力表(`OH.Media.Codec.Encoder.Audio.Opus`,声道 1-2、码率 6k-510k、48k 均在范围内,
+按名创建实例也成功),但**底层插件拒绝一切 Configure(全部 AV_ERR_UNSUPPORT)**——逐一
+排除:S16LE/F32LE/bare、单声道/立体声、有无先注册回调、CreateByName,结论为厂商固件
+实际缺失 Opus 编码器插件。端点降级行为已验证:麦克风未开 → 503,编码器不可用 → 501
+"opus unavail"。完整链路(Ogg 封装、多客户端广播、PCM tap、编码器随首末客户端起停)
+在有可用 Opus 编码器的设备/模拟器上即自动激活。
+
+排查附带收获(通用坑):**OH_AVCodec 的 Configure 是一次性状态转换——Configure 失败后
+编码器实例不可复用,后续 Configure 一律 AV_ERR_INVALID_STATE(错误码 8);多配置变体尝试
+必须每个变体重新 Create**。
+
+## 阶段 8:ONVIF/播放器侧(已完成,真机验证通过 2026-09-28)
+
+对照 Android 播放器侧四大 Activity 的鸿蒙实现:
+
+| Android | 鸿蒙 | 说明 |
+|---|---|---|
+| OnvifScannerActivity | `OnvifScan.ets` + `onvif_client.cpp` | WS-Discovery Probe(UDP 组播 239.255.255.250:3702)→ ProbeMatch 去重 → SOAP GetProfiles + GetStreamUri(HTTP,自研极简 SOAP/解析,无 XML 库);扫描结果列 Model/XAddrs/流地址,一键复制;`onvifScan()` napi 异步(async work + Promise,返回 JSON) |
+| LiveVideoActivity | `Player.ets` | **平台限制**:鸿蒙 AVPlayer 无 RTSP 协议支持。实时画面走 Web 组件加载自家 MJPEG(`/video?pw=<密码>` 免 Basic token 参数——Web 组件无法带 Authorization 头);rtsp:// 地址点击播放即复制到剪贴板供 VLC/ffplay 使用 |
+| MediaPlayer(Plus)Activity | `Playback.ets` | AVPlayer + XComponent(surface 模式)回放 filesDir 下 `ipc_*.mp4` 录像,自动循环,暂停/停止 |
+| RTMPListActivity | `RtmpAddrs.ets` | RTMP 地址列表(preferences `rtmpAddrList`),增/删/设为当前推流地址 |
+
+真机验证:①PC 端 Python ONVIF 模拟器(WS-Discovery 应答 + SOAP 服务,temp 目录 `onvif_sim.py`),
+手机扫描页完整显示 SimCam-T100 / XAddrs / `rtsp://…:8554/simcam/profile_1` / profile_1
+(全链路:组播发现→Profile→流地址);②回放页播放 6 秒实测录像,state=playing,画面目检正确;
+③Player 页 Web 组件渲染自家 MJPEG 实时画面目检正确;④token 认证 curl 双向验证(对 200 multipart、
+错 401)。
+
+**附带修复**:`deviceIp()` 字节序 bug——鸿蒙 `wifiManager.getIpInfo().ipAddress` 是**网络序(大端)**
+数值,原 Index 的移位拆解方向反了(显示 123.110.168.192),两页统一改为从高字节拆解。
+
+**验证环境坑**:手机→PC 的 WS-Discovery 组播与 SOAP 被默认 Windows Defender 防火墙拦截,
+需入站放行 UDP 3702 + TCP 8000(已加规则 `ONVIF-Sim-UDP3702/TCP8000`,测试机保留);
+模拟器本机组播自测可绕过防火墙先验证逻辑。鸿蒙返回键 uitest keyEvent 码为 **2**(155 无效)。
+
+**已知边界**:ONVIF 发现无鉴权 GetProfiles/GetStreamUri(多数相机无需);流地址不直接内嵌播放
+(无系统 RTSP 组件);扫描依赖 AP 转发组播(家用 AP 默认泛洪,企业网可能过滤)。
+
 ## 阶段 7(远期,未排期)
 
 - Opus 音频流(/audio.opus):需移植 libopus(OHOS 三方库有现成移植)

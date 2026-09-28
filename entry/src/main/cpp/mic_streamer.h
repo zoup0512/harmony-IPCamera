@@ -37,6 +37,12 @@ class MicStreamer {
   bool Start(int sampleRate, int channels, int bitrate, FrameSink sink, ErrorSink onError);
   void Stop();
   bool IsRunning() const { return running_.load(); }
+  // Raw PCM tap for side consumers (e.g. the /audio.opus Opus encoder). The
+  // handler runs on the capturer callback thread and must not block.
+  void SetPcmTap(
+      std::function<void(const uint8_t*, size_t, int sampleRate, int channels)> tap) {
+    pcmTap_ = std::move(tap);
+  }
 
  private:
   void Fail(const std::string& what, int err);
@@ -74,6 +80,7 @@ class MicStreamer {
   FrameSink sink_;
   ErrorSink onError_;
   std::mutex stateMu_;
+  std::function<void(const uint8_t*, size_t, int, int)> pcmTap_;
 };
 
 }  // namespace ipcam

@@ -1,14 +1,15 @@
 import { wifiManager } from '@kit.ConnectivityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
-import { abilityAccessCtrl, common, Permissions, wantAgent } from '@kit.AbilityKit';
+import { abilityAccessCtrl, autoStartupManager, common, Permissions, wantAgent } from '@kit.AbilityKit';
 import { BusinessError, batteryInfo, deviceInfo } from '@kit.BasicServicesKit';
 import { geoLocationManager } from '@kit.LocationKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { preferences } from '@kit.ArkData';
 import { image } from '@kit.ImageKit';
 import { fileIo, picker } from '@kit.CoreFileKit';
-import { HttpOptions, OsdConfig, RtspEvent, RtspServer, RtspStartConfig } from '../model/RtspServer';
+import { router } from '@kit.ArkUI';
+import { HttpOptions, OsdConfig, RecordOptions, RtspEvent, RtspServer, RtspStartConfig } from '../model/RtspServer';
 
 const TAG: string = 'IPCameraIndex';
 const DOMAIN: number = 0xC010;
@@ -120,6 +121,12 @@ struct Index {
   @State wmPadding: string = '0';
   @State wmMaxArea: string = '10';
   @State osdSpeedUnitIdx: number = 0;
+  @State segFourGb: boolean = true;
+  @State segMinutes: string = '10';
+  @State autoRtsp: boolean = false;
+  @State autoRtmp: boolean = false;
+  @State bootStart: boolean = false;
+  @State camOnConnect: boolean = true;
   private keepAliveOn: boolean = false;
   private server: RtspServer = new RtspServer();
   private osdWatermarkPm: image.PixelMap | null = null;
@@ -159,6 +166,13 @@ struct Index {
         name = 'ERROR';
       }
       this.clients = clients;
+      if (event === RtspEvent.Connected && this.camOnConnect && this.running &&
+          !this.cameraRunning && !this.patternRunning) {
+        // Android start_camera_on_connect: first client brings the camera up
+        this.cameraRunning = this.startCameraNow();
+        this.appendLog(this.cameraRunning ? 'camera auto-started on client connect'
+                                          : 'camera auto-start failed');
+      }
       if (event === RtspEvent.Error && detail.startsWith('rtmp:')) {
         this.rtmpGeneration++;
         this.rtmpState = RtmpState.Idle;
@@ -170,6 +184,14 @@ struct Index {
       }
     });
     this.appendLog('ready - 启动服务后 VLC/ffplay 打开 RTSP 地址;相机画面在本页预览');
+    // Android auto_rtsp_after_turn_on / auto_rtmp_after_turn_on
+    if (this.autoRtsp && !this.running) {
+      this.onStartServer();
+    }
+    if (this.autoRtmp && this.running && this.rtmpUrl !== '' &&
+        this.rtmpState === RtmpState.Idle) {
+      this.onStartRtmp();
+    }
   }
 
   aboutToDisappear(): void {
@@ -210,8 +232,8 @@ struct Index {
   deviceIp(): string {
     try {
       const info: wifiManager.IpInfo = wifiManager.getIpInfo();
-      const ip: number = info.ipAddress;
-      return `${ip & 0xFF}.${(ip >>> 8) & 0xFF}.${(ip >>> 16) & 0xFF}.${(ip >>> 24) & 0xFF}`;
+      const ip: number = info.ipAddress >>> 0;  // network-order (big-endian)
+      return `${(ip >>> 24) & 0xFF}.${(ip >>> 16) & 0xFF}.${(ip >>> 8) & 0xFF}.${ip & 0xFF}`;
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'getIpInfo failed');
       return '0.0.0.0';
@@ -412,9 +434,14 @@ struct Index {
     }
     const ctx = getContext(this) as common.UIAbilityContext;
     const ts = this.timestamp().replace(/:/g, '');
-    const ok: boolean = this.server.startRecord(`${ctx.filesDir}/ipc_${ts}.mp4`);
+    const recordOptions: RecordOptions = {
+      fourGbLimit: this.segFourGb,
+      segmentMinutes: parseInt(this.segMinutes) || 0
+    };
+    const ok: boolean = this.server.startRecord(`${ctx.filesDir}/ipc_${ts}.mp4`, recordOptions);
     this.recording = ok;
-    this.appendLog(ok ? `recording started (MP4 ipc_${ts}.mp4)` : 'recording failed to start');
+    this.appendLog(ok ? `recording started (MP4 ipc_${ts}.mp4, 4GB分段=${this.segFourGb}, 分段=${recordOptions.segmentMinutes}分)`
+                      : 'recording failed to start');
   }
 
   onSnapshot(): void {
@@ -482,6 +509,16 @@ struct Index {
     this.appendLog('test pattern stopped');
   }
 
+  async checkBootStart(): Promise<void> {
+    try {
+      const granted: boolean = await autoStartupManager.getAutoStartupStatusForSelf();
+      this.appendLog(granted ? 'system autostart: enabled'
+                             : 'system autostart NOT enabled (grant in 系统设置>应用>IPCamera>启动管理)');
+    } catch (err) {
+      this.appendLog('autostart query failed');
+    }
+  }
+
   // ---------- OSD (text overlay) ----------
 
   loadOsdSettings(): void {
@@ -508,6 +545,12 @@ struct Index {
       if (wmSrc !== '') {
         this.decodeWatermark(wmSrc);
       }
+      this.segFourGb = pref.getSync('four_gb_limit', true) as boolean;
+      this.segMinutes = `${pref.getSync('each_segment_length', 10) as number}`;
+      this.autoRtsp = pref.getSync('auto_rtsp_after_turn_on', false) as boolean;
+      this.autoRtmp = pref.getSync('auto_rtmp_after_turn_on', false) as boolean;
+      this.bootStart = pref.getSync('Start_on_boot', false) as boolean;
+      this.camOnConnect = pref.getSync('start_camera_on_connect', true) as boolean;
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'loadOsdSettings failed');
     }
@@ -784,6 +827,16 @@ struct Index {
           Button('停止测试流').onClick(() => this.onStopPattern()).enabled(this.patternRunning)
         }
 
+        Row({ space: 8 }) {
+          Button('实时画面').onClick(() => router.pushUrl({ url: 'pages/Player' }))
+          Button('录像回放').onClick(() => router.pushUrl({ url: 'pages/Playback' }))
+        }
+
+        Row({ space: 8 }) {
+          Button('ONVIF 扫描').onClick(() => router.pushUrl({ url: 'pages/OnvifScan' }))
+          Button('RTMP 地址').onClick(() => router.pushUrl({ url: 'pages/RtmpAddrs' }))
+        }
+
         Text('设置(重启相机/服务后生效)').fontSize(13).fontWeight(FontWeight.Medium)
           .margin({ top: 4 })
 
@@ -873,6 +926,57 @@ struct Index {
             .onChange((v: string) => {
               this.keyframeInterval = v;
               this.saveSetting('keyframeInterval', parseInt(v) || 2);
+            })
+        }
+
+        Text('录像与自启动').fontSize(13).fontWeight(FontWeight.Medium).margin({ top: 8 })
+
+        Row({ space: 8 }) {
+          Text('4GB分段').fontSize(12).width(60)
+          Toggle({ type: ToggleType.Checkbox, isOn: this.segFourGb })
+            .onChange((on: boolean) => {
+              this.segFourGb = on;
+              this.saveSetting('four_gb_limit', on);
+            })
+          Text('分段(分,0关)').fontSize(12).width(96)
+          TextInput({ text: this.segMinutes }).fontSize(12).width(50).type(InputType.Number)
+            .onChange((v: string) => {
+              this.segMinutes = v;
+              this.saveSetting('each_segment_length', parseInt(v) || 0);
+            })
+        }
+
+        Row({ space: 6 }) {
+          Text('自启服务').fontSize(11)
+          Toggle({ type: ToggleType.Checkbox, isOn: this.autoRtsp })
+            .onChange((on: boolean) => {
+              this.autoRtsp = on;
+              this.saveSetting('auto_rtsp_after_turn_on', on);
+            })
+          Text('自启RTMP').fontSize(11)
+          Toggle({ type: ToggleType.Checkbox, isOn: this.autoRtmp })
+            .onChange((on: boolean) => {
+              this.autoRtmp = on;
+              this.saveSetting('auto_rtmp_after_turn_on', on);
+            })
+          Text('连入开摄').fontSize(11)
+          Toggle({ type: ToggleType.Checkbox, isOn: this.camOnConnect })
+            .onChange((on: boolean) => {
+              this.camOnConnect = on;
+              this.saveSetting('start_camera_on_connect', on);
+            })
+        }
+
+        Row({ space: 8 }) {
+          Text('开机自启').fontSize(12).width(64)
+          Toggle({ type: ToggleType.Switch, isOn: this.bootStart })
+            .onChange((on: boolean) => {
+              this.bootStart = on;
+              this.saveSetting('Start_on_boot', on);
+              if (on) {
+                this.appendLog('HarmonyOS 需在 系统设置>应用>IPCamera 中允许自启动');
+                this.checkBootStart();
+              }
             })
         }
 

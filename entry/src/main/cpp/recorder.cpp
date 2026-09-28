@@ -30,6 +30,9 @@ namespace {
 
 constexpr size_t kQueueLimit = 600;
 constexpr auto kStartupGrace = std::chrono::microseconds(800000);
+// Split below the 4 GiB mark: MP4 sample chunk offsets are 32-bit in the
+// muxer, and the Android four_gb_limit default mirrors the same intent.
+constexpr uint64_t kFourGbLimitBytes = 3968ULL * 1024ULL * 1024ULL;
 
 int64_t NowUs() {
   struct timespec ts {};
@@ -105,6 +108,13 @@ std::vector<uint8_t> LengthPrefixed(const std::vector<NalView>& nalsIn, bool h26
 
 StreamRecorder::~StreamRecorder() { Stop(); }
 
+void StreamRecorder::SetOptions(const Options& options) {
+  // Writer-thread fields are only touched between items, so an unlocked write
+  // of scalars is fine; queueMu_ is taken anyway when cheap.
+  std::lock_guard<std::mutex> lk(queueMu_);
+  options_ = options;
+}
+
 bool StreamRecorder::Enqueue(Item item) {
   std::lock_guard<std::mutex> lk(queueMu_);
   if (!accepting_.load()) return false;
@@ -152,6 +162,8 @@ bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink 
 
   filePath_ = filePath;
   rotation_ = rotation;
+  segmentIndex_ = 1;
+  pendingBaseReset_ = false;
   videoTrack_ = -1;
   audioTrack_ = -1;
   started_ = false;
@@ -306,6 +318,10 @@ void StreamRecorder::WriterLoop() {
             fatal = true;
             break;
           }
+          if (ShouldRotate() && !RotateSegment(videoParams, audioSeen, audioCfg)) {
+            fatal = true;
+            break;
+          }
         }
         startupPending.clear();
         if (fatal) break;
@@ -326,6 +342,11 @@ void StreamRecorder::WriterLoop() {
     } else {
       for (const Item& item : local) {
         if (!WriteItem(item, activeVideoIsH265)) {
+          fatal = true;
+          break;
+        }
+        if (ShouldRotate() &&
+            !RotateSegment(activeVideoParams_, activeAudioSeen_, activeAudioCfg_)) {
           fatal = true;
           break;
         }
@@ -435,6 +456,11 @@ bool StreamRecorder::CreateMuxer(const VideoParams& videoParams, bool audioSeen,
     return false;
   }
   started_ = true;
+  segmentBytes_ = 0;
+  segmentStart_ = std::chrono::steady_clock::now();
+  activeVideoParams_ = videoParams;
+  activeAudioCfg_ = audioCfg;
+  activeAudioSeen_ = audioSeen;
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
                "muxer started (video=%{public}d audio=%{public}d h265=%{public}d)",
                videoTrack_, audioTrack_, videoParams.h265 ? 1 : 0);
@@ -467,6 +493,14 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
     attr.flags = hasKey ? AVCODEC_BUFFER_FLAGS_SYNC_FRAME : AVCODEC_BUFFER_FLAGS_NONE;
     track = videoTrack_;
     lastPtsUs = &lastVideoPtsUs_;
+  }
+
+  if (pendingBaseReset_) {
+    // New segment: restart PTS from zero at the first written sample.
+    tsBaseUs_ = item.tsUs;
+    lastVideoPtsUs_ = -1;
+    lastAudioPtsUs_ = -1;
+    pendingBaseReset_ = false;
   }
 
   int64_t ptsUs = 0;
@@ -520,6 +554,46 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
     return false;
   }
   *lastPtsUs = ptsUs;
+  segmentBytes_ += static_cast<uint64_t>(attr.size);
+  return true;
+}
+
+bool StreamRecorder::ShouldRotate() const {
+  if (!started_) return false;
+  if (options_.fourGbLimit && segmentBytes_ >= kFourGbLimitBytes) return true;
+  if (options_.segmentMinutes > 0) {
+    auto elapsed = std::chrono::steady_clock::now() - segmentStart_;
+    if (elapsed >= std::chrono::minutes(options_.segmentMinutes)) return true;
+  }
+  return false;
+}
+
+std::string StreamRecorder::SegmentPath(const std::string& basePath, int index) {
+  if (index <= 1) return basePath;
+  size_t dot = basePath.find_last_of('.');
+  size_t slash = basePath.find_last_of('/');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+    return basePath + "_" + std::to_string(index);
+  }
+  return basePath.substr(0, dot) + "_" + std::to_string(index) + basePath.substr(dot);
+}
+
+bool StreamRecorder::RotateSegment(const VideoParams& videoParams, bool audioSeen,
+                                   const AudioCfg& audioCfg) {
+  std::string previous = SegmentPath(filePath_, segmentIndex_);
+  DestroyMuxerAndClose();
+  segmentIndex_++;
+  std::string next = SegmentPath(filePath_, segmentIndex_);
+  outputFd_ = open(next.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+  if (outputFd_ < 0) {
+    ReportFatalError("open segment output failed, errno=" + std::to_string(errno));
+    return false;
+  }
+  pendingBaseReset_ = true;
+  if (!CreateMuxer(videoParams, audioSeen, audioCfg)) return false;
+  OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
+               "segment %{public}d rotated -> %{public}s (prev %{public}s)",
+               segmentIndex_, next.c_str(), previous.c_str());
   return true;
 }
 

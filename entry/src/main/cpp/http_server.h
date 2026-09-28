@@ -13,11 +13,14 @@
 
 namespace ipcam {
 
+class OpusStream;
+
 // Minimal HTTP/1.1 server exposing the IP-camera web console, mirroring the
 // original Android app's endpoints:
 //   / /index /main.html      simple dashboard
 //   /snapshot.jpg /getsnapshot  latest JPEG still
 //   /video                   multipart/x-mixed-replace MJPEG
+//   /audio.opus              live Ogg Opus microphone stream (when mic runs)
 //   /serverinfo /size        plain-text status
 //   /light /camswitch        torch + camera facing actions (via command sink)
 //   /getarchives /get/ipc_*  recording archives
@@ -54,6 +57,7 @@ class HttpServer {
   void SetVoiceSink(VoiceSink sink);
   void SetArchiveSource(ArchiveSource source);
   void SetArchiveFile(ArchiveFile file);
+  void SetOpusStream(OpusStream* stream);
 
  private:
   struct Worker;
@@ -96,6 +100,7 @@ class HttpServer {
   VoiceSink voiceSink_;
   ArchiveSource archiveSource_;
   ArchiveFile archiveFile_;
+  OpusStream* opusStream_ = nullptr;
 };
 
 }  // namespace ipcam

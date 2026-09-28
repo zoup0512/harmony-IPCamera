@@ -61,6 +61,9 @@ int32_t MicStreamer::OnReadData(OH_AudioCapturer*, void* userData, void* buffer,
   auto self = static_cast<MicStreamer*>(userData);
   if (buffer != nullptr && bufferLen > 0 && self->running_.load()) {
     const uint8_t* p = static_cast<const uint8_t*>(buffer);
+    if (self->pcmTap_) {
+      self->pcmTap_(p, static_cast<size_t>(bufferLen), self->sampleRate_, self->channels_);
+    }
     const size_t frameBytes = 2 * static_cast<size_t>(self->channels_);
     {
       std::lock_guard<std::mutex> lk(self->pcmMu_);

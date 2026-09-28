@@ -52,7 +52,14 @@ export const rtmpStart: (server: object, url: string) => Promise<boolean>;
 export const rtmpStop: (server: object) => void;
 
 /** Record the shared streams into an MP4 file (H.264/H.265 + AAC). */
-export const rtspStartRecord: (server: object, filePath: string) => boolean;
+export interface RecordOptions {
+  /** four_gb_limit: rotate before MP4 32-bit sample offsets overflow (default true) */
+  fourGbLimit: boolean;
+  /** each_segment_length: new numbered segment every N minutes (0 = off, default 10) */
+  segmentMinutes: number;
+}
+export const rtspStartRecord: (server: object, filePath: string,
+  options?: RecordOptions) => boolean;
 export const rtspStopRecord: (server: object) => void;
 
 /** Decode the latest cached keyframe to a 24-bit BMP (async, result via status callback). */
@@ -120,3 +127,22 @@ export const osdSetGps: (server: object, lat: number, lng: number, speedKmh: num
   valid: boolean, speedMph: boolean) => void;
 /** Watermark image from a decoded RGBA_8888 PixelMap. */
 export const osdSetWatermark: (server: object, pixelmap: object) => boolean;
+
+/** ONVIF device discovered by onvifScan (JSON fields). */
+export interface OnvifDevice {
+  /** device service endpoint, http://ip:port/onvif/device_service */
+  xaddrs: string;
+  /** onvif://www.onvif.org/Model scope value (may be empty) */
+  model: string;
+  /** first media profile token (empty when resolution failed) */
+  profile: string;
+  /** rtsp://... stream URI of that profile (empty when unavailable) */
+  streamUri: string;
+  /** last SOAP/parse error (empty on success) */
+  error: string;
+}
+/**
+ * WS-Discovery probe + GetProfiles + GetStreamUri. Resolves with a JSON array
+ * of OnvifDevice objects (parse with JSON.parse). timeoutMs default 4000.
+ */
+export const onvifScan: (timeoutMs?: number) => Promise<string>;

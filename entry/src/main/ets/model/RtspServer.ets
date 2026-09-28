@@ -5,7 +5,8 @@ import { createRtspServer, rtspStart, rtspStop, rtspIsRunning, rtspClientCount,
   rtmpStart, rtmpStop, rtspStartRecord, rtspStopRecord, rtspTakeSnapshot,
   rtspStartHttp, rtspStopHttp, rtspSetMotion, rtspSetMotionTimeout,
   osdSetConfig, osdSetDeviceName, osdSetBattery, osdSetGps, osdSetWatermark,
-  RtspStartConfig, HttpOptions, OsdConfig
+  onvifScan,
+  RtspStartConfig, HttpOptions, OsdConfig, RecordOptions, OnvifDevice
 } from 'libstreaming.so';
 
 export { HttpOptions } from 'libstreaming.so';
@@ -13,6 +14,10 @@ export { HttpOptions } from 'libstreaming.so';
 export { RtspStartConfig } from 'libstreaming.so';
 
 export { OsdConfig } from 'libstreaming.so';
+
+export { RecordOptions } from 'libstreaming.so';
+
+export { OnvifDevice } from 'libstreaming.so';
 
 export enum RtspEvent {
   Connected = 0,
@@ -84,7 +89,10 @@ export class RtspServer {
     return rtmpStart(this.handle, url);
   }
 
-  startRecord(filePath: string): boolean {
+  startRecord(filePath: string, options?: RecordOptions): boolean {
+    if (options !== undefined) {
+      return rtspStartRecord(this.handle, filePath, options);
+    }
     return rtspStartRecord(this.handle, filePath);
   }
 
@@ -143,5 +151,10 @@ export class RtspServer {
 
   setOsdWatermark(pixelmap: object): boolean {
     return osdSetWatermark(this.handle, pixelmap);
+  }
+
+  scanOnvif(timeoutMs?: number): Promise<Array<OnvifDevice>> {
+    const p: Promise<string> = onvifScan(timeoutMs);
+    return p.then((json: string) => JSON.parse(json) as Array<OnvifDevice>);
   }
 }

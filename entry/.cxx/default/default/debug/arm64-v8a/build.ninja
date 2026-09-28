@@ -81,6 +81,14 @@ build CMakeFiles/streaming.dir/mic_streamer.cpp.o: CXX_COMPILER__streaming_unsca
   OBJECT_DIR = CMakeFiles\streaming.dir
   OBJECT_FILE_DIR = CMakeFiles\streaming.dir
 
+build CMakeFiles/streaming.dir/opus_stream.cpp.o: CXX_COMPILER__streaming_unscanned_Debug C$:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp/opus_stream.cpp || cmake_object_order_depends_target_streaming
+  DEFINES = -Dstreaming_EXPORTS
+  DEP_FILE = CMakeFiles\streaming.dir\opus_stream.cpp.o.d
+  FLAGS = -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info  -std=gnu++17 -fPIC
+  INCLUDES = -I"C:/Program Files/Huawei/DevEco Studio/sdk/default/hms/native/sysroot/usr/include" -IC:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp
+  OBJECT_DIR = CMakeFiles\streaming.dir
+  OBJECT_FILE_DIR = CMakeFiles\streaming.dir
+
 build CMakeFiles/streaming.dir/rtmp_publisher.cpp.o: CXX_COMPILER__streaming_unscanned_Debug C$:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp/rtmp_publisher.cpp || cmake_object_order_depends_target_streaming
   DEFINES = -Dstreaming_EXPORTS
   DEP_FILE = CMakeFiles\streaming.dir\rtmp_publisher.cpp.o.d
@@ -161,6 +169,14 @@ build CMakeFiles/streaming.dir/osd_pipeline.cpp.o: CXX_COMPILER__streaming_unsca
   OBJECT_DIR = CMakeFiles\streaming.dir
   OBJECT_FILE_DIR = CMakeFiles\streaming.dir
 
+build CMakeFiles/streaming.dir/onvif_client.cpp.o: CXX_COMPILER__streaming_unscanned_Debug C$:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp/onvif_client.cpp || cmake_object_order_depends_target_streaming
+  DEFINES = -Dstreaming_EXPORTS
+  DEP_FILE = CMakeFiles\streaming.dir\onvif_client.cpp.o.d
+  FLAGS = -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info  -std=gnu++17 -fPIC
+  INCLUDES = -I"C:/Program Files/Huawei/DevEco Studio/sdk/default/hms/native/sysroot/usr/include" -IC:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp
+  OBJECT_DIR = CMakeFiles\streaming.dir
+  OBJECT_FILE_DIR = CMakeFiles\streaming.dir
+
 build CMakeFiles/streaming.dir/napi_init.cpp.o: CXX_COMPILER__streaming_unscanned_Debug C$:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp/napi_init.cpp || cmake_object_order_depends_target_streaming
   DEFINES = -Dstreaming_EXPORTS
   DEP_FILE = CMakeFiles\streaming.dir\napi_init.cpp.o.d
@@ -177,7 +193,7 @@ build CMakeFiles/streaming.dir/napi_init.cpp.o: CXX_COMPILER__streaming_unscanne
 #############################################
 # Link the shared library C:\Users\24790\DevEcoStudioProjects\harmony-IPCamera\entry\build\default\intermediates\cmake\default\obj\arm64-v8a\libstreaming.so
 
-build C$:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/build/default/intermediates/cmake/default/obj/arm64-v8a/libstreaming.so: CXX_SHARED_LIBRARY_LINKER__streaming_Debug CMakeFiles/streaming.dir/rtsp_server.cpp.o CMakeFiles/streaming.dir/test_source.cpp.o CMakeFiles/streaming.dir/camera_streamer.cpp.o CMakeFiles/streaming.dir/mic_streamer.cpp.o CMakeFiles/streaming.dir/rtmp_publisher.cpp.o CMakeFiles/streaming.dir/recorder.cpp.o CMakeFiles/streaming.dir/snapshot.cpp.o CMakeFiles/streaming.dir/web_stream.cpp.o CMakeFiles/streaming.dir/jpeg_encoder.cpp.o CMakeFiles/streaming.dir/http_server.cpp.o CMakeFiles/streaming.dir/voice_player.cpp.o CMakeFiles/streaming.dir/osd_state.cpp.o CMakeFiles/streaming.dir/osd_renderer.cpp.o CMakeFiles/streaming.dir/osd_pipeline.cpp.o CMakeFiles/streaming.dir/napi_init.cpp.o
+build C$:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/build/default/intermediates/cmake/default/obj/arm64-v8a/libstreaming.so: CXX_SHARED_LIBRARY_LINKER__streaming_Debug CMakeFiles/streaming.dir/rtsp_server.cpp.o CMakeFiles/streaming.dir/test_source.cpp.o CMakeFiles/streaming.dir/camera_streamer.cpp.o CMakeFiles/streaming.dir/mic_streamer.cpp.o CMakeFiles/streaming.dir/opus_stream.cpp.o CMakeFiles/streaming.dir/rtmp_publisher.cpp.o CMakeFiles/streaming.dir/recorder.cpp.o CMakeFiles/streaming.dir/snapshot.cpp.o CMakeFiles/streaming.dir/web_stream.cpp.o CMakeFiles/streaming.dir/jpeg_encoder.cpp.o CMakeFiles/streaming.dir/http_server.cpp.o CMakeFiles/streaming.dir/voice_player.cpp.o CMakeFiles/streaming.dir/osd_state.cpp.o CMakeFiles/streaming.dir/osd_renderer.cpp.o CMakeFiles/streaming.dir/osd_pipeline.cpp.o CMakeFiles/streaming.dir/onvif_client.cpp.o CMakeFiles/streaming.dir/napi_init.cpp.o
   LANGUAGE_COMPILE_FLAGS = -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info
   LINK_FLAGS = --rtlib=compiler-rt -fuse-ld=lld -Wl,--build-id=sha1 -Wl,--warn-shared-textrel -Wl,--fatal-warnings -lunwind -Wl,--no-undefined -Qunused-arguments -Wl,-z,noexecstack
   LINK_LIBRARIES = -lace_napi.z  -lhilog_ndk.z  -lnative_media_core  -lnative_media_codecbase  -lnative_media_venc  -lnative_media_vdec  -lnative_media_adec  -lnative_media_avmuxer  -lnative_media_aenc  -lohcamera  -lohaudio  -lnative_window  -lnative_image  -lnative_buffer  -lnative_drawing  -lpixelmap  -lace_ndk.z  -lm

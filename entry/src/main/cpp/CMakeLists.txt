@@ -9,6 +9,7 @@ add_library(streaming SHARED
         test_source.cpp
         camera_streamer.cpp
         mic_streamer.cpp
+        opus_stream.cpp
         rtmp_publisher.cpp
         recorder.cpp
         snapshot.cpp
@@ -19,6 +20,7 @@ add_library(streaming SHARED
         osd_state.cpp
         osd_renderer.cpp
         osd_pipeline.cpp
+        onvif_client.cpp
         napi_init.cpp)
 
 target_include_directories(streaming PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

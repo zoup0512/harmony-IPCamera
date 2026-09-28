@@ -25,6 +25,12 @@
 },
 {
   "directory": "C:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/.cxx/default/default/debug/x86_64",
+  "command": "C:\\PROGRA~1\\Huawei\\DEVECO~1\\sdk\\default\\OPENHA~1\\native\\llvm\\bin\\CLANG_~1.EXE --target=x86_64-linux-ohos --gcc-toolchain=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/llvm\" --sysroot=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/sysroot\" -Dstreaming_EXPORTS -I\"C:/Program Files/Huawei/DevEco Studio/sdk/default/hms/native/sysroot/usr/include\" -IC:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info  -std=gnu++17 -fPIC -o CMakeFiles\\streaming.dir\\opus_stream.cpp.o -c C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\opus_stream.cpp",
+  "file": "C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\opus_stream.cpp",
+  "output": "CMakeFiles\\streaming.dir\\opus_stream.cpp.o"
+},
+{
+  "directory": "C:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/.cxx/default/default/debug/x86_64",
   "command": "C:\\PROGRA~1\\Huawei\\DEVECO~1\\sdk\\default\\OPENHA~1\\native\\llvm\\bin\\CLANG_~1.EXE --target=x86_64-linux-ohos --gcc-toolchain=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/llvm\" --sysroot=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/sysroot\" -Dstreaming_EXPORTS -I\"C:/Program Files/Huawei/DevEco Studio/sdk/default/hms/native/sysroot/usr/include\" -IC:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info  -std=gnu++17 -fPIC -o CMakeFiles\\streaming.dir\\rtmp_publisher.cpp.o -c C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\rtmp_publisher.cpp",
   "file": "C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\rtmp_publisher.cpp",
   "output": "CMakeFiles\\streaming.dir\\rtmp_publisher.cpp.o"
@@ -82,6 +88,12 @@
   "command": "C:\\PROGRA~1\\Huawei\\DEVECO~1\\sdk\\default\\OPENHA~1\\native\\llvm\\bin\\CLANG_~1.EXE --target=x86_64-linux-ohos --gcc-toolchain=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/llvm\" --sysroot=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/sysroot\" -Dstreaming_EXPORTS -I\"C:/Program Files/Huawei/DevEco Studio/sdk/default/hms/native/sysroot/usr/include\" -IC:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info  -std=gnu++17 -fPIC -o CMakeFiles\\streaming.dir\\osd_pipeline.cpp.o -c C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\osd_pipeline.cpp",
   "file": "C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\osd_pipeline.cpp",
   "output": "CMakeFiles\\streaming.dir\\osd_pipeline.cpp.o"
+},
+{
+  "directory": "C:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/.cxx/default/default/debug/x86_64",
+  "command": "C:\\PROGRA~1\\Huawei\\DEVECO~1\\sdk\\default\\OPENHA~1\\native\\llvm\\bin\\CLANG_~1.EXE --target=x86_64-linux-ohos --gcc-toolchain=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/llvm\" --sysroot=\"C:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/sysroot\" -Dstreaming_EXPORTS -I\"C:/Program Files/Huawei/DevEco Studio/sdk/default/hms/native/sysroot/usr/include\" -IC:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/src/main/cpp -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -fno-addrsig -Wa,--noexecstack -Wformat -Werror=format-security   -D__MUSL__ -O0 -g -fno-limit-debug-info  -std=gnu++17 -fPIC -o CMakeFiles\\streaming.dir\\onvif_client.cpp.o -c C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\onvif_client.cpp",
+  "file": "C:\\Users\\24790\\DevEcoStudioProjects\\harmony-IPCamera\\entry\\src\\main\\cpp\\onvif_client.cpp",
+  "output": "CMakeFiles\\streaming.dir\\onvif_client.cpp.o"
 },
 {
   "directory": "C:/Users/24790/DevEcoStudioProjects/harmony-IPCamera/entry/.cxx/default/default/debug/x86_64",
