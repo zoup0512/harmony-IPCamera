@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "C:\\Users\\24790\\.ohos\\config\\default_harmony-IPCamera_f8WBZrKl55Fl0OupqHv36Nx9cVaqa34lU9LTTxUtTdA=.cer",
+          "certpath": "C:\\Users\\vyron\\.ohos\\config\\default_harmony-IPCamera_juZHpj5wYLGXKmjMuVcxXdOJ2NDoFXKRBpPQzVEPGm4=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001BCD39544CAE9ACAE85103C61D60D15C3400ECD2C3AC9C16030597B5EF374C63D542FC4006215A93",
-          "profile": "C:\\Users\\24790\\.ohos\\config\\default_harmony-IPCamera_f8WBZrKl55Fl0OupqHv36Nx9cVaqa34lU9LTTxUtTdA=.p7b",
+          "keyPassword": "0000001B821352AA6A9F5E89C0DDE6EE1C3EC531CDC9411B872F348D4BA0FC9ED8C177822163A8BE10E688",
+          "profile": "C:\\Users\\vyron\\.ohos\\config\\default_harmony-IPCamera_juZHpj5wYLGXKmjMuVcxXdOJ2NDoFXKRBpPQzVEPGm4=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\24790\\.ohos\\config\\default_harmony-IPCamera_f8WBZrKl55Fl0OupqHv36Nx9cVaqa34lU9LTTxUtTdA=.p12",
-          "storePassword": "0000001B17D0A117D1FD7467ABFDB82B567CD14ED757843CFA6AE10048F7A5562345E9101547BB9F21543B"
+          "storeFile": "C:\\Users\\vyron\\.ohos\\config\\default_harmony-IPCamera_juZHpj5wYLGXKmjMuVcxXdOJ2NDoFXKRBpPQzVEPGm4=.p12",
+          "storePassword": "0000001B96AA2FBA06D989EE4EAEC412FF53EB348168F39E6AAC02DAAFD1FF880A186D848A415503947D6F"
         }
       }
     ],

@@ -44,6 +44,10 @@ class OsdRenderer {
   OsdSnapshot cached_;
   long cachedSecond_ = -1;
   bool hasCached_ = false;
+  int cachedFrameW_ = -1;
+  int cachedFrameH_ = -1;
+  bool rasterLogged_ = false;
+  bool emptyLayerLogged_ = false;
 };
 
 }  // namespace ipcam

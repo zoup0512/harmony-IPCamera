@@ -28,6 +28,12 @@ void LogErr(const char* what, int err) {
   OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "%{public}s err=%{public}d", what, err);
 }
 
+// Last rotation the OSD pipeline derived from the preview surface. Recordings
+// in the raw (surface) path use it as MP4 rotation metadata so players show
+// them upright; the OSD path needs no metadata because its pixels are already
+// rotated before encoding.
+std::atomic<int> g_lastKnownRotation{0};
+
 }  // namespace
 
 CameraStreamer::CameraStreamer() = default;
@@ -108,13 +114,12 @@ void CameraStreamer::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuffer*
 }
 
 void CameraStreamer::Cleanup() {
-  // The OSD pipeline writes into the encoder window; shut it down before the
-  // encoder (its consumer) goes away.
-  if (osd_ != nullptr) {
-    osd_->Stop();
-    osd_.reset();
-    pendingCv_.notify_all();  // wake a blocked buffer-mode input callback
-  }
+  // Tear the producer down first: stop the camera preview outputs and the
+  // capture session BEFORE stopping the OSD pipeline. The OSD consumer
+  // surface must not be unmapped/destroyed while the camera is still pushing
+  // frames into it (in-flight FlushBuffer/ReuseBuffer on the queue during
+  // teardown was the ClearMapCache SIGSEGV). The OSD path feeds the encoder
+  // in buffer mode, so the encoder is independent of the camera surface.
   if (previewUi_ != nullptr) {
     OH_PreviewOutput_Stop(previewUi_);
     OH_PreviewOutput_Release(previewUi_);
@@ -136,6 +141,11 @@ void CameraStreamer::Cleanup() {
   if (manager_ != nullptr) {
     OH_Camera_DeleteCameraManager(manager_);
     manager_ = nullptr;
+  }
+  if (osd_ != nullptr) {
+    osd_->Stop();
+    osd_.reset();
+    pendingCv_.notify_all();  // wake a blocked buffer-mode input callback
   }
   if (encoder_ != nullptr) {
     OH_VideoEncoder_Stop(encoder_);
@@ -241,15 +251,73 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
     running_ = false;
     return false;
   }
+  // Pick the input path before configuring the encoder: the buffer (OSD) path
+  // must declare its pixel format, the surface path must not (the format then
+  // travels on the surface buffers, and an explicit buffer format makes the
+  // codec expect CPU input instead). The OSD pipeline only touches the camera,
+  // so starting it here is independent of the encoder configuration below.
+  uint64_t cameraSurfaceId = 0;
+  bool osdOwnsPreview = false;
+  if (osdEnabled) {
+    osd_ = std::make_unique<OsdPipeline>();
+    bool ok = osd_->Start(
+        width, height, hasPendingPreview_ ? pendingPreviewId_ : 0,
+        &cameraSurfaceId,
+        [this](const uint8_t* nv12, size_t size) {
+          std::lock_guard<std::mutex> lk(pendingMu_);
+          pendingFrame_.assign(nv12, nv12 + size);
+          hasPending_ = true;
+          pendingCv_.notify_one();
+        },
+        [](const std::string& err) {
+          OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "osd: %{public}s",
+                       err.c_str());
+        });
+    if (ok) {
+      // The pipeline owns the XComponent surface when one was handed over.
+      osdOwnsPreview = hasPendingPreview_ && pendingPreviewId_ != 0;
+      g_lastKnownRotation.store(osd_->rotation());
+      // Already-rotated pixels: rotation metadata would double-rotate.
+      orientation_.store(0);
+      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
+                   "OSD CPU pipeline active, buffer-mode encoder rot=%{public}d "
+                   "out=%{public}dx%{public}d (camera surface %{public}llu)",
+                   osd_->rotation(), osd_->OutWidth(), osd_->OutHeight(),
+                   static_cast<unsigned long long>(cameraSurfaceId));
+    } else {
+      OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
+                   "OSD pipeline init failed, streaming without OSD");
+      osd_.reset();
+      cameraSurfaceId = 0;
+    }
+  }
+  int encW = width;
+  int encH = height;
+  if (cameraSurfaceId != 0) {
+    // Rotated output: 90/270 swaps the encoder dimensions.
+    encW = osd_->OutWidth();
+    encH = osd_->OutHeight();
+  } else {
+    orientation_.store(g_lastKnownRotation.load());
+  }
+  encW_ = encW;
+  encH_ = encH;
   OH_AVFormat* format = OH_AVFormat_Create();
-  OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, width);
-  OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, height);
+  OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, encW);
+  OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, encH);
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_BITRATE, bitrate);
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE, BITRATE_MODE_CBR);
   OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE, 30.0);
   // Unit is MILLISECONDS per the NDK header (an Android-style seconds value of
   // 2 here would make every frame a keyframe).
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, lastIFrameMs_);
+  if (cameraSurfaceId != 0) {
+    // Buffer mode: pin the input layout to the tightly-packed NV12 the OSD
+    // pipeline produces. Without this the codec falls back to its default
+    // input format and reads the buffer as 4-byte pixels, which turns the
+    // picture into 4 squashed horizontal copies with a black bottom half.
+    OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, AV_PIXEL_FORMAT_NV12);
+  }
   aerr = OH_VideoEncoder_Configure(encoder_, format);
   OH_AVFormat_Destroy(format);
   if (aerr != AV_ERR_OK) {
@@ -264,37 +332,6 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
     Cleanup();
     running_ = false;
     return false;
-  }
-  // OSD path: the CPU compositing pipeline receives the camera frames and
-  // feeds the encoder in BUFFER mode (OnNeedInputBuffer below). Direct path:
-  // the camera renders straight into the encoder's producer surface. The
-  // codec HDI on this device rejects producer-side Request/FlushBuffer on the
-  // encoder surface, which is why OSD cannot reuse the surface path.
-  uint64_t cameraSurfaceId = 0;
-  if (osdEnabled) {
-    osd_ = std::make_unique<OsdPipeline>();
-    bool ok = osd_->Start(
-        width, height, &cameraSurfaceId,
-        [this](const uint8_t* nv12, size_t size) {
-          std::lock_guard<std::mutex> lk(pendingMu_);
-          pendingFrame_.assign(nv12, nv12 + size);
-          hasPending_ = true;
-          pendingCv_.notify_one();
-        },
-        [](const std::string& err) {
-          OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "osd: %{public}s",
-                       err.c_str());
-        });
-    if (ok) {
-      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                   "OSD CPU pipeline active, buffer-mode encoder (camera surface %{public}llu)",
-                   static_cast<unsigned long long>(cameraSurfaceId));
-    } else {
-      OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
-                   "OSD pipeline init failed, streaming without OSD");
-      osd_.reset();
-      cameraSurfaceId = 0;
-    }
   }
   if (cameraSurfaceId == 0) {
     // Surface mode: camera renders into the encoder's producer surface.
@@ -356,7 +393,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   err = OH_CaptureSession_BeginConfig(session_);
   if (err == CAMERA_OK) err = OH_CaptureSession_AddInput(session_, input_);
   if (err == CAMERA_OK) err = OH_CaptureSession_AddPreviewOutput(session_, preview_);
-  if (err == CAMERA_OK && hasPendingPreview_) {
+  if (err == CAMERA_OK && hasPendingPreview_ && !osdOwnsPreview) {
     char sidStr2[32];
     snprintf(sidStr2, sizeof(sidStr2), "%llu",
              static_cast<unsigned long long>(pendingPreviewId_));
@@ -385,7 +422,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   }
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
                "camera streaming %{public}ux%{public}u -> encoder %{public}dx%{public}d",
-               profile.size.width, profile.size.height, width, height);
+               profile.size.width, profile.size.height, encW, encH);
   return true;
 }
 
@@ -430,6 +467,16 @@ bool CameraStreamer::Restart() {
 }
 
 bool CameraStreamer::AttachPreview(uint64_t surfaceId) {
+  if (osd_ != nullptr) {
+    // OSD mode: the pipeline owns the local preview and adopts surfaces live
+    // (switching pages destroys and recreates the XComponent), so no camera
+    // restart is needed here. Keep the id pending so a later start without OSD
+    // re-attaches the camera output to the same surface.
+    pendingPreviewId_ = surfaceId;
+    bool ok = osd_->SetUiSurface(surfaceId);
+    g_lastKnownRotation.store(osd_->rotation());
+    return ok;
+  }
   if (previewUi_ != nullptr) return true;  // already attached
   if (!running_.load() || session_ == nullptr || manager_ == nullptr) {
     pendingPreviewId_ = surfaceId;

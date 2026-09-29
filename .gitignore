@@ -37,3 +37,7 @@ yarn.lock
 Thumbs.db
 *.swp
 *.swo
+
+# native build artifacts (CMake/ninja output)
+entry/.cxx/
+*.dmp

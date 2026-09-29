@@ -50,7 +50,8 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
 
   // The timestamp only changes once per second; re-raster on the second tick
   // or whenever any text-affecting field differs from the cached snapshot.
-  bool dirty = !hasCached_ || second != cachedSecond_ || text_.width != frameW ||
+  bool dirty = !hasCached_ || second != cachedSecond_ ||
+               cachedFrameW_ != frameW || cachedFrameH_ != frameH ||
                snap.enabled != cached_.enabled || snap.padding != cached_.padding ||
                snap.position != cached_.position || snap.fontStyle != cached_.fontStyle ||
                snap.argb != cached_.argb || snap.showTimestamp != cached_.showTimestamp ||
@@ -67,6 +68,8 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
   cached_ = snap;
   cachedSecond_ = second;
   hasCached_ = true;
+  cachedFrameW_ = frameW;
+  cachedFrameH_ = frameH;
 
   std::string lines;
   auto addLine = [&lines](const std::string& s) {
@@ -90,10 +93,50 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
   if (!snap.customText.empty()) addLine(snap.customText);
 
   if (lines.empty()) {
+    if (snap.enabled && (snap.showTimestamp || snap.showDevName ||
+                         snap.showBattery || snap.showGps ||
+                         !snap.customText.empty())) {
+      OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
+                   "osd on but no lines rendered (ts=%{public}d dev=%{public}d "
+                   "bat=%{public}d lvl=%{public}d gps=%{public}d custom=%{public}zu "
+                   "devName=%{public}zu)",
+                   snap.showTimestamp ? 1 : 0, snap.showDevName ? 1 : 0,
+                   snap.showBattery ? 1 : 0, snap.batteryLevel, snap.showGps ? 1 : 0,
+                   snap.customText.size(), snap.devName.size());
+    }
     text_ = Layer{};
     return true;
   }
   Rasterize(lines, snap, frameW, frameH);
+  if (!text_.empty()) {
+    // A layout that succeeds but rasterizes to a fully transparent bitmap is
+    // the silent "OSD configured but invisible" failure; count opaque pixels
+    // so it is distinguishable from a real text layer in the log.
+    size_t opaque = 0;
+    uint8_t maxA = 0;
+    const std::vector<uint8_t>& px = text_.rgba;
+    for (size_t i = 3; i < px.size(); i += 4) {
+      uint8_t a = px[i];
+      if (a != 0) ++opaque;
+      if (a > maxA) maxA = a;
+    }
+    if (opaque == 0) {
+      if (!emptyLayerLogged_) {
+        emptyLayerLogged_ = true;
+        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
+                     "osd layer %{public}dx%{public}d rasterized but fully "
+                     "transparent (invisible)",
+                     text_.width, text_.height);
+      }
+    } else if (!rasterLogged_) {
+      rasterLogged_ = true;
+      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
+                   "osd text layer %{public}dx%{public}d opaque=%{public}zu/%{public}zu "
+                   "maxA=%{public}u frame=%{public}dx%{public}d",
+                   text_.width, text_.height, opaque, px.size() / 4,
+                   static_cast<unsigned>(maxA), frameW, frameH);
+    }
+  }
   return true;
 }
 
@@ -152,6 +195,10 @@ void OsdRenderer::Rasterize(const std::string& text, const OsdSnapshot& snap, in
   int w = static_cast<int>(std::ceil(OH_Drawing_TypographyGetLongestLine(typo)));
   int h = static_cast<int>(std::ceil(OH_Drawing_TypographyGetHeight(typo)));
   if (w <= 0 || h <= 0) {
+    OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
+                 "typography layout empty w=%{public}d h=%{public}d fontPx=%{public}d "
+                 "maxW=%{public}d textLen=%{public}zu",
+                 w, h, fontPx, maxW, text.size());
     OH_Drawing_DestroyTypography(typo);
     text_ = Layer{};
     return;

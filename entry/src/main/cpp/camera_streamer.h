@@ -44,6 +44,10 @@ class CameraStreamer {
   void Stop();
   bool IsRunning() const { return running_.load(); }
   int Orientation() const { return orientation_.load(); }
+  // Encoder-facing dimensions: the requested size, except in OSD mode with a
+  // 90/270 rotation where they are swapped.
+  int EncodedWidth() const { return encW_; }
+  int EncodedHeight() const { return encH_; }
   bool SetTorch(bool on);
   bool SwitchFacing();  // restart with the other camera, preview preserved
   bool Restart();       // restart with the same params (fresh encoder emits IDR)
@@ -89,6 +93,8 @@ class CameraStreamer {
   std::vector<uint8_t> lastFrame_;
   std::atomic<bool> running_{false};
   std::atomic<int> orientation_{0};
+  int encW_ = 0;  // encoder dimensions of the current run
+  int encH_ = 0;
   FrameSink sink_;
   ErrorSink onError_;
   std::mutex stateMu_;

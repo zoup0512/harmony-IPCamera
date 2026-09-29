@@ -194,6 +194,20 @@ struct Index {
     }
   }
 
+  onPageShow(): void {
+    this.pageActive = true;
+    // Coming back to the page (foreground return, or back from Playback):
+    // the system closes the camera device while the app is backgrounded
+    // (privacy_service + camera_service CloseDevice), and nothing rebuilds
+    // the capture session on the way in — without this restart the stream
+    // and the preview stay frozen on the last frame.
+    if (this.cameraRunning) {
+      this.cameraRunning = this.startCameraNow();
+      this.appendLog(this.cameraRunning ? 'camera restarted on page show'
+                                        : 'camera restart failed on page show');
+    }
+  }
+
   aboutToDisappear(): void {
     this.pageActive = false;
     this.rtmpGeneration++;

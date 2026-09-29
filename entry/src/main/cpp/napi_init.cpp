@@ -628,8 +628,6 @@ napi_value RtspStartCamera(napi_env env, napi_callback_info info) {
     holder->pattern.reset();
   }
   holder->StopCameraOutput();
-  holder->streamWidth.store(static_cast<int>(width));
-  holder->streamHeight.store(static_cast<int>(height));
   holder->videoIsH265.store(std::string(mime) == "video/hevc");
   holder->webParamsInjected.store(false);
   auto camera = std::make_unique<ipcam::CameraStreamer>();
@@ -646,6 +644,11 @@ napi_value RtspStartCamera(napi_env env, napi_callback_info info) {
         PostEvent(holder, ipcam::RtspEvent::kServerError, holder->server.ClientCount(), err);
       });
   if (ok) {
+    // Encoded dims, not requested dims: OSD mode may rotate the stream 90/270
+    // (portrait mount), and every downstream consumer (web decoder, snapshot,
+    // recorder, serverinfo) keys off these atoms.
+    holder->streamWidth.store(camera->EncodedWidth());
+    holder->streamHeight.store(camera->EncodedHeight());
     {
       std::lock_guard<std::mutex> lk(holder->cameraMu);
       holder->camera = std::move(camera);

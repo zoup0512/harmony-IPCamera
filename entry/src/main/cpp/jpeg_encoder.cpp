@@ -147,7 +147,10 @@ std::vector<uint8_t> JpegEncoder::EncodeNV12(const uint8_t* nv12, int width, int
     sof.push_back(1);
     PushMarker(jpg, 0xC0, sof);
   }
-  const uint8_t dcBits[16] = {0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  // DC: 16 symbols @ 5 bits. A full 4-bit table is illegal (16 codes would fill
+  // the code space and use the reserved all-ones code, which libjpeg rejects as
+  // "Bogus Huffman table definition"), so the codes get one spare bit.
+  const uint8_t dcBits[16] = {0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   std::vector<uint8_t> dcVals;
   for (int i = 0; i < 16; ++i) dcVals.push_back(static_cast<uint8_t>(i));
   PushDHT(jpg, 0x00, dcBits, dcVals);
@@ -214,7 +217,7 @@ std::vector<uint8_t> JpegEncoder::EncodeNV12(const uint8_t* nv12, int width, int
       cat++;
       absv >>= 1;
     }
-    bw.Put(cat, 4);  // DC Huffman: 4-bit codes, symbol = cat (0..15)
+    bw.Put(cat, 5);  // DC Huffman: 5-bit codes, symbol = cat (0..15)
     if (cat) {
       int v = diff > 0 ? diff : diff + (1 << cat) - 1;
       bw.Put(static_cast<uint32_t>(v), cat);
