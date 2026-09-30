@@ -62,7 +62,7 @@ function loadSettings(ctx: common.UIAbilityContext): Settings {
     facing: pref.getSync('facing', 0) as number,
     port: pref.getSync('port', 8554) as number,
     httpPort: pref.getSync('httpPort', 8081) as number,
-    motionTimeout: pref.getSync('motionTimeout', 15) as number,
+    motionTimeout: Math.min(120, Math.max(10, pref.getSync('motionTimeout', 15) as number)),
     keyframeInterval: pref.getSync('keyframeInterval', 2) as number,
     path: pref.getSync('path', 'live') as string,
     user: pref.getSync('user', 'admin') as string,
@@ -90,6 +90,7 @@ struct Index {
   @State recording: boolean = false;
   @State httpRunning: boolean = false;
   @State motionEnabled: boolean = false;
+  @State motionRecording: boolean = false;
   @State httpPort: string = '8081';
   @State motionTimeout: string = '15';
   @State keyframeInterval: string = '2';
@@ -134,6 +135,7 @@ struct Index {
   private batteryTimerId: number = -1;
   private rtmpGeneration: number = 0;
   private pageActive: boolean = false;
+  private motionRecordPath: string = '';
 
   aboutToAppear(): void {
     this.pageActive = true;
@@ -177,7 +179,13 @@ struct Index {
         this.rtmpGeneration++;
         this.rtmpState = RtmpState.Idle;
       }
-      if (detail.startsWith('snapshot') || detail === 'MOTION detected') {
+      if (detail === 'MOTION detected') {
+        this.appendLog('MOTION detected');
+        this.onMotionStart();
+      } else if (detail === 'MOTION cleared') {
+        this.appendLog('MOTION cleared');
+        this.onMotionStop();
+      } else if (detail.startsWith('snapshot')) {
         this.appendLog(detail);
       } else {
         this.appendLog(`${name} ${detail} (clients=${clients})`);
@@ -213,6 +221,7 @@ struct Index {
     this.rtmpGeneration++;
     this.stopGpsTimer();
     this.stopBatteryTimer();
+    this.stopMotionMode('motion detection OFF (page closed)');
     this.server.stopHttp();
     this.httpRunning = false;
     if (this.recording) {
@@ -322,6 +331,7 @@ struct Index {
 
   onStopServer(): void {
     this.rtmpGeneration++;
+    this.stopMotionMode('motion detection OFF (server stopped)');
     this.server.stopHttp();
     this.httpRunning = false;
     if (this.recording) {
@@ -373,6 +383,7 @@ struct Index {
   }
 
   onStopCamera(): void {
+    this.stopMotionMode('motion detection OFF (camera stopped)');
     this.server.stopCamera();
     this.cameraRunning = false;
     this.appendLog('camera stopped');
@@ -446,6 +457,10 @@ struct Index {
       this.appendLog('start the server first');
       return;
     }
+    if (this.motionEnabled) {
+      this.appendLog('manual recording is off while motion detection is ON');
+      return;
+    }
     const ctx = getContext(this) as common.UIAbilityContext;
     const ts = this.timestamp().replace(/:/g, '');
     const recordOptions: RecordOptions = {
@@ -494,11 +509,110 @@ struct Index {
   }
 
   onToggleMotion(): void {
-    this.motionEnabled = !this.motionEnabled;
-    const timeout = parseInt(this.motionTimeout) || 15;
-    this.server.setMotion(this.motionEnabled, timeout);
-    this.appendLog(this.motionEnabled ? `motion detection ON (timeout=${timeout}s)`
-                                      : 'motion detection OFF');
+    if (this.motionEnabled) {
+      this.motionEnabled = false;
+      this.server.setMotion(false);  // ends a live episode -> onMotionStop closes the file
+      this.appendLog('motion detection OFF');
+      return;
+    }
+    // Android switches motion mode on by bringing the server up first
+    // (BaseServerActivity.G0 -> R0). Detection and the auto recording both read
+    // the encoded stream, and the encoders only emit their parameter sets at
+    // stream start, so the server has to be up before anything can be written.
+    if (!this.running) this.onStartServer();
+    if (!this.running) {
+      this.appendLog('motion detection needs the RTSP server (start failed)');
+      return;
+    }
+    if (!this.cameraRunning) {
+      this.cameraRunning = this.startCameraNow();
+      this.appendLog(this.cameraRunning ? 'camera started for motion detection'
+                                        : 'motion detection: camera failed to start');
+    }
+    if (this.recording) {
+      this.server.stopRecord();
+      this.recording = false;
+      this.appendLog('manual recording stopped (motion detection takes over)');
+    }
+    // Android clamps motion_timeout to 10-120 s (SeekBarPreference min/max).
+    const timeout = Math.min(120, Math.max(10, parseInt(this.motionTimeout) || 15));
+    this.motionTimeout = `${timeout}`;
+    this.saveSetting('motionTimeout', timeout);
+    this.motionEnabled = true;
+    this.server.setMotion(true, timeout);
+    this.appendLog(`motion detection ON (timeout=${timeout}s, arms in 10s, auto record MD/)`);
+  }
+
+  // Android timestamp shape for motion records: yyyy-MM-dd.HH.mm.ss.SSSS
+  // (BaseServerActivity.F0 -> DCIM/IPCamera/MD/IPS_<date>.mp4).
+  // Android clamps motion_timeout to 10-120 s (SeekBarPreference min/max).
+  normalizeMotionTimeout(): void {
+    const timeout = Math.min(120, Math.max(10, parseInt(this.motionTimeout) || 15));
+    this.motionTimeout = `${timeout}`;
+    this.saveSetting('motionTimeout', timeout);
+  }
+
+  motionTimestamp(): string {
+    const d: Date = new Date();
+    const p = (n: number, w: number): string => {
+      let s = `${n}`;
+      while (s.length < w) s = `0${s}`;
+      return s;
+    };
+    return `${p(d.getFullYear(), 4)}-${p(d.getMonth() + 1, 2)}-${p(d.getDate(), 2)}.` +
+           `${p(d.getHours(), 2)}.${p(d.getMinutes(), 2)}.${p(d.getSeconds(), 2)}.` +
+           `${p(d.getMilliseconds(), 4)}`;
+  }
+
+  onMotionStart(): void {
+    if (this.motionRecording) return;
+    if (this.recording) {
+      this.appendLog('motion: manual recording is running, auto record skipped');
+      return;
+    }
+    const ctx = getContext(this) as common.UIAbilityContext;
+    const dir = `${ctx.filesDir}/MD`;
+    try {
+      if (!fileIo.accessSync(dir)) fileIo.mkdirSync(dir, true);
+    } catch (err) {
+      this.appendLog('motion: cannot create the MD folder');
+      return;
+    }
+    const stamp = this.motionTimestamp();
+    const path = `${dir}/IPS_${stamp}.mp4`;
+    const recordOptions: RecordOptions = {
+      fourGbLimit: this.segFourGb,
+      segmentMinutes: parseInt(this.segMinutes) || 0
+    };
+    const ok: boolean = this.server.startRecord(path, recordOptions);
+    this.motionRecording = ok;
+    this.motionRecordPath = ok ? path : '';
+    this.appendLog(ok ? `motion record started (MD/IPS_${stamp}.mp4)`
+                      : 'motion record failed to start');
+  }
+
+  onMotionStop(): void {
+    if (!this.motionRecording) return;
+    const name = this.motionRecordPath.substring(this.motionRecordPath.lastIndexOf('/') + 1);
+    this.server.stopRecord();
+    this.motionRecording = false;
+    this.motionRecordPath = '';
+    this.appendLog(`motion record saved (MD/${name})`);
+  }
+
+  // Leaving motion mode (server stop, page teardown, camera stop) closes the
+  // auto recording instead of leaving the file open.
+  stopMotionMode(reason: string): void {
+    if (this.motionRecording) {
+      this.server.stopRecord();
+      this.motionRecording = false;
+      this.motionRecordPath = '';
+    }
+    if (this.motionEnabled) {
+      this.motionEnabled = false;
+      this.server.setMotion(false);
+      this.appendLog(reason);
+    }
   }
 
   onStartPattern(): void {
@@ -822,7 +936,7 @@ struct Index {
         Row({ space: 8 }) {
           Button(this.recording ? '停止录像' : '开启录像')
             .onClick(() => this.onToggleRecord())
-            .enabled(this.running || this.recording)
+            .enabled(this.recording || (this.running && !this.motionEnabled))
           Button('抓拍').onClick(() => this.onSnapshot()).enabled(this.running)
         }
 
@@ -830,9 +944,10 @@ struct Index {
           Button(this.httpRunning ? '停止网页' : '启动网页')
             .onClick(() => this.onToggleHttp())
             .enabled(this.running || this.httpRunning)
-          Button(this.motionEnabled ? '移动侦测:开' : '移动侦测:关')
+          Button(this.motionEnabled
+            ? (this.motionRecording ? '移动侦测:录制中' : '移动侦测:开')
+            : '移动侦测:关')
             .onClick(() => this.onToggleMotion())
-            .enabled(this.running || this.motionEnabled)
         }
 
         Row({ space: 8 }) {
@@ -933,8 +1048,8 @@ struct Index {
           TextInput({ text: this.motionTimeout }).fontSize(12).width(60).type(InputType.Number)
             .onChange((v: string) => {
               this.motionTimeout = v;
-              this.saveSetting('motionTimeout', parseInt(v) || 15);
             })
+            .onSubmit(() => this.normalizeMotionTimeout())
           Text('I 帧间隔(s)').fontSize(12).width(72)
           TextInput({ text: this.keyframeInterval }).fontSize(12).width(50).type(InputType.Number)
             .onChange((v: string) => {

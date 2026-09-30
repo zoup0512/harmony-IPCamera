@@ -18,6 +18,9 @@ namespace ipcam {
 // destroy) at ~1–2 fps — verified to work on this device.
 class WebStream {
  public:
+  // Fires on both edges: true when motion starts, false once motion has been
+  // absent for the hold time — the caller starts and stops its auto recording
+  // off these two transitions (Android reports the same two states).
   using MotionSink = std::function<void(bool motion)>;
 
   ~WebStream();
@@ -25,6 +28,8 @@ class WebStream {
   void FeedVideo(const uint8_t* data, size_t size);  // Annex-B, both codecs
 
   void SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB, int width, int height);
+  // Enabling keeps the decode loop alive on its own (no web client needed) and
+  // arms the detector kArmDelayUs later, so the user can leave the frame first.
   void SetMotionEnabled(bool enabled);
   void SetMotionTimeout(int seconds);
   bool MotionActive() const { return motionLatch_.load(); }
@@ -39,6 +44,16 @@ class WebStream {
   bool DecodeOne(const std::vector<uint8_t>& params, const std::vector<uint8_t>& idr,
                  int w, int h, std::vector<uint8_t>* nv12Out);
   void CheckMotion(const uint8_t* nv12, int w, int h);
+  // The latch is time based, so it is re-evaluated on every loop pass even when
+  // no new picture was decoded — the auto recording then stops within half a
+  // second of the timeout instead of at the next keyframe.
+  void UpdateMotionLatch();
+  bool MotionArmed(uint64_t now) const;
+  // The decode loop serves two independent consumers — JPEG frames for the web
+  // console and NV12 frames for motion detection — so it runs while either one
+  // wants it.
+  void UpdateWorker();
+  bool WorkerWanted() const;
 
   std::atomic<bool> h265_{false};
   std::atomic<int> width_{1280};
@@ -52,14 +67,19 @@ class WebStream {
   std::vector<uint8_t> lastIdr_;  // Annex-B IDR frame
   std::vector<uint8_t> lastJpeg_;
 
-  std::atomic<bool> clientsActive_{false};
+  std::atomic<int> jpegClients_{0};    // web console consumers of LatestJpeg()
+  std::atomic<bool> motionDemand_{false};
+  std::atomic<uint64_t> idrGeneration_{0};
+  uint64_t decodedIdrGeneration_ = 0;  // decode loop only
   std::atomic<bool> workerRunning_{false};
+  std::mutex workerMu_;                // serialises UpdateWorker start/join
   std::thread workerThread_;
 
   std::mutex motionMu_;
   std::vector<uint8_t> prevGrid_;
-  int64_t lastMotionUs_ = 0;
-  int64_t motionHoldUs_ = 5000000;  // default 5 s
+  std::atomic<int64_t> lastMotionUs_{0};
+  std::atomic<int64_t> armAtUs_{0};    // 0 = not armed (detector idle)
+  int64_t motionHoldUs_ = 15000000;    // default 15 s, Android motion_timeout default
   MotionSink motionSink_;
   std::mutex sinkMu_;
 };

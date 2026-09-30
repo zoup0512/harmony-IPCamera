@@ -159,16 +159,16 @@ MP4 录像 24MB(hvc1+hvcC+mp4a 结构校验通过);抓拍 BMP 1280x720 画面经
 | /video | multipart/x-mixed-replace MJPEG(相同 JPEG 管线) |
 | /light | 原生手电筒开关(OH_CameraManager_SetTorchMode) |
 | /camswitch | 原生前/后摄切换(带预览面的完整相机重启) |
-| /getarchives + /get/ipc_* | 录像存档列表 + MP4 下载 |
+| /getarchives + /get/ipc_* + /get/MD/IPS_* | 录像存档列表(手工录像 + 移动侦测录像)+ MP4 下载 |
 | /put_voice | AAC ADTS 语音上传 → OH_AudioDecoder 解码 → OH_AudioRenderer 播放(对讲) |
-| 移动侦测 | WebStream 帧差分(32×18 亮度网格,阈值 25,持续 5s),事件走 TSFN 回调 |
+| 移动侦测 | WebStream 帧差分(32×18 亮度网格 3×3 均值采样,阈值 25),事件走 TSFN 回调;开关/自动录像见下节 |
 | UI | 网页端口设置、启动/停止网页、移动侦测开关、HTTP URL 显示 |
 
 **验证**:serverinfo(401→auth→正确 JSON 文本)、camswitch 原生切换成功、
 snapshot.bmp 1280×720 目检正确(USB 线+织物纹理)、MP4 录像 24MB(hvc1 结构正确)。
 
 **已知限制**:MJPEG/snapshot.jpg 的 JPEG 画面可能偏暗或全黑(冷解码 EOS 时序问题,
-BMP 抓拍正常);移动侦测依赖视频解码帧,需网页控制台运行;Opus 音频流(/audio.opus)未实现;
+BMP 抓拍正常);Opus 音频流(/audio.opus)未实现;
 WebRTC / 多码率 / GL 级旋转未实现(独立工程量级)。
 
 ## P0 设置补齐(已完成)
@@ -177,7 +177,7 @@ WebRTC / 多码率 / GL 级旋转未实现(独立工程量级)。
 
 | 设置项 | Android Key | 鸿蒙实现 |
 |---|---|---|
-| 移动侦测超时 | `motion_timeout` (10-120s) | UI TextInput + WebStream::SetMotionTimeout() |
+| 移动侦测超时 | `motion_timeout` (10-120s) | UI TextInput + WebStream::SetMotionTimeout()(两端都钳位到 10-120,默认 15) |
 | I 帧间隔 | `keyframe_interval` / `hevc_keyframe_interval` (1-10s) | UI TextInput + CameraStreamer::Start(iFrameMs) |
 | H.265 码率 | `server_hevc_bitrate` | 复用码率选择（选 H.265 时自动应用） |
 | RTSP 格式 | `rtsp_format` (H264/HEVC) | 已有 codec Select，标签对齐为"RTSP 格式" |
@@ -305,6 +305,71 @@ Android Web 控制台的听声端点,鸿蒙补齐:
 
 **已知边界**:ONVIF 发现无鉴权 GetProfiles/GetStreamUri(多数相机无需);流地址不直接内嵌播放
 (无系统 RTSP 组件);扫描依赖 AP 转发组播(家用 AP 默认泛洪,企业网可能过滤)。
+
+## 移动侦测对齐 Android(真机验证通过 2026-09-29,华为畅享 90 Plus / HarmonyOS 7.0)
+
+Android 的"移动侦测"实质是**侦测命中即自动录像**:`BaseServerActivity` 收到 true → `F0()` 写
+`DCIM/IPCamera/MD/IPS_yyyy-MM-dd.HH.mm.ss.SSSS.mp4`,`motion_timeout`(默认 15s,10-120)秒内
+无新命中 → 停录;开启时 `G0()` 先 `R0()` 拉起服务器,再延迟 10 秒 `F0` 武装检测器
+("Motion Detection will delay 10 seconds to open")。本轮把这条链路整体搬到鸿蒙:
+
+| 环节 | Android | 鸿蒙实现 |
+|---|---|---|
+| 检测器武装 | 开启后 10 秒(postDelayed StartPreviewRunnable → `MotionDetection.start()`) | `WebStream::SetMotionEnabled(true)` 记 10s 期限(`kArmDelayUs`),到期前只刷新基准网格不上报 |
+| 取帧 | 相机预览/解码帧直供 `detectNV21`/`detectBuffer`/`detectImage`,与网页无关 | WebStream 解码线程由"消费方引用"驱动:网页控制台(`IncClients`)与移动侦测(`motionDemand_`)各自计数,任一存在即运行——**不再依赖网页控制台开着** |
+| 判定 | native `libmotiondetection.so`(无源码) | 32×18 亮度网格 3×3 均值采样,单格变化阈值 25,变化 ≥10 格为命中 |
+| 停止条件 | 每次命中重启 15s 定时器,到期回调 false | 保持窗口 `motionHoldUs_`(默认 15s,钳位 10-120),同一帧循环里算下降沿 |
+| 事件上报 | 每次检测结果都回调(`c(boolean)`) | 只在状态跳变时回调:`MOTION detected` / `MOTION cleared`(走 TSFN) |
+| 命中动作 | 起服务器 + 录像到 `DCIM/IPCamera/MD/` | `Index.ets` 编排:起服务器/相机 → 建 `filesDir/MD/` → 录 `IPS_<yyyy-MM-dd.HH.mm.ss.SSSS>.mp4`(同一 `StreamRecorder`,沿用 four_gb_limit/分段设置) |
+| 超时动作 | `X0()` 停计时 + 停录 | `MOTION cleared` → `stopRecord()` 收尾 |
+| 网页可见 | 存档列表含 `DCIM/IPCamera/MD` | `/getarchives` 列出 `MD/IPS_*.mp4`,`/get/MD/IPS_*.mp4` 下载(路由与归档回调都按前缀白名单校验,禁 `..`/越目录) |
+| 手动录像冲突 | 移动侦测开启时录像菜单不可用 | 移动侦测开启时"开启录像"按钮禁用;开启移动侦测会先停掉手工录像 |
+
+**顺带修复**:WebStream 的 `SetParams` 原来只注入一次,相机换分辨率/编码后解码尺寸失配会让
+网格在错误几何上取值 → 改为几何/编码变化时重新注入(`webParamsInjected`/`webParamsWidth`/
+`webParamsH265` 原子),JPEG 与移动侦测都拿到真实帧大小;JPEG 编码现在只在有网页客户端时执行
+(纯侦测场景不做无用编码)。
+
+**仍未移植(Android 侧配套能力)**:命中通知邮件(`mail_smtp_notify` + 快照附件)、OneDrive/FTP 录像
+上传、录制中每 `M` 分钟自动分段时另存快照(`ServerUiTimerTask` → `Z()`)。这三项依赖 SMTP/FTP/
+云盘客户端,属 P4 独立工程;分段本身已由 `StreamRecorder` 的 `segmentMinutes` 覆盖。
+
+**语义差异(有意为之)**:①Android 是 4fps(250ms)检测,鸿蒙冷解码 2fps(500ms),命中/收尾各有
+≤0.5s 延迟;②判定算法无法逐位复刻(原库无源码),只对齐了"输入几何(降采样亮度)、时间语义
+(命中保持 + 超时收尾)、上报节奏"这三层契约;③鸿蒙无 DCIM/媒体库写入,录像落在应用沙盒
+`filesDir/MD`,通过网页存档下载,而不是进系统相册。
+
+### 真机验证记录(2026-09-29)
+
+| 环节 | 证据 |
+|---|---|
+| 开关即起服务/相机 | 应用日志:`RTSP server listening on :8554/live` → `camera started for motion detection` → `motion detection ON (timeout=15s, arms in 10s, auto record MD/)` 三条连续出现 |
+| 10 秒武装延迟 | 22:45:05 开关打开,前 6 秒 0 条录像;首条 `recording to .../MD/IPS_2026-09-29.22.45.20.0490.mp4` 出现在 22:45:20(t+14.5s = 10s 延迟 + 相机启动 + 下一关键帧) |
+| 命中即自动录像 | 22:35:12 检测到真人运动 → 同一时刻 `MOTION detected` + `motion record started (MD/IPS_2026-09-29.22.35.12.0498.mp4)` |
+| 超时停录(15s 保持窗口) | 最后一次检测 22:37:49.678 + 15s = `recording stopped` 22:38:04.678,分秒不差 |
+| 关开关立即停录 | 22:41:35 点"移动侦测:关" → 22:41:36.328 `recording stopped` |
+| 再次命中重新开录 | 相机重启后 3 秒(22:39:37.647)开出新文件 `IPS_2026-09-29.22.39.37.0646.mp4` |
+| 成片有效 | ffprobe:超时收尾片 314,029,693 字节 / 165.59s / 3331 帧 / h264 1280x720(时长=有帧区间 22:35:12.5→22:37:57);抽帧目检为现场画面 + OSD 时间戳 |
+| 网页归档可见可下载 | `/getarchives` 列出 `MD/IPS_*.mp4 <size>`;`/get/MD/IPS_*.mp4` 下载 314MB 全量落盘 |
+| 手动录像互斥 | 录制中布局:`移动侦测:录制中` 可点、`开启录像` disabled |
+| 超时钳位 | 设置文件写入 `motionTimeout=5` 后重启,界面显示 `10`(下限钳位) |
+
+**真机测试发现并修掉的两个 bug(均为既有代码,不是移动侦测逻辑本身)**:
+
+1. **`/get/MD/...` 下载 404**:HTTP 层在路由前对路径做了 `ToLower`(`HandleRequest` 收到的是
+   小写路径),`/get/ipc_*` 本来就全小写所以一直正常,带大写的 `MD/IPS_` 永远匹配不上。
+   修法:路由按折叠形式匹配 `/get/md/ips_`,归档回调再把大小写还原成磁盘上的
+   `MD/IPS_<date>.mp4`(其余字符是数字/点/横线,大小写无歧义)。
+2. **大文件下载被截断**:`SendAll` 的 5 秒 deadline 是**整段内容**的预算,不是"停滞"超时——
+   服务端 5 秒内把 283MB 灌进 socket 后主动断连(curl exit 18),314MB 的移动侦测录像永远下不完。
+   修法:每写入成功就续期(`deadline = now + kSendDeadline`),语义变成"5 秒无进展才放弃",
+   对慢客户端宽容、对卡死客户端仍然会断开。
+   复测:同一 URL 由 `size=0/283183060`(截断)变为 `size=314029693`(全量,10.1s)。
+
+**观察(既有行为,非本轮引入)**:录像码率远高于设置值——同一设置下用户既有录像为 5.36Mbps 与
+19.2Mbps,移动侦测录像 15.2~16.3Mbps(设置 2Mbps)。720p/20fps 下这个码率异常偏高,疑似
+buffer(OSD)模式下 `OH_MD_KEY_BITRATE` 未作为上限生效;后果是移动侦测录像很大(3 分钟 314MB,
+约 7GB/小时)。建议后续单独排查码率控制(与本轮契约对齐无关)。
 
 ## 阶段 7(远期,未排期)
 

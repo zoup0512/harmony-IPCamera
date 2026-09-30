@@ -21,6 +21,14 @@ namespace {
 constexpr uint8_t kStartCode[] = {0x00, 0x00, 0x00, 0x01};
 constexpr int kGridW = 32;
 constexpr int kGridH = 18;
+constexpr int kCellDelta = 25;      // per-cell luminance step counted as change
+constexpr int kChangedCells = 10;   // changed cells needed to call it motion
+// Android arms the detector 10 s after motion mode is switched on
+// ("Motion Detection will delay 10 seconds to open") and clamps the timeout
+// preference to 10–120 s.
+constexpr int64_t kArmDelayUs = 10 * 1000000;
+constexpr int kTimeoutMinSeconds = 10;
+constexpr int kTimeoutMaxSeconds = 120;
 
 uint64_t NowUs() {
   struct timespec ts{};
@@ -176,11 +184,39 @@ void WebStream::SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB, i
 }
 
 void WebStream::SetMotionTimeout(int seconds) {
+  if (seconds < kTimeoutMinSeconds) seconds = kTimeoutMinSeconds;
+  if (seconds > kTimeoutMaxSeconds) seconds = kTimeoutMaxSeconds;
   motionHoldUs_ = static_cast<int64_t>(seconds) * 1000000;
 }
 
 void WebStream::SetMotionEnabled(bool enabled) {
-  motionEnabled_ = enabled;
+  bool wasEnabled = motionEnabled_.exchange(enabled);
+  if (enabled) {
+    {
+      std::lock_guard<std::mutex> lk(motionMu_);
+      // Drop the previous baseline: the first frame after the arming delay
+      // becomes the new reference instead of a 10 s old one, which would
+      // otherwise report motion the moment the delay expires.
+      prevGrid_.clear();
+    }
+    lastMotionUs_.store(0);
+    armAtUs_.store(static_cast<int64_t>(NowUs()) + kArmDelayUs);
+    motionDemand_ = true;
+  } else {
+    armAtUs_.store(0);
+    motionDemand_ = false;
+    // Leaving motion mode ends a live episode right away so the caller can
+    // close its auto recording instead of waiting for the hold time.
+    if (wasEnabled && motionLatch_.exchange(false)) {
+      MotionSink sink;
+      {
+        std::lock_guard<std::mutex> lk(sinkMu_);
+        sink = motionSink_;
+      }
+      if (sink) sink(false);
+    }
+  }
+  UpdateWorker();
 }
 
 void WebStream::SetMotionSink(MotionSink sink) {
@@ -188,17 +224,32 @@ void WebStream::SetMotionSink(MotionSink sink) {
   motionSink_ = std::move(sink);
 }
 
-void WebStream::IncClients() {
-  // Web console active: start the decode loop if not already running.
-  if (!workerRunning_.exchange(true)) {
-    workerThread_ = std::thread(&WebStream::DecodeLoop, this);
+bool WebStream::WorkerWanted() const {
+  return jpegClients_.load() > 0 || motionDemand_.load();
+}
+
+void WebStream::UpdateWorker() {
+  std::lock_guard<std::mutex> lk(workerMu_);
+  if (WorkerWanted()) {
+    if (!workerRunning_.exchange(true)) {
+      workerThread_ = std::thread(&WebStream::DecodeLoop, this);
+    }
+    return;
   }
+  workerRunning_ = false;
+  if (workerThread_.joinable()) workerThread_.join();
+}
+
+void WebStream::IncClients() {
+  jpegClients_.fetch_add(1);
+  UpdateWorker();
 }
 
 void WebStream::DecClients() {
-  // The web console stopped; stop the decode loop.
-  workerRunning_ = false;
-  if (workerThread_.joinable()) workerThread_.join();
+  int current = jpegClients_.load();
+  while (current > 0 && !jpegClients_.compare_exchange_weak(current, current - 1)) {
+  }
+  UpdateWorker();
 }
 
 std::vector<uint8_t> WebStream::LatestJpeg() const {
@@ -240,7 +291,10 @@ void WebStream::FeedVideo(const uint8_t* data, size_t size) {
       }
     }
     if (sawParam) paramsSet_ = !params_.empty();
-    if (sawIdr) lastIdr_ = std::move(idr);
+    if (sawIdr) {
+      lastIdr_ = std::move(idr);
+      idrGeneration_.fetch_add(1);  // a new picture is available to decode
+    }
   }
 }
 
@@ -250,6 +304,7 @@ void WebStream::DecodeLoop() {
     std::vector<uint8_t> idr;
     bool h265;
     int w, h;
+    uint64_t gen;
     {
       std::lock_guard<std::mutex> lk(stateMu_);
       params = params_;
@@ -257,33 +312,82 @@ void WebStream::DecodeLoop() {
       h265 = h265_.load();
       w = width_.load();
       h = height_.load();
+      gen = idrGeneration_.load();
     }
     if (params.empty() || idr.empty() || w <= 0 || h <= 0) {
       usleep(500 * 1000);
       continue;
     }
-    std::vector<uint8_t> nv12;
-    if (DecodeOneFrame(h265, params, idr, w, h, &nv12) &&
-        nv12.size() >= static_cast<size_t>(w) * h * 3 / 2) {
-      auto jpg = JpegEncoder::EncodeNV12(nv12.data(), w, h);
-      if (!jpg.empty()) {
-        std::lock_guard<std::mutex> lk(stateMu_);
-        lastJpeg_ = std::move(jpg);
+    // The cold decoder's input is the cached keyframe, so re-decoding before a
+    // new keyframe arrives would only reproduce the same picture: skip it and
+    // keep the last JPEG/motion sample instead.
+    if (gen != decodedIdrGeneration_) {
+      std::vector<uint8_t> nv12;
+      if (DecodeOneFrame(h265, params, idr, w, h, &nv12) &&
+          nv12.size() >= static_cast<size_t>(w) * h * 3 / 2) {
+        decodedIdrGeneration_ = gen;
+        // JPEG only feeds the web console; motion detection reads the NV12
+        // buffer directly, so skip the encode when nobody is watching.
+        if (jpegClients_.load() > 0) {
+          auto jpg = JpegEncoder::EncodeNV12(nv12.data(), w, h);
+          if (!jpg.empty()) {
+            std::lock_guard<std::mutex> lk(stateMu_);
+            lastJpeg_ = std::move(jpg);
+          }
+        }
+        CheckMotion(nv12.data(), w, h);
       }
-      CheckMotion(nv12.data(), w, h);
     }
+    UpdateMotionLatch();
     usleep(500 * 1000);  // ~2 fps
   }
 }
 
+bool WebStream::MotionArmed(uint64_t now) const {
+  const int64_t armAt = armAtUs_.load();
+  return armAt != 0 && static_cast<int64_t>(now) >= armAt;
+}
+
+void WebStream::UpdateMotionLatch() {
+  if (!motionEnabled_.load()) return;
+  const uint64_t now = NowUs();
+  const bool armed = MotionArmed(now);
+  // Hold window: the episode stays active until the timeout elapses without a
+  // new detection, which is what stops the auto recording on Android.
+  const bool active = armed && (now - static_cast<uint64_t>(lastMotionUs_.load())) <
+                                  static_cast<uint64_t>(motionHoldUs_);
+  const bool wasActive = motionLatch_.exchange(active);
+  if (active == wasActive) return;
+  MotionSink sink;
+  {
+    std::lock_guard<std::mutex> lk(sinkMu_);
+    sink = motionSink_;
+  }
+  if (sink) sink(active);
+}
+
 void WebStream::CheckMotion(const uint8_t* nv12, int w, int h) {
   if (!motionEnabled_.load()) return;
+  // Sample each cell as a 3x3 average of the Y plane. A single tap per cell
+  // would flag sensor noise on one pixel; averaging keeps the 32x18 grid cheap
+  // while staying stable (Android feeds its detector a luminance downscale to
+  // at most 640 pixels wide for the same reason).
   uint8_t grid[kGridW * kGridH];
+  const int stepX = std::max(1, w / (kGridW * 4));
+  const int stepY = std::max(1, h / (kGridH * 4));
   for (int gy = 0; gy < kGridH; ++gy) {
     for (int gx = 0; gx < kGridW; ++gx) {
-      int x = (gx * w) / kGridW;
-      int y = (gy * h) / kGridH;
-      grid[gy * kGridW + gx] = nv12[static_cast<size_t>(y) * w + x];
+      const int cx = ((2 * gx + 1) * w) / (2 * kGridW);
+      const int cy = ((2 * gy + 1) * h) / (2 * kGridH);
+      int sum = 0;
+      for (int sy = -1; sy <= 1; ++sy) {
+        for (int sx = -1; sx <= 1; ++sx) {
+          const int x = std::min(w - 1, std::max(0, cx + sx * stepX));
+          const int y = std::min(h - 1, std::max(0, cy + sy * stepY));
+          sum += nv12[static_cast<size_t>(y) * w + x];
+        }
+      }
+      grid[gy * kGridW + gx] = static_cast<uint8_t>(sum / 9);
     }
   }
   bool motion = false;
@@ -293,24 +397,17 @@ void WebStream::CheckMotion(const uint8_t* nv12, int w, int h) {
       int changed = 0;
       for (int i = 0; i < kGridW * kGridH; ++i) {
         int d = grid[i] - prevGrid_[i];
-        if (d < -25 || d > 25) changed++;
+        if (d < -kCellDelta || d > kCellDelta) changed++;
       }
-      if (changed >= 10) motion = true;
+      if (changed >= kChangedCells) motion = true;
     }
     prevGrid_.assign(grid, grid + kGridW * kGridH);
   }
-  if (motion) lastMotionUs_ = static_cast<int64_t>(NowUs());
-  bool wasActive = motionLatch_.load();
-  bool active = (NowUs() - static_cast<uint64_t>(lastMotionUs_)) < static_cast<uint64_t>(motionHoldUs_);
-  motionLatch_ = active;
-  if (active && !wasActive) {
-    MotionSink sink;
-    {
-      std::lock_guard<std::mutex> lk(sinkMu_);
-      sink = motionSink_;
-    }
-    if (sink) sink(true);
-  }
+  const uint64_t now = NowUs();
+  // Only a hit while armed counts: during the arming delay the samples must not
+  // push the hold window forward, or the detector would fire the moment it arms.
+  if (MotionArmed(now) && motion) lastMotionUs_.store(static_cast<int64_t>(now));
+  UpdateMotionLatch();
 }
 
 }  // namespace ipcam

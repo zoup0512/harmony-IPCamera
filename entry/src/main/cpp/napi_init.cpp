@@ -86,6 +86,8 @@ struct ServerHolder {
   std::atomic<int> streamHeight{720};
   std::atomic<bool> videoIsH265{false};  // last camera mime, used as RTMP hint
   std::atomic<bool> webParamsInjected{false};
+  std::atomic<int> webParamsWidth{0};
+  std::atomic<bool> webParamsH265{false};
   bool httpWebStreamActive = false;
 
   void PushVideo(const uint8_t* data, size_t size, ipcam::TimestampUs tsUs) {
@@ -93,8 +95,11 @@ struct ServerHolder {
     if (tsUs < 0) return;
     server.PushH264(data, size, tsUs);
     // The RTSP server caches codec params from the first frame; inject them
-    // into the web decoder lazily once they are available.
-    if (!webParamsInjected.load()) {
+    // into the web decoder lazily once they are available — and again when the
+    // geometry or codec changes, since the decode/JPEG/motion grid all work on
+    // the frame size the decoder was told about.
+    if (!webParamsInjected.load() || webParamsWidth.load() != streamWidth.load() ||
+        webParamsH265.load() != videoIsH265.load()) {
       auto vp = server.GetVideoParams();
       if (vp.ready) {
         std::vector<uint8_t> annexB;
@@ -109,6 +114,8 @@ struct ServerHolder {
         append(vp.pps);
         webStream->SetParams(vp.h265, annexB, streamWidth.load(), streamHeight.load());
         webParamsInjected.store(true);
+        webParamsWidth.store(streamWidth.load());
+        webParamsH265.store(vp.h265);
       }
     }
     webStream->FeedVideo(data, size);
@@ -1104,29 +1111,50 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
   });
   holder->http->SetOpusStream(holder->opus.get());
   holder->http->SetArchiveSource([weakHolder]() {
+    // Motion-detection clips go to filesDir/MD under their Android names
+    // (IPS_<date>.mp4, Android stores them in DCIM/IPCamera/MD) and are
+    // listed as MD/<name> so they stay distinguishable from manual records.
     std::string out;
-    DIR* d = opendir((weakHolder->filesDir).c_str());
-    if (d == nullptr) return out;
-    struct dirent* e = nullptr;
-    while ((e = readdir(d)) != nullptr) {
-      std::string name = e->d_name;
-      if (name.rfind("ipc_", 0) != 0 || name.find(".mp4") == std::string::npos) continue;
-      struct stat st{};
-      std::string full = weakHolder->filesDir + "/" + name;
-      if (stat(full.c_str(), &st) == 0) {
-        out += name + " " + std::to_string(st.st_size) + "\n";
+    const struct {
+      const char* sub;
+      const char* prefix;
+      const char* listed;
+    } dirs[] = {{"", "ipc_", ""}, {"/MD", "IPS_", "MD/"}};
+    for (const auto& dir : dirs) {
+      std::string base = weakHolder->filesDir + dir.sub;
+      DIR* d = opendir(base.c_str());
+      if (d == nullptr) continue;
+      struct dirent* e = nullptr;
+      while ((e = readdir(d)) != nullptr) {
+        std::string name = e->d_name;
+        if (name.rfind(dir.prefix, 0) != 0 || name.find(".mp4") == std::string::npos) {
+          continue;
+        }
+        struct stat st{};
+        if (stat((base + "/" + name).c_str(), &st) == 0) {
+          out += std::string(dir.listed) + name + " " + std::to_string(st.st_size) + "\n";
+        }
       }
+      closedir(d);
     }
-    closedir(d);
     return out;
   });
   holder->http->SetArchiveFile([weakHolder](const std::string& name,
                                             std::vector<uint8_t>* out) {
-    if (name.rfind("ipc_", 0) != 0 || name.find("..") != std::string::npos ||
-        name.find('/') != std::string::npos) {
+    // Only filesDir and its MD subdirectory are reachable, and only with the
+    // two recording prefixes the recorder writes. HTTP paths arrive lowercased,
+    // so restore the canonical casing the recorder used on disk.
+    std::string dir = "/";
+    std::string file = name;
+    if (name.rfind("md/ips_", 0) == 0) {
+      dir = "/MD/";
+      file = "IPS_" + name.substr(7);  // the rest is digits, dots and dashes
+    }
+    if (name.find("..") != std::string::npos || file.find('/') != std::string::npos ||
+        (file.rfind("ipc_", 0) != 0 && file.rfind("IPS_", 0) != 0)) {
       return false;
     }
-    std::string full = weakHolder->filesDir + "/" + name;
+    std::string full = weakHolder->filesDir + dir + file;
     FILE* f = fopen(full.c_str(), "rb");
     if (f == nullptr) return false;
     fseek(f, 0, SEEK_END);
@@ -1182,13 +1210,15 @@ napi_value RtspSetMotion(napi_env env, napi_callback_info info) {
   bool enabled = false;
   napi_get_value_bool(env, argv[1], &enabled);
   if (argc >= 3) {
-    double timeoutSec = 5;
+    double timeoutSec = 15;  // Android motion_timeout default; clamped natively
     napi_get_value_double(env, argv[2], &timeoutSec);
     holder->webStream->SetMotionTimeout(static_cast<int>(timeoutSec));
   }
   holder->webStream->SetMotionSink([holder](bool motion) {
+    // Both edges reach ArkTS: the rising one starts the motion recording, the
+    // falling one (hold time elapsed) closes it.
     PostEvent(holder, ipcam::RtspEvent::kClientPlaying, holder->server.ClientCount(),
-              motion ? "MOTION detected" : "");
+              motion ? "MOTION detected" : "MOTION cleared");
   });
   holder->webStream->SetMotionEnabled(enabled);
   napi_value result;
