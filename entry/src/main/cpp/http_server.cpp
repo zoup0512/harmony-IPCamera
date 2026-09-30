@@ -163,6 +163,10 @@ bool SendAll(int fd, const uint8_t* data, size_t len,
     ssize_t sent = ::send(fd, data + offset, len - offset, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (sent > 0) {
       offset += static_cast<size_t>(sent);
+      // The deadline is a stall timeout, not a budget for the whole body:
+      // renewed on progress so a multi-hundred-MB recording download cannot be
+      // cut off mid-transfer, while a client that stops reading still aborts.
+      deadline = Clock::now() + kSendDeadline;
       continue;
     }
     if (sent < 0 && errno == EINTR) continue;
@@ -768,7 +772,11 @@ bool HttpServer::HandleRequest(int fd, const std::string& method, const std::str
     RespondText(fd, archiveSource ? archiveSource() : "");
     return true;
   }
-  if (path.rfind("/get/ipc_", 0) == 0) {
+  // Manual records (ipc_*) and motion-detection records (MD/IPS_*) — the names
+  // are exactly what /getarchives lists. Paths reach the handler lowercased, so
+  // the MD prefix is matched in its folded form; the archive resolver restores
+  // the casing the recorder wrote.
+  if (path.rfind("/get/ipc_", 0) == 0 || path.rfind("/get/md/ips_", 0) == 0) {
     std::string name = path.substr(5);
     std::vector<uint8_t> data;
     if (archiveFile && archiveFile(name, &data) && !data.empty()) {
