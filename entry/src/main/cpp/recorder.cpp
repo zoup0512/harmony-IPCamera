@@ -87,7 +87,7 @@ std::vector<uint8_t> LengthPrefixed(const std::vector<NalView>& nalsIn, bool h26
     if (h265) {
       uint8_t t = static_cast<uint8_t>((nal.data[0] >> 1) & 0x3F);
       if (t == 32 || t == 33 || t == 34) continue;
-      if (t == 19 || t == 20) *hasKey = true;
+      if (t >= 16 && t <= 21) *hasKey = true;  // BLA / IDR / CRA
       if (t == 35 || t == 39 || t == 40) continue;  // AUD / SEI
     } else {
       uint8_t t = static_cast<uint8_t>(nal.data[0] & 0x1F);
@@ -109,8 +109,6 @@ std::vector<uint8_t> LengthPrefixed(const std::vector<NalView>& nalsIn, bool h26
 StreamRecorder::~StreamRecorder() { Stop(); }
 
 void StreamRecorder::SetOptions(const Options& options) {
-  // Writer-thread fields are only touched between items, so an unlocked write
-  // of scalars is fine; queueMu_ is taken anyway when cheap.
   std::lock_guard<std::mutex> lk(queueMu_);
   options_ = options;
 }
@@ -163,7 +161,8 @@ bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink 
   filePath_ = filePath;
   rotation_ = rotation;
   segmentIndex_ = 1;
-  pendingBaseReset_ = false;
+  pendingBaseReset_ = true;
+  discardLeadingPictures_ = false;
   videoTrack_ = -1;
   audioTrack_ = -1;
   started_ = false;
@@ -318,10 +317,6 @@ void StreamRecorder::WriterLoop() {
             fatal = true;
             break;
           }
-          if (ShouldRotate() && !RotateSegment(videoParams, audioSeen, audioCfg)) {
-            fatal = true;
-            break;
-          }
         }
         startupPending.clear();
         if (fatal) break;
@@ -342,11 +337,6 @@ void StreamRecorder::WriterLoop() {
     } else {
       for (const Item& item : local) {
         if (!WriteItem(item, activeVideoIsH265)) {
-          fatal = true;
-          break;
-        }
-        if (ShouldRotate() &&
-            !RotateSegment(activeVideoParams_, activeAudioSeen_, activeAudioCfg_)) {
           fatal = true;
           break;
         }
@@ -474,6 +464,7 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
   std::vector<uint8_t> sample;
   int track = -1;
   int64_t* lastPtsUs = nullptr;
+  bool hasKey = false;
   if (item.audio) {
     if (audioTrack_ < 0) return true;
     AdtsInfo info{};
@@ -487,7 +478,16 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
   } else {
     if (videoTrack_ < 0) return true;
     std::vector<NalView> nals = SplitAnnexB(item.data.data(), item.data.size());
-    bool hasKey = false;
+    if (videoIsH265 && discardLeadingPictures_) {
+      for (const NalView& nal : nals) {
+        if (nal.size < 2) continue;
+        const uint8_t type = (nal.data[0] >> 1) & 0x3f;
+        if (type > 31) continue;
+        if (type >= 6 && type <= 9) return true;  // RADL/RASL preceding the segment IRAP
+        discardLeadingPictures_ = false;
+        break;
+      }
+    }
     sample = LengthPrefixed(nals, videoIsH265, &hasKey);
     if (sample.empty()) return true;
     attr.flags = hasKey ? AVCODEC_BUFFER_FLAGS_SYNC_FRAME : AVCODEC_BUFFER_FLAGS_NONE;
@@ -495,12 +495,18 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
     lastPtsUs = &lastVideoPtsUs_;
   }
 
+  if (hasKey && !pendingBaseReset_ && ShouldRotate()) {
+    if (!RotateSegment(activeVideoParams_, activeAudioSeen_, activeAudioCfg_)) return false;
+    track = videoTrack_;
+  }
   if (pendingBaseReset_) {
-    // New segment: restart PTS from zero at the first written sample.
+    // Audio and predictive frames cannot establish an independently decodable segment.
+    if (!hasKey) return true;
     tsBaseUs_ = item.tsUs;
     lastVideoPtsUs_ = -1;
     lastAudioPtsUs_ = -1;
     pendingBaseReset_ = false;
+    discardLeadingPictures_ = videoIsH265;
   }
 
   int64_t ptsUs = 0;
@@ -558,8 +564,9 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
   return true;
 }
 
-bool StreamRecorder::ShouldRotate() const {
+bool StreamRecorder::ShouldRotate() {
   if (!started_) return false;
+  std::lock_guard<std::mutex> lk(queueMu_);
   if (options_.fourGbLimit && segmentBytes_ >= kFourGbLimitBytes) return true;
   if (options_.segmentMinutes > 0) {
     auto elapsed = std::chrono::steady_clock::now() - segmentStart_;

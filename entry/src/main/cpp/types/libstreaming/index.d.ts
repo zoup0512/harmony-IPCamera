@@ -77,6 +77,8 @@ export const rtspStartHttp: (server: object, options: HttpOptions) => boolean;
 export const rtspStopHttp: (server: object) => void;
 /** Enable/disable motion detection on the decoded stream (events via status callback). */
 export const rtspSetMotion: (server: object, enabled: boolean, timeoutSeconds?: number) => void;
+/** Authoritative, time-based state; independent of best-effort status callbacks. */
+export const rtspMotionActive: (server: object) => boolean;
 /** Set motion detection hold time in seconds. */
 export const rtspSetMotionTimeout: (server: object, seconds: number) => void;
 

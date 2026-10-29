@@ -136,6 +136,8 @@ struct Index {
   private rtmpGeneration: number = 0;
   private pageActive: boolean = false;
   private motionRecordPath: string = '';
+  private motionTimerId: number = -1;
+  private motionGeneration: number = 0;
 
   aboutToAppear(): void {
     this.pageActive = true;
@@ -179,12 +181,9 @@ struct Index {
         this.rtmpGeneration++;
         this.rtmpState = RtmpState.Idle;
       }
-      if (detail === 'MOTION detected') {
-        this.appendLog('MOTION detected');
-        this.onMotionStart();
-      } else if (detail === 'MOTION cleared') {
-        this.appendLog('MOTION cleared');
-        this.onMotionStop();
+      if (detail === 'MOTION detected' || detail === 'MOTION cleared') {
+        // Status delivery is lossy; only the native-state timer controls recording.
+        this.appendLog(detail);
       } else if (detail.startsWith('snapshot')) {
         this.appendLog(detail);
       } else {
@@ -510,9 +509,7 @@ struct Index {
 
   onToggleMotion(): void {
     if (this.motionEnabled) {
-      this.motionEnabled = false;
-      this.server.setMotion(false);  // ends a live episode -> onMotionStop closes the file
-      this.appendLog('motion detection OFF');
+      this.stopMotionMode('motion detection OFF');
       return;
     }
     // Android switches motion mode on by bringing the server up first
@@ -529,6 +526,7 @@ struct Index {
       this.appendLog(this.cameraRunning ? 'camera started for motion detection'
                                         : 'motion detection: camera failed to start');
     }
+    if (!this.cameraRunning) return;
     if (this.recording) {
       this.server.stopRecord();
       this.recording = false;
@@ -540,6 +538,7 @@ struct Index {
     this.saveSetting('motionTimeout', timeout);
     this.motionEnabled = true;
     this.server.setMotion(true, timeout);
+    this.startMotionTimer();
     this.appendLog(`motion detection ON (timeout=${timeout}s, arms in 10s, auto record MD/)`);
   }
 
@@ -564,8 +563,30 @@ struct Index {
            `${p(d.getMilliseconds(), 4)}`;
   }
 
+  startMotionTimer(): void {
+    this.stopMotionTimer();
+    const generation = this.motionGeneration;
+    this.motionTimerId = setInterval(() => {
+      if (generation !== this.motionGeneration || !this.motionEnabled || !this.running) return;
+      if (this.server.motionActive()) {
+        this.onMotionStart();
+      } else {
+        this.onMotionStop();
+      }
+    }, 250);
+  }
+
+  stopMotionTimer(): void {
+    this.motionGeneration++;
+    if (this.motionTimerId >= 0) {
+      clearInterval(this.motionTimerId);
+      this.motionTimerId = -1;
+    }
+  }
+
   onMotionStart(): void {
-    if (this.motionRecording) return;
+    if (!this.motionEnabled || !this.running || !this.pageActive ||
+        !this.server.motionActive() || this.motionRecording) return;
     if (this.recording) {
       this.appendLog('motion: manual recording is running, auto record skipped');
       return;
@@ -603,16 +624,15 @@ struct Index {
   // Leaving motion mode (server stop, page teardown, camera stop) closes the
   // auto recording instead of leaving the file open.
   stopMotionMode(reason: string): void {
-    if (this.motionRecording) {
-      this.server.stopRecord();
-      this.motionRecording = false;
-      this.motionRecordPath = '';
-    }
-    if (this.motionEnabled) {
-      this.motionEnabled = false;
+    const wasEnabled = this.motionEnabled;
+    this.motionEnabled = false;
+    this.stopMotionTimer();
+    try {
+      this.onMotionStop();
+    } finally {
       this.server.setMotion(false);
-      this.appendLog(reason);
     }
+    if (wasEnabled) this.appendLog(reason);
   }
 
   onStartPattern(): void {

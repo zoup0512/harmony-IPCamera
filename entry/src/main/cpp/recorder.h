@@ -85,10 +85,10 @@ class StreamRecorder {
   void ReportFatalError(const std::string& message);
   void DestroyMuxerAndClose();
   // Closes the current file and opens the next numbered segment reusing the
-  // active codec params; the timestamp base resets on the next written item.
+  // active codec params; the timestamp base resets on the incoming random-access frame.
   bool RotateSegment(const VideoParams& videoParams, bool audioSeen,
                      const AudioCfg& audioCfg);
-  bool ShouldRotate() const;
+  bool ShouldRotate();
   static std::string SegmentPath(const std::string& basePath, int index);
 
   std::atomic<bool> running_{false};
@@ -118,6 +118,7 @@ class StreamRecorder {
   int64_t lastVideoPtsUs_ = -1;
   int64_t lastAudioPtsUs_ = -1;
   bool pendingBaseReset_ = false;
+  bool discardLeadingPictures_ = false;
   // segmentation state, owned by the writer thread
   int segmentIndex_ = 0;
   uint64_t segmentBytes_ = 0;

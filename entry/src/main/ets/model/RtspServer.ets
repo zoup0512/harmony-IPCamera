@@ -3,7 +3,7 @@ import { createRtspServer, rtspStart, rtspStop, rtspIsRunning, rtspClientCount,
   rtspStartTestPattern,
   rtspStopTestPattern, rtspStartCamera, rtspStopCamera, rtspStartMic, rtspStopMic,
   rtmpStart, rtmpStop, rtspStartRecord, rtspStopRecord, rtspTakeSnapshot,
-  rtspStartHttp, rtspStopHttp, rtspSetMotion, rtspSetMotionTimeout,
+  rtspStartHttp, rtspStopHttp, rtspSetMotion, rtspMotionActive,
   osdSetConfig, osdSetDeviceName, osdSetBattery, osdSetGps, osdSetWatermark,
   onvifScan,
   RtspStartConfig, HttpOptions, OsdConfig, RecordOptions, OnvifDevice
@@ -118,6 +118,10 @@ export class RtspServer {
     } else {
       rtspSetMotion(this.handle, enabled);
     }
+  }
+
+  motionActive(): boolean {
+    return rtspMotionActive(this.handle);
   }
 
   stopRtmp(): void {

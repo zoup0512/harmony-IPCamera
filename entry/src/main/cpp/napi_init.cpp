@@ -13,6 +13,7 @@
 #include <napi/native_api.h>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <chrono>
@@ -279,6 +280,8 @@ void ServerFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
     holder->pattern->Stop();
     holder->pattern.reset();
   }
+  holder->webStream->SetMotionEnabled(false);
+  holder->webStream->SetMotionSink(nullptr);
   holder->StopCameraOutput();
   if (holder->mic) {
     holder->mic->Stop();
@@ -402,6 +405,7 @@ napi_value RtspStop(napi_env env, napi_callback_info info) {
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
   if (holder != nullptr) {
+    holder->webStream->SetMotionEnabled(false);
     holder->server.Stop();
   }
   napi_value undef;
@@ -1139,8 +1143,7 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
     }
     return out;
   });
-  holder->http->SetArchiveFile([weakHolder](const std::string& name,
-                                            std::vector<uint8_t>* out) {
+  holder->http->SetArchiveFile([weakHolder](const std::string& name) -> int {
     // Only filesDir and its MD subdirectory are reachable, and only with the
     // two recording prefixes the recorder writes. HTTP paths arrive lowercased,
     // so restore the canonical casing the recorder used on disk.
@@ -1151,20 +1154,12 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
       file = "IPS_" + name.substr(7);  // the rest is digits, dots and dashes
     }
     if (name.find("..") != std::string::npos || file.find('/') != std::string::npos ||
-        (file.rfind("ipc_", 0) != 0 && file.rfind("IPS_", 0) != 0)) {
-      return false;
+        (file.rfind("ipc_", 0) != 0 && file.rfind("IPS_", 0) != 0) ||
+        file.size() < 4 || file.compare(file.size() - 4, 4, ".mp4") != 0) {
+      return -1;
     }
     std::string full = weakHolder->filesDir + dir + file;
-    FILE* f = fopen(full.c_str(), "rb");
-    if (f == nullptr) return false;
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    out->resize(static_cast<size_t>(size));
-    size_t rd = fread(out->data(), 1, static_cast<size_t>(size), f);
-    fclose(f);
-    out->resize(rd);
-    return rd > 0;
+    return ::open(full.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   });
   bool ok = holder->http->Start(static_cast<int>(port), userStr, passStr,
                                 holder->filesDir);
@@ -1215,14 +1210,40 @@ napi_value RtspSetMotion(napi_env env, napi_callback_info info) {
     holder->webStream->SetMotionTimeout(static_cast<int>(timeoutSec));
   }
   holder->webStream->SetMotionSink([holder](bool motion) {
-    // Both edges reach ArkTS: the rising one starts the motion recording, the
-    // falling one (hold time elapsed) closes it.
+    // Status events are advisory; ArkTS polls the authoritative motion state.
     PostEvent(holder, ipcam::RtspEvent::kClientPlaying, holder->server.ClientCount(),
               motion ? "MOTION detected" : "MOTION cleared");
   });
   holder->webStream->SetMotionEnabled(enabled);
   napi_value result;
   napi_get_boolean(env, enabled, &result);
+  return result;
+}
+
+napi_value RtspMotionActive(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1) return InvalidArgs(env);
+  ServerHolder* holder = HolderFromArg(env, argv[0]);
+  if (holder == nullptr) return InvalidArgs(env);
+  napi_value result;
+  napi_get_boolean(env, holder->server.IsRunning() && holder->webStream->MotionActive(), &result);
+  return result;
+}
+
+napi_value RtspSetMotionTimeout(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2) return InvalidArgs(env);
+  ServerHolder* holder = HolderFromArg(env, argv[0]);
+  if (holder == nullptr) return InvalidArgs(env);
+  int32_t seconds = 15;
+  if (napi_get_value_int32(env, argv[1], &seconds) != napi_ok) return InvalidArgs(env);
+  holder->webStream->SetMotionTimeout(seconds);
+  napi_value result;
+  napi_get_undefined(env, &result);
   return result;
 }
 
@@ -1541,7 +1562,9 @@ napi_value Init(napi_env env, napi_value exports) {
        napi_default, nullptr},
       {"rtspSetMotion", nullptr, RtspSetMotion, nullptr, nullptr, nullptr,
        napi_default, nullptr},
-      {"rtspSetMotionTimeout", nullptr, RtspSetMotion, nullptr, nullptr, nullptr,
+      {"rtspMotionActive", nullptr, RtspMotionActive, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"rtspSetMotionTimeout", nullptr, RtspSetMotionTimeout, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"rtmpStop", nullptr, RtmpStop, nullptr, nullptr, nullptr,
        napi_default, nullptr},

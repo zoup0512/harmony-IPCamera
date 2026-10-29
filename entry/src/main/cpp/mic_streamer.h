@@ -67,7 +67,8 @@ class MicStreamer {
   int channels_ = 1;
   uint64_t nextSampleFrame_ = 0;
   // Input-buffer handoff: never push zero-size input (the encoder would spin
-  // empty output frames). Hold buffers until the mic callback provides PCM.
+  // empty output frames). Each AAC-LC input must contain exactly 1024 PCM
+  // sample frames; short capture callbacks are accumulated rather than padded.
   struct PendingInput {
     uint32_t index = 0;
     OH_AVMemory* memory = nullptr;

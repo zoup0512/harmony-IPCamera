@@ -19,6 +19,8 @@
 namespace ipcam {
 namespace {
 
+constexpr size_t kAacSamplesPerFrame = 1024;
+
 // Sample-rate -> ADTS sampling_frequency_index.
 int SfIndexForRate(int rate) {
   const int rates[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
@@ -135,9 +137,16 @@ void MicStreamer::DrainPendingInputs() {
         continue;
       }
       const size_t frameBytes = 2 * static_cast<size_t>(channels_);
-      filled = std::min(static_cast<size_t>(capacity), pcmQueue_.size());
-      filled -= filled % frameBytes;
-      if (filled == 0) {
+      filled = kAacSamplesPerFrame * frameBytes;
+      if (static_cast<size_t>(capacity) < filled) {
+        pendingInputs_.pop_front();
+        drainActive_ = false;
+        pcmCv_.notify_all();
+        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
+                     "AAC input buffer smaller than one 1024-sample frame");
+        return;
+      }
+      if (pcmQueue_.size() < filled) {
         drainActive_ = false;
         pcmCv_.notify_all();
         return;
@@ -167,7 +176,9 @@ void MicStreamer::DrainPendingInputs() {
 void MicStreamer::OnNewOutputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data,
                                   OH_AVCodecBufferAttr* attr, void* userData) {
   auto self = static_cast<MicStreamer*>(userData);
-  if (attr != nullptr && !(attr->flags & AVCODEC_BUFFER_FLAGS_EOS) && attr->size > 0) {
+  if (attr != nullptr &&
+      !(attr->flags & (AVCODEC_BUFFER_FLAGS_EOS | AVCODEC_BUFFER_FLAGS_CODEC_DATA)) &&
+      attr->size > 0) {
     FrameSink sink;
     {
       std::lock_guard<std::mutex> lk(self->stateMu_);
@@ -175,11 +186,13 @@ void MicStreamer::OnNewOutputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data
     }
     if (sink && data != nullptr) {
       const uint8_t* aac = OH_AVMemory_GetAddr(data);
+      int32_t capacity = OH_AVMemory_GetSize(data);
       int sfIndex = SfIndexForRate(self->sampleRate_);
-      if (aac != nullptr && sfIndex >= 0 && attr->size <= 8192) {
-        uint8_t frame[7 + 8192];
+      if (aac != nullptr && sfIndex >= 0 && attr->size <= 8191 - 7 &&
+          attr->offset >= 0 && attr->offset <= capacity && attr->size <= capacity - attr->offset) {
+        uint8_t frame[8191];
         BuildAdts(frame, 1 /* AAC-LC */, sfIndex, self->channels_, attr->size);
-        memcpy(frame + 7, aac, static_cast<size_t>(attr->size));
+        memcpy(frame + 7, aac + attr->offset, static_cast<size_t>(attr->size));
         sink(frame, static_cast<size_t>(attr->size) + 7, attr->pts);
       }
     }

@@ -6,6 +6,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -661,6 +662,32 @@ void HttpServer::Respond(int fd, int code, const std::string& contentType,
   if (SendAll(fd, head, deadline) && !body.empty()) SendAll(fd, body, deadline);
 }
 
+bool HttpServer::RespondFile(int fd, int fileFd) {
+  struct FileCloser {
+    int fd;
+    ~FileCloser() { ::close(fd); }
+  } file{fileFd};
+  struct stat st{};
+  if (::fstat(fileFd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+    Respond(fd, 404, "text/plain", {});
+    return false;
+  }
+  uint64_t remaining = static_cast<uint64_t>(st.st_size);
+  std::string head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: " +
+                     std::to_string(remaining) + "\r\nConnection: close\r\n\r\n";
+  if (!SendAll(fd, head)) return false;
+  uint8_t buffer[64 * 1024];
+  while (remaining > 0 && running_.load()) {
+    const size_t count = static_cast<size_t>(std::min<uint64_t>(remaining, sizeof(buffer)));
+    ssize_t readBytes = ::read(fileFd, buffer, count);
+    if (readBytes < 0 && errno == EINTR) continue;
+    if (readBytes <= 0) return false;
+    if (!SendAll(fd, buffer, static_cast<size_t>(readBytes))) return false;
+    remaining -= static_cast<uint64_t>(readBytes);
+  }
+  return remaining == 0;
+}
+
 void HttpServer::Respond401(int fd) {
   Respond(fd, 401, "text/plain", {}, "WWW-Authenticate: Basic realm=\"IPCamera\"\r\n");
 }
@@ -778,12 +805,9 @@ bool HttpServer::HandleRequest(int fd, const std::string& method, const std::str
   // the casing the recorder wrote.
   if (path.rfind("/get/ipc_", 0) == 0 || path.rfind("/get/md/ips_", 0) == 0) {
     std::string name = path.substr(5);
-    std::vector<uint8_t> data;
-    if (archiveFile && archiveFile(name, &data) && !data.empty()) {
-      Respond(fd, 200, "video/mp4", data);
-    } else {
-      Respond(fd, 404, "text/plain", {});
-    }
+    int fileFd = archiveFile ? archiveFile(name) : -1;
+    if (fileFd >= 0) return RespondFile(fd, fileFd);
+    Respond(fd, 404, "text/plain", {});
     return true;
   }
   if (path == "/put_voice") {

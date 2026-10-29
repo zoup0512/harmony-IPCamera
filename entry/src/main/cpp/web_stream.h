@@ -18,9 +18,8 @@ namespace ipcam {
 // destroy) at ~1–2 fps — verified to work on this device.
 class WebStream {
  public:
-  // Fires on both edges: true when motion starts, false once motion has been
-  // absent for the hold time — the caller starts and stops its auto recording
-  // off these two transitions (Android reports the same two states).
+  // Best-effort status notifications. Recording control reads MotionActive()
+  // instead, so a dropped or delayed status event cannot change recording state.
   using MotionSink = std::function<void(bool motion)>;
 
   ~WebStream();
@@ -32,7 +31,7 @@ class WebStream {
   // arms the detector kArmDelayUs later, so the user can leave the frame first.
   void SetMotionEnabled(bool enabled);
   void SetMotionTimeout(int seconds);
-  bool MotionActive() const { return motionLatch_.load(); }
+  bool MotionActive() const;
   void SetMotionSink(MotionSink sink);
   std::vector<uint8_t> LatestJpeg() const;
 
@@ -43,7 +42,7 @@ class WebStream {
   void DecodeLoop();
   bool DecodeOne(const std::vector<uint8_t>& params, const std::vector<uint8_t>& idr,
                  int w, int h, std::vector<uint8_t>* nv12Out);
-  void CheckMotion(const uint8_t* nv12, int w, int h);
+  void CheckMotion(const uint8_t* nv12, int w, int h, uint64_t generation);
   // The latch is time based, so it is re-evaluated on every loop pass even when
   // no new picture was decoded — the auto recording then stops within half a
   // second of the timeout instead of at the next keyframe.
@@ -75,8 +74,9 @@ class WebStream {
   std::mutex workerMu_;                // serialises UpdateWorker start/join
   std::thread workerThread_;
 
-  std::mutex motionMu_;
+  mutable std::mutex motionMu_;
   std::vector<uint8_t> prevGrid_;
+  std::atomic<uint64_t> motionGeneration_{0};
   std::atomic<int64_t> lastMotionUs_{0};
   std::atomic<int64_t> armAtUs_{0};    // 0 = not armed (detector idle)
   int64_t motionHoldUs_ = 15000000;    // default 15 s, Android motion_timeout default

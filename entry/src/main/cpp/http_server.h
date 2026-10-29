@@ -40,8 +40,8 @@ class HttpServer {
   using InfoSource = std::function<std::string()>;
   using VoiceSink = std::function<VoiceResult(const std::vector<uint8_t>& body)>;
   using ArchiveSource = std::function<std::string()>;  // list text
-  using ArchiveFile =
-      std::function<bool(const std::string& name, std::vector<uint8_t>* out)>;
+  // Returns an opened read-only descriptor; ownership transfers to HttpServer.
+  using ArchiveFile = std::function<int(const std::string& name)>;
 
   HttpServer();
   ~HttpServer();
@@ -74,6 +74,7 @@ class HttpServer {
   void Respond(int fd, int code, const std::string& contentType,
                const std::vector<uint8_t>& body,
                const std::string& extraHeaders = std::string());
+  bool RespondFile(int fd, int fileFd);
   void Respond401(int fd);
   void RespondText(int fd, const std::string& text);
   bool CheckAuth(const std::string& headerValue) const;

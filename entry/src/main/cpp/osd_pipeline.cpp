@@ -108,17 +108,18 @@ int RotationFromTransform(int transform) {
 
 namespace ipcam {
 
-uint8_t* OsdPipeline::AddrFor(OHNativeWindowBuffer* wb, BufferHandle** hOut) {
+uint8_t* OsdPipeline::AddrFor(OHNativeWindowBuffer* wb, BufferHandle** hOut, bool preview) {
   std::lock_guard<std::mutex> lk(mapMu_);
+  auto& cache = preview ? previewMapCache_ : mapCache_;
   BufferHandle* h = OH_NativeWindow_GetBufferHandleFromNative(wb);
   if (h == nullptr) return nullptr;
-  for (auto it = mapCache_.begin(); it != mapCache_.end(); ++it) {
+  for (auto it = cache.begin(); it != cache.end(); ++it) {
     if (it->wb == wb) {
       if (it->h != h) {
         // Same wrapper address but a different BufferHandle inside: the queue
         // recycled this address for a new SurfaceBuffer and the cached entry
         // (nb included) is stale. Drop it and re-map below.
-        mapCache_.erase(it);
+        cache.erase(it);
         break;
       }
       *hOut = it->h;
@@ -135,7 +136,7 @@ uint8_t* OsdPipeline::AddrFor(OHNativeWindowBuffer* wb, BufferHandle** hOut) {
     return nullptr;
   }
   c.addr = static_cast<uint8_t*>(addr);
-  mapCache_.push_back(c);
+  cache.push_back(c);
   *hOut = c.h;
   return c.addr;
 }
@@ -148,18 +149,15 @@ void OsdPipeline::ClearMapCache() {
   // down by the SurfaceBuffer destructors inside OH_NativeImage_Destroy.
   std::lock_guard<std::mutex> lk(mapMu_);
   mapCache_.clear();
+  previewMapCache_.clear();
 }
 
 bool OsdPipeline::SetUiSurface(uint64_t surfaceId) {
   if (surfaceId == 0) return false;
-  int w = 0;
-  int h = 0;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (surfaceId == uiSurfaceId_ && uiWindow_ != nullptr) return true;
-    w = outW_;
-    h = outH_;
-  }
+  std::lock_guard<std::mutex> lk(uiMu_);
+  if (surfaceId == uiSurfaceId_ && uiWindow_ != nullptr) return true;
+  const int w = outW_;
+  const int h = outH_;
   if (w <= 0 || h <= 0) return false;  // Start() has not run yet
   OHNativeWindow* window = nullptr;
   int createRet = OH_NativeWindow_CreateNativeWindowFromSurfaceId(surfaceId, &window);
@@ -182,6 +180,7 @@ bool OsdPipeline::SetUiSurface(uint64_t surfaceId) {
   }
   // Put the frame in the layout the pipeline produces. The render service owns
   // this surface, so set usage first: a CPU producer needs CPU-visible buffers.
+  OH_NativeWindow_NativeWindowHandleOpt(window, SET_TIMEOUT, 100);
   int usageRet = OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE, kCpuUsage);
   int geomRet = OH_NativeWindow_NativeWindowHandleOpt(window, SET_BUFFER_GEOMETRY, w, h);
   int fmtRet = OH_NativeWindow_NativeWindowHandleOpt(
@@ -202,28 +201,31 @@ bool OsdPipeline::SetUiSurface(uint64_t surfaceId) {
                "usage=0x%{public}llx",
                usageRet, geomRet, fmtRet, transformRet, transform, gotW, gotH,
                gotFmt, static_cast<unsigned long long>(gotUsage));
-  ClearUiSurface();
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    uiWindow_ = window;
-    uiSurfaceId_ = surfaceId;
-    uiOrigTransform_ = transform;
-    uiFailCount_ = 0;
-    uiLogged_ = false;
-  }
+  ClearUiSurfaceLocked();
+  uiWindow_ = window;
+  uiSurfaceId_ = surfaceId;
+  uiOrigTransform_ = transform;
+  uiFailCount_ = 0;
+  uiLogged_ = false;
+  uiActive_.store(true);
   return true;
 }
 
 void OsdPipeline::ClearUiSurface() {
-  OHNativeWindow* window = nullptr;
-  int origTransform = -1;
+  std::lock_guard<std::mutex> lk(uiMu_);
+  ClearUiSurfaceLocked();
+}
+
+void OsdPipeline::ClearUiSurfaceLocked() {
+  OHNativeWindow* window = uiWindow_;
+  int origTransform = uiOrigTransform_;
+  uiActive_.store(false);
+  uiWindow_ = nullptr;
+  uiSurfaceId_ = 0;
+  uiOrigTransform_ = -1;
   {
-    std::lock_guard<std::mutex> lk(mu_);
-    window = uiWindow_;
-    origTransform = uiOrigTransform_;
-    uiWindow_ = nullptr;
-    uiSurfaceId_ = 0;
-    uiOrigTransform_ = -1;
+    std::lock_guard<std::mutex> lk(mapMu_);
+    previewMapCache_.clear();
   }
   if (window != nullptr) {
     if (origTransform >= 0) {
@@ -249,23 +251,18 @@ void OsdPipeline::PreviewLoop() {
       frame.swap(presentFrame_);
       presentPending_ = false;
     }
-    if (!PresentFrameToUi(frame)) {
-      if (uiFailCount_ >= 3) {
-        OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
-                     "ui preview surface unresponsive, local preview disabled");
-        ClearUiSurface();
-      }
+    std::lock_guard<std::mutex> lk(uiMu_);
+    if (!PresentFrameToUiLocked(frame) && uiFailCount_ >= 3) {
+      OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
+                   "ui preview surface unresponsive, local preview disabled");
+      ClearUiSurfaceLocked();
     }
   }
 }
 
 // Returns false when the frame could not be handed to the surface.
-bool OsdPipeline::PresentFrameToUi(const std::vector<uint8_t>& frame) {
-  OHNativeWindow* window = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    window = uiWindow_;
-  }
+bool OsdPipeline::PresentFrameToUiLocked(const std::vector<uint8_t>& frame) {
+  OHNativeWindow* window = uiWindow_;
   if (window == nullptr) {
     return true;  // nothing to do; not a failure
   }
@@ -294,7 +291,7 @@ bool OsdPipeline::PresentFrameToUi(const std::vector<uint8_t>& frame) {
   // only Abort/Flush it, never OH_NativeWindow_DestroyNativeWindowBuffer
   // (destroying it starves the queue after the first frame).
   BufferHandle* h = nullptr;
-  uint8_t* dstBase = AddrFor(buf, &h);
+  uint8_t* dstBase = AddrFor(buf, &h, true);
   bool presented = false;
   if (h != nullptr && dstBase != nullptr && h->stride >= outW_) {
     const int dstRows = h->height > outH_ ? h->height : outH_;
@@ -412,6 +409,7 @@ bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
   // Adopt the local preview surface first: its display transform tells how far
   // sensor frames must rotate for the encoded picture to stand upright, and
   // that fixes the encoder dimensions before anything is configured.
+  std::unique_lock<std::mutex> uiLock(uiMu_);
   rotation_ = 0;
   uiOrigTransform_ = -1;
   if (uiSurfaceId != 0) {
@@ -445,12 +443,17 @@ bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
   outW_ = (rotation_ % 180 != 0) ? reqHeight : reqWidth;
   outH_ = (rotation_ % 180 != 0) ? reqWidth : reqHeight;
   if (uiWindow_ != nullptr) {
+    OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_TIMEOUT, 100);
     OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_BUFFER_GEOMETRY, outW_,
                                           outH_);
     OH_NativeWindow_NativeWindowHandleOpt(
         uiWindow_, SET_FORMAT,
         static_cast<int32_t>(NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP));
   }
+  uiFailCount_ = 0;
+  uiLogged_ = false;
+  uiActive_.store(uiWindow_ != nullptr);
+  uiLock.unlock();
   size_t outputYBytes = 0;
   size_t outputUvBytes = 0;
   size_t outputBytes = 0;
@@ -765,12 +768,7 @@ void OsdPipeline::CompositeOne() {
     sink = sink_;
   }
   if (sink) sink(nv12_.data(), nv12_.size());
-  bool uiActive = false;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    uiActive = uiWindow_ != nullptr;
-  }
-  if (uiActive) {
+  if (uiActive_.load()) {
     std::lock_guard<std::mutex> lk(presentMu_);
     if (!presentPending_) {  // otherwise drop: the preview is still behind
       presentFrame_.assign(nv12_.begin(), nv12_.end());

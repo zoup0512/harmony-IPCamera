@@ -65,12 +65,13 @@ class OsdPipeline {
     BufferHandle* h;
     uint8_t* addr;
   };
-  uint8_t* AddrFor(OHNativeWindowBuffer* wb, BufferHandle** hOut);
+  uint8_t* AddrFor(OHNativeWindowBuffer* wb, BufferHandle** hOut, bool preview = false);
   void ClearMapCache();
   void Run();
   void CompositeOne();
   void PreviewLoop();
-  bool PresentFrameToUi(const std::vector<uint8_t>& frame);
+  bool PresentFrameToUiLocked(const std::vector<uint8_t>& frame);
+  void ClearUiSurfaceLocked();
   void BlendRgbaIntoYuv(const uint8_t* rgba, int srcW, int srcH, bool premul,
                         int dstX, int dstY, int dstW, int dstH,
                         uint8_t* yPlane, uint8_t* uvPlane, int yStride,
@@ -99,11 +100,14 @@ class OsdPipeline {
   OsdRenderer renderer_;
   std::mutex mapMu_;  // guards mapCache_ (compositing and preview threads)
   std::vector<CachedMap> mapCache_;
+  std::vector<CachedMap> previewMapCache_;
   std::vector<uint8_t> nv12_;  // tightly packed compositing target
   std::vector<uint8_t> wmScaled_;  // watermark RGBA, straight alpha, scaled
   int wmScaledW_ = 0;
   int wmScaledH_ = 0;
   uint32_t wmScaledVersion_ = 0;
+  std::mutex uiMu_;  // serializes complete window operations, including destruction
+  std::atomic<bool> uiActive_{false};
   OHNativeWindow* uiWindow_ = nullptr;  // local preview producer window
   uint64_t uiSurfaceId_ = 0;
   int uiFailCount_ = 0;

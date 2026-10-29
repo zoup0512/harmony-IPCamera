@@ -249,7 +249,7 @@ RTMP);停相机后 PC 端 ffplay 连入 RTSP,4 秒内相机自动重启推流(�
 | 4GB 限制 | `four_gb_limit`(默认开) | StreamRecorder 计字节数,≥3968MiB(32 位 sample offset 安全线)关闭当前文件并滚动到下一段 |
 | 定时分段 | `each_segment_length`(分钟,默认 10) | 每段可配时长,到点滚动;`0` 关闭 |
 | 分段命名 | — | `ipc_<ts>.mp4 → ipc_<ts>_2.mp4 → _3…`,天然匹配 `/getarchives` 的 `ipc_*.mp4` 过滤 |
-| 段间连续性 | — | 复用启动时捕获的 VPS/SPS/PPS 与音频配置重建 muxer;PTS 在新段从 0 重锚(下一写样本作为新基准),不丢样本(同线程紧邻完成关闭与重开) |
+| 段间连续性 | — | 复用 VPS/SPS/PPS 与音频配置;达到阈值后在下一随机访问帧前切段并以其重锚 PTS=0;早于新基准的音频和 HEVC 前导帧不写入新段 |
 | 接口 | — | `rtspStartRecord(handle, path, {fourGbLimit, segmentMinutes})` 可选第三参 |
 
 **不移植项(平台限制)**:`save_to_mkv`——OH_AVMuxer 仅支持 MP4/M4A,无 MKV 封装;`save_to_sdcard`——鸿蒙三方应用无公共存储写权限(沙盒 filesDir 即存档目录);`mp4_format` 独立录像编码选择——录像跟随 RTSP 编码(单编码器架构,与 Android 行为一致化)。
@@ -321,7 +321,7 @@ Android 的"移动侦测"实质是**侦测命中即自动录像**:`BaseServerAct
 | 停止条件 | 每次命中重启 15s 定时器,到期回调 false | 保持窗口 `motionHoldUs_`(默认 15s,钳位 10-120),同一帧循环里算下降沿 |
 | 事件上报 | 每次检测结果都回调(`c(boolean)`) | 只在状态跳变时回调:`MOTION detected` / `MOTION cleared`(走 TSFN) |
 | 命中动作 | 起服务器 + 录像到 `DCIM/IPCamera/MD/` | `Index.ets` 编排:起服务器/相机 → 建 `filesDir/MD/` → 录 `IPS_<yyyy-MM-dd.HH.mm.ss.SSSS>.mp4`(同一 `StreamRecorder`,沿用 four_gb_limit/分段设置) |
-| 超时动作 | `X0()` 停计时 + 停录 | `MOTION cleared` → `stopRecord()` 收尾 |
+| 超时动作 | `X0()` 停计时 + 停录 | ArkTS 每 250ms 查询 native 当前保持窗口状态并收尾；TSFN 仅用于日志，不承担录像控制 |
 | 网页可见 | 存档列表含 `DCIM/IPCamera/MD` | `/getarchives` 列出 `MD/IPS_*.mp4`,`/get/MD/IPS_*.mp4` 下载(路由与归档回调都按前缀白名单校验,禁 `..`/越目录) |
 | 手动录像冲突 | 移动侦测开启时录像菜单不可用 | 移动侦测开启时"开启录像"按钮禁用;开启移动侦测会先停掉手工录像 |
 
@@ -370,6 +370,23 @@ Android 的"移动侦测"实质是**侦测命中即自动录像**:`BaseServerAct
 19.2Mbps,移动侦测录像 15.2~16.3Mbps(设置 2Mbps)。720p/20fps 下这个码率异常偏高,疑似
 buffer(OSD)模式下 `OH_MD_KEY_BITRATE` 未作为上限生效;后果是移动侦测录像很大(3 分钟 314MB,
 约 7GB/小时)。建议后续单独排查码率控制(与本轮契约对齐无关)。
+
+## 审查修复与回归测试 (2026-10-29)
+
+- 预览窗口的 Request/Flush/Abort 与替换、销毁使用同一独立互斥锁；相机合成线程不等待该锁。
+- 移动侦测通过同步 native 状态查询控制录像，日志回调可丢弃；关闭直接停录，计时器和解码样本均校验启用代次。
+- 录像归档按固定 64KiB 缓冲读取/发送，响应长度来自已打开文件的 `fstat`，客户端断开即释放文件。
+- 首次开录等待 H.264 IDR / H.265 随机访问帧，并丢弃之前的音视频；时间/大小达到分段阈值后，在下一随机访问帧写入前切段。H.265 段首的 RADL/RASL 前导帧丢弃；分段时刻可能延后一个 GOP，不把 P 帧放在新片头。
+- AAC-LC 编码输入积累到完整 1024 个 PCM 采样帧才提交，避免将 20ms 采集块分别补齐编码成 21.333ms 音频。
+
+主机侧回归（Python 3 + MSVC C++，系统媒体接口使用 stub，不替代真机验证）：
+
+```text
+python tests/preview_lifetime_test.py
+python tests/motion_state_test.py
+python tests/recorder_archive_test.py
+python tests/aac_framing_test.py
+```
 
 ## 阶段 7(远期,未排期)
 
