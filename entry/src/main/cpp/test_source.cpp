@@ -38,6 +38,10 @@ bool TestPatternSource::Start(int width, int height, int fps, int bitrate, Frame
     sink_ = std::move(sink);
     onError_ = std::move(onError);
   }
+  {
+    std::lock_guard<std::mutex> lk(cbMu_);
+    cbStopping_ = false;
+  }
   running_ = true;
 
   encoder_ = OH_VideoEncoder_CreateByMime("video/avc");
@@ -68,7 +72,9 @@ bool TestPatternSource::Start(int width, int height, int fps, int bitrate, Frame
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_BITRATE, bitrate);
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE, BITRATE_MODE_CBR);
   OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE, static_cast<double>(fps_));
-  OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, 2);
+  // Unit is MILLISECONDS (2s GOP, matching the camera default); an
+  // Android-style seconds value here would make every frame a keyframe.
+  OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, 2000);
   err = OH_VideoEncoder_Configure(encoder_, format);
   OH_AVFormat_Destroy(format);
   if (err != AV_ERR_OK) {
@@ -101,8 +107,11 @@ bool TestPatternSource::Start(int width, int height, int fps, int bitrate, Frame
 
 void TestPatternSource::Stop() {
   if (!running_.exchange(false)) return;
-  // Let an in-flight input callback finish (it pushes EOS once running_ is false).
-  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  {
+    std::unique_lock<std::mutex> lk(cbMu_);
+    cbStopping_ = true;
+    cbCv_.wait(lk, [this] { return cbInFlight_ == 0; });
+  }
   if (encoder_ != nullptr) {
     OH_VideoEncoder_Stop(encoder_);
     OH_VideoEncoder_Destroy(encoder_);
@@ -135,11 +144,22 @@ void TestPatternSource::WaitNextFrameSlot() {
 void TestPatternSource::OnNeedInputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuffer* buffer,
                                           void* userData) {
   auto self = static_cast<TestPatternSource*>(userData);
+  {
+    std::lock_guard<std::mutex> lk(self->cbMu_);
+    if (self->cbStopping_) return;  // Stop waits for us; never touch encoder_
+    ++self->cbInFlight_;
+  }
+  auto done = [self] {
+    std::lock_guard<std::mutex> lk(self->cbMu_);
+    --self->cbInFlight_;
+    self->cbCv_.notify_all();
+  };
   if (!self->running_.load()) {
     OH_AVCodecBufferAttr eos{};
     eos.flags = AVCODEC_BUFFER_FLAGS_EOS;
     OH_AVBuffer_SetBufferAttr(buffer, &eos);
     OH_VideoEncoder_PushInputBuffer(self->encoder_, index);
+    done();
     return;
   }
   self->WaitNextFrameSlot();
@@ -154,11 +174,17 @@ void TestPatternSource::OnNeedInputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuff
   OH_VideoEncoder_PushInputBuffer(self->encoder_, index);
   self->frameIndex_++;
   self->nextPtsUs_ += 1000000 / self->fps_;
+  done();
 }
 
 void TestPatternSource::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuffer* buffer,
                                           void* userData) {
   auto self = static_cast<TestPatternSource*>(userData);
+  {
+    std::lock_guard<std::mutex> lk(self->cbMu_);
+    if (self->cbStopping_) return;
+    ++self->cbInFlight_;
+  }
   OH_AVCodecBufferAttr attr{};
   OH_AVBuffer_GetBufferAttr(buffer, &attr);
   if (!(attr.flags & AVCODEC_BUFFER_FLAGS_EOS) && attr.size > 0) {
@@ -172,6 +198,11 @@ void TestPatternSource::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuff
     }
   }
   OH_VideoEncoder_FreeOutputBuffer(self->encoder_, index);
+  {
+    std::lock_guard<std::mutex> lk(self->cbMu_);
+    --self->cbInFlight_;
+    self->cbCv_.notify_all();
+  }
 }
 
 void TestPatternSource::FillFrame(uint8_t* dst, size_t capacity, uint64_t) {

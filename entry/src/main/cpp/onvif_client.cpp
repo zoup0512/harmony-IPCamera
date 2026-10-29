@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <poll.h>
@@ -10,9 +11,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 
 #include <hilog/log.h>
 
@@ -91,7 +94,12 @@ std::string OnvifClient::ExtractTag(const std::string& xml, const std::string& t
       continue;
     }
     size_t end = xml.find("</" + tag + ">", gt);
-    if (end == std::string::npos) return std::string();
+    if (end == std::string::npos) {
+      // A look-alike element (<tagFoo>) without our closing tag must not end
+      // the scan for the real tag later in the document.
+      pos = gt + 1;
+      continue;
+    }
     return xml.substr(gt + 1, end - gt - 1);
   }
   return std::string();
@@ -114,7 +122,10 @@ std::vector<std::string> OnvifClient::ExtractAll(const std::string& xml,
       continue;
     }
     size_t end = xml.find("</" + tag + ">", gt);
-    if (end == std::string::npos) break;
+    if (end == std::string::npos) {
+      pos = gt + 1;
+      continue;
+    }
     out.push_back(xml.substr(gt + 1, end - gt - 1));
     pos = end + tag.size() + 3;
   }
@@ -154,11 +165,35 @@ bool OnvifClient::SoapPost(const std::string& url, const std::string& action,
     }
     memcpy(&addr.sin_addr, he->h_addr_list[0], sizeof(in_addr));
   }
-  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+  // Connect with a deadline: a silent device otherwise stalls the worker for
+  // the kernel TCP timeout, far beyond timeoutMs.
+  int flags = ::fcntl(fd, F_GETFL, 0);
+  ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  const int connRet = ::connect(fd, reinterpret_cast<sockaddr*>(&addr),
+                                sizeof(addr));
+  const int connErr = errno;
+  if (connRet < 0 && connErr != EINPROGRESS) {
     ::close(fd);
     *error = "connect " + hostport;
     return false;
   }
+  if (connErr == EINPROGRESS) {
+    pollfd p{fd, static_cast<short>(POLLOUT | POLLERR | POLLHUP), 0};
+    if (::poll(&p, 1, timeoutMs) <= 0) {
+      ::close(fd);
+      *error = "connect timeout " + hostport;
+      return false;
+    }
+    int soErr = 0;
+    socklen_t soLen = sizeof(soErr);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soLen) != 0 ||
+        soErr != 0) {
+      ::close(fd);
+      *error = "connect " + hostport;
+      return false;
+    }
+  }
+  ::fcntl(fd, F_SETFL, flags);
 
   std::string contentType = "application/soap+xml; charset=utf-8";
   if (!action.empty()) {
@@ -170,10 +205,6 @@ bool OnvifClient::SoapPost(const std::string& url, const std::string& action,
                     "\r\nConnection: close\r\n\r\n" + body;
 
   // send + receive with deadline
-  auto deadline = [](int ms) {
-    return ms;
-  };
-  (void)deadline;
   struct timeval tv {};
   tv.tv_sec = timeoutMs / 1000;
   tv.tv_usec = (timeoutMs % 1000) * 1000;
@@ -249,14 +280,18 @@ std::vector<OnvifClient::Device> OnvifClient::Discover(int timeoutMs, int settle
   }
   // Some devices answer slowly; keep listening for the full window.
   const int64_t totalMs = timeoutMs + settleMs;
-  int64_t listened = 0;
+  const auto endAt = std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(totalMs);
   char rbuf[8192];
   std::map<std::string, size_t> byAddress;
-  while (listened < totalMs) {
+  while (true) {
+    const int64_t remain =
+        std::chrono::duration_cast<std::chrono::milliseconds>(endAt -
+        std::chrono::steady_clock::now()).count();
+    if (remain <= 0) break;
     pollfd p{fd, POLLIN, 0};
-    int wait = static_cast<int>(std::min<int64_t>(500, totalMs - listened));
+    int wait = static_cast<int>(std::min<int64_t>(500, remain));
     int r = ::poll(&p, 1, wait);
-    listened += wait;
     if (r <= 0) continue;
     ssize_t n = ::recv(fd, rbuf, sizeof(rbuf) - 1, 0);
     if (n <= 0) continue;

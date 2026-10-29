@@ -11,6 +11,7 @@
 #include <multimedia/player_framework/native_avformat.h>
 
 #include "jpeg_encoder.h"
+#include "param_sets.h"
 
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "WebStream"
@@ -73,9 +74,6 @@ void AppendNal(std::vector<uint8_t>& v, const uint8_t* d, size_t n) {
   v.insert(v.end(), kStartCode, kStartCode + 4);
   v.insert(v.end(), d, d + n);
 }
-
-// NV12 → 24-bit BMP (unused in production but handy for debug)
-void Dummy() {}
 
 // Cold-decode one keyframe: create decoder → push params+IDR+EOS → get NV12.
 bool DecodeOneFrame(bool h265, const std::vector<uint8_t>& params,
@@ -235,7 +233,11 @@ void WebStream::UpdateWorker() {
   std::lock_guard<std::mutex> lk(workerMu_);
   if (WorkerWanted()) {
     if (!workerRunning_.exchange(true)) {
-      workerThread_ = std::thread(&WebStream::DecodeLoop, this);
+      try {
+        workerThread_ = std::thread(&WebStream::DecodeLoop, this);
+      } catch (const std::system_error&) {
+        workerRunning_ = false;
+      }
     }
     return;
   }
@@ -264,7 +266,7 @@ void WebStream::FeedVideo(const uint8_t* data, size_t size) {
   if (data == nullptr || size < 5) return;
   std::vector<NalView> nals = SplitAnnexB(data, size);
   std::vector<uint8_t> idr;
-  bool sawParam = false;
+  std::vector<uint8_t> frameParams;
   bool sawIdr = false;
   {
     std::lock_guard<std::mutex> lk(stateMu_);
@@ -276,24 +278,29 @@ void WebStream::FeedVideo(const uint8_t* data, size_t size) {
       uint8_t h265Type = static_cast<uint8_t>((nal.data[0] >> 1) & 0x3F);
       if (h265Param) {
         h265_ = true;
-        AppendNal(params_, nal.data, nal.size);
-        sawParam = true;
+        AppendNal(frameParams, nal.data, nal.size);
         continue;
       }
       if (h264Type == 7 || h264Type == 8) {
         h265_ = false;
-        AppendNal(params_, nal.data, nal.size);
-        sawParam = true;
+        AppendNal(frameParams, nal.data, nal.size);
         continue;
       }
       if ((h265_ && (h265Type == 19 || h265Type == 20 || h265Type == 21)) ||
           (!h265_ && h264Type == 5)) {
-        idr.clear();
+        // Accumulate every slice NAL of this access unit — an IDR can be
+        // split across several slice NALs.
+        if (!sawIdr) idr.clear();
         AppendNal(idr, nal.data, nal.size);
         sawIdr = true;
       }
     }
-    if (sawParam) paramsSet_ = !params_.empty();
+    if (!frameParams.empty()) {
+      // Replace per NAL type: encoders re-emit the sets on every keyframe (so
+      // appending would grow without bound), and a buffer may carry only some.
+      params_ = MergeParamSets(params_, frameParams, h265_);
+      paramsSet_ = true;
+    }
     if (sawIdr) {
       lastIdr_ = std::move(idr);
       idrGeneration_.fetch_add(1);  // a new picture is available to decode

@@ -409,7 +409,8 @@ struct Index {
   }
 
   async onStartRtmp(): Promise<void> {
-    hilog.info(DOMAIN, TAG, 'onStartRtmp url=%{public}s', this.rtmpUrl);
+    // The URL embeds the stream key — keep it out of persistent logs.
+    hilog.info(DOMAIN, TAG, 'onStartRtmp urlLen=%{public}d', this.rtmpUrl.length);
     const url = this.rtmpUrl.trim();
     if (url === '') {
       this.appendLog('RTMP url is empty');

@@ -504,8 +504,28 @@ bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
   OH_OnFrameAvailableListener listener{this, &OsdPipeline::OnFrameAvailable};
   OH_NativeImage_SetOnFrameAvailableListener(image_, listener);
 
-  thread_ = std::thread(&OsdPipeline::Run, this);
-  previewThread_ = std::thread(&OsdPipeline::PreviewLoop, this);
+  try {
+    thread_ = std::thread(&OsdPipeline::Run, this);
+    previewThread_ = std::thread(&OsdPipeline::PreviewLoop, this);
+  } catch (const std::system_error&) {
+    Fail("OSD worker thread start failed");
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      quit_ = true;
+    }
+    cv_.notify_all();
+    {
+      std::lock_guard<std::mutex> lk(presentMu_);
+      presentQuit_ = true;
+    }
+    presentCv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+    if (previewThread_.joinable()) previewThread_.join();
+    OH_NativeImage_Destroy(&image_);
+    image_ = nullptr;
+    ClearUiSurface();
+    return false;
+  }
   std::unique_lock<std::mutex> lk(mu_);
   cv_.wait(lk, [this] { return ready_; });
   if (initOk_ && cameraSurfaceId != nullptr) {

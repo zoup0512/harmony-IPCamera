@@ -16,6 +16,7 @@
 #include <multimedia/player_framework/native_avmemory.h>
 
 #include "codec_records.h"
+#include "param_sets.h"
 
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "Snapshotter"
@@ -119,10 +120,18 @@ void OnNeedInput(OH_AVCodec*, uint32_t index, OH_AVBuffer* buffer, void* userDat
   OH_AVCodecBufferAttr attr{};
   if (!s->inputs.empty()) {
     std::vector<uint8_t>& in = s->inputs.front();
-    memcpy(OH_AVBuffer_GetAddr(buffer), in.data(), in.size());
-    attr.size = static_cast<int32_t>(in.size());
+    uint8_t* dst = OH_AVBuffer_GetAddr(buffer);
+    const int64_t capacity = OH_AVBuffer_GetCapacity(buffer);
+    if (dst == nullptr || capacity <= 0) return;  // retry on the next request
+    const size_t write = std::min(in.size(), static_cast<size_t>(capacity));
+    memcpy(dst, in.data(), write);
+    attr.size = static_cast<int32_t>(write);
     attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-    s->inputs.erase(s->inputs.begin());
+    if (write == in.size()) {
+      s->inputs.erase(s->inputs.begin());
+    } else {
+      in.erase(in.begin(), in.begin() + static_cast<long>(write));
+    }
   } else if (!s->eosQueued) {
     attr.flags = AVCODEC_BUFFER_FLAGS_EOS;
     s->eosQueued = true;
@@ -166,6 +175,8 @@ void Snapshotter::FeedVideo(const uint8_t* data, size_t size) {
   std::vector<NalView> nals = SplitAnnexB(data, size);
   std::lock_guard<std::mutex> lk(stateMu_);
   std::vector<uint8_t> idr;
+  std::vector<uint8_t> frameParams;
+  bool sawIdr = false;
   for (auto& nal : nals) {
     while (nal.size > 1 && nal.data[nal.size - 1] == 0x00) nal.size--;
     if (nal.size < 2) continue;
@@ -175,20 +186,27 @@ void Snapshotter::FeedVideo(const uint8_t* data, size_t size) {
                      nal.data[1] == 0x01;
     if (h265Param) {
       h265_ = true;
-      AppendNal(params_, nal.data, nal.size);
+      AppendNal(frameParams, nal.data, nal.size);
       continue;
     }
     if (h264Type == 7 || h264Type == 8) {
       h265_ = false;
-      AppendNal(params_, nal.data, nal.size);
+      AppendNal(frameParams, nal.data, nal.size);
       continue;
     }
     if ((h265_ && (h265Type == 19 || h265Type == 20)) || (!h265_ && h264Type == 5)) {
-      // fresh IDR: restart the cached parameter sets alongside it
-      idr.clear();
+      // Keep every slice NAL of this access unit — encoders can split an IDR
+      // across several slice NALs.
+      if (!sawIdr) {
+        idr.clear();
+        sawIdr = true;
+      }
       AppendNal(idr, nal.data, nal.size);
     }
   }
+  // Replace per NAL type: encoders re-emit the sets on every keyframe (so
+  // appending would grow without bound), and a buffer may carry only some.
+  if (!frameParams.empty()) params_ = MergeParamSets(params_, frameParams, h265_);
   if (!idr.empty()) {
     lastIdr_ = std::move(idr);
   }

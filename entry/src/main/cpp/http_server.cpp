@@ -923,6 +923,17 @@ void HttpServer::HandleConnection(int fd) {
     return;
   }
 
+  // Clients that ask for 100-continue wait for the interim response before
+  // sending the body (curl waits ~1s otherwise).
+  auto expect = request.headers.find("Expect");
+  if (expect != request.headers.end() && !expect->second.empty() &&
+      ToLower(expect->second.front()).find("100-continue") !=
+          std::string::npos) {
+    static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    SendAll(fd, reinterpret_cast<const uint8_t*>(kContinue), sizeof(kContinue) - 1,
+            Clock::now() + kSendDeadline);
+  }
+
   std::vector<uint8_t> body(contentLength);
   auto bodyDeadline = Clock::now() + kBodyDeadline;
   if (!body.empty() && !ReceiveExact(fd, body.data(), body.size(), bodyDeadline)) {

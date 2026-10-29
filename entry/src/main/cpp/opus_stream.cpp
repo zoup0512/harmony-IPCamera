@@ -120,6 +120,7 @@ std::vector<uint8_t> OpusStream::BuildOggPage(uint8_t headerType, uint64_t granu
 
 bool OpusStream::CreateEncoderLocked() {
   if (encoder_ != nullptr) return true;
+  encoderDestroying_ = false;
   // Log what the system opus encoder actually supports so configuration can
   // be adapted per device (some builds reject S16LE or explicit bitrates).
   OH_AVCapability* cap = OH_AVCodec_GetCapability(OH_AVCODEC_MIMETYPE_AUDIO_OPUS, true);
@@ -179,7 +180,6 @@ bool OpusStream::CreateEncoderLocked() {
       {2, true, SAMPLE_F32LE, true, "stereo/F32LE"},
   };
   bool configured = false;
-  (void)0;
   OH_AVErrCode lastErr = AV_ERR_UNKNOWN;
   // Diagnostic: some codec builds only accept the new buffer API; an old-style
   // SetCallback before Configure can lock the state machine. Try Configure on
@@ -317,8 +317,6 @@ bool OpusStream::CreateEncoderLocked() {
   pendingInputs_.clear();
   encoderFailed_.store(false);
   pageSequence_ = 0;
-  granule_ = 0;
-  headersSent_ = false;
   headPages_.clear();
   headPages_ = BuildOggPage(0x02, 0, pageSerial_, pageSequence_++, BuildOpusHead());
   std::vector<uint8_t> tagsPage =
@@ -330,7 +328,11 @@ bool OpusStream::CreateEncoderLocked() {
   return true;
 }
 
-void OpusStream::DestroyEncoderLocked() {
+void OpusStream::DestroyEncoderLocked(std::unique_lock<std::mutex>& lk) {
+  // PushInputData runs with pcmMu_ released; block new drain iterations and
+  // wait out the in-flight one before the codec handle is destroyed.
+  encoderDestroying_ = true;
+  pcmCv_.wait(lk, [this] { return !drainActive_; });
   if (encoder_ != nullptr) {
     OH_AudioEncoder_Stop(encoder_);
     OH_AudioEncoder_Destroy(encoder_);
@@ -342,12 +344,12 @@ void OpusStream::DestroyEncoderLocked() {
 }
 
 bool OpusStream::EnsureReady() {
-  std::lock_guard<std::mutex> lk(pcmMu_);
+  std::unique_lock<std::mutex> lk(pcmMu_);
   if (readyChecked_) return encoderAvailable_;
   // One-time probe: create and immediately destroy; the real encoder is
   // created when the first client connects.
   encoderAvailable_ = CreateEncoderLocked();
-  DestroyEncoderLocked();
+  DestroyEncoderLocked(lk);
   readyChecked_ = true;
   return encoderAvailable_;
 }
@@ -385,8 +387,10 @@ void OpusStream::DrainPendingInputs() {
     uint64_t ptsUs = 0;
     {
       std::lock_guard<std::mutex> lk(pcmMu_);
-      if (encoder_ == nullptr || pendingInputs_.empty() || pcmQueue_.empty()) {
+      if (encoder_ == nullptr || encoderDestroying_ || pendingInputs_.empty() ||
+          pcmQueue_.empty()) {
         drainActive_ = false;
+        pcmCv_.notify_all();
         return;
       }
       pending = pendingInputs_.front();
@@ -405,6 +409,7 @@ void OpusStream::DrainPendingInputs() {
       size_t samples = std::min(srcSamples, outCapacity);
       if (samples == 0) {
         drainActive_ = false;
+        pcmCv_.notify_all();
         return;
       }
       const size_t filled = samples * 2;  // bytes consumed from the mono tap
@@ -438,6 +443,7 @@ void OpusStream::DrainPendingInputs() {
     if (OH_AudioEncoder_PushInputData(encoder_, pending.index, attr) != AV_ERR_OK) {
       std::lock_guard<std::mutex> lk(pcmMu_);
       drainActive_ = false;
+      pcmCv_.notify_all();
       return;
     }
   }
@@ -512,7 +518,6 @@ bool OpusStream::Serve(int fd, const std::atomic<bool>& serverRunning) {
     clients_.push_back(client);
   }
 
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   auto sendAll = [&](const uint8_t* data, size_t size) {
     size_t offset = 0;
     while (offset < size) {
@@ -557,8 +562,8 @@ bool OpusStream::Serve(int fd, const std::atomic<bool>& serverRunning) {
     bool none = clients_.empty();
     clientsCv_.notify_all();
     if (none) {
-      std::lock_guard<std::mutex> lk2(pcmMu_);
-      DestroyEncoderLocked();
+      std::unique_lock<std::mutex> lk2(pcmMu_);
+      DestroyEncoderLocked(lk2);
     }
   }
   return !client->closed;
@@ -571,8 +576,8 @@ void OpusStream::Shutdown() {
     clients_.clear();
     clientsCv_.notify_all();
   }
-  std::lock_guard<std::mutex> lk(pcmMu_);
-  DestroyEncoderLocked();
+  std::unique_lock<std::mutex> lk(pcmMu_);
+  DestroyEncoderLocked(lk);
 }
 
 }  // namespace ipcam

@@ -106,10 +106,6 @@ void PushDHT(std::vector<uint8_t>& v, uint8_t tcTh, const uint8_t bits[16],
   PushMarker(v, 0xC4, p);
 }
 
-void PushMarker16(std::vector<uint8_t>& v, uint8_t marker, const std::vector<uint8_t>& payload) {
-  PushMarker(v, marker, payload);
-}
-
 }  // namespace
 
 std::vector<uint8_t> JpegEncoder::EncodeNV12(const uint8_t* nv12, int width, int height) {

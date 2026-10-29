@@ -62,7 +62,7 @@ class OpusStream {
                               OH_AVCodecBufferAttr* attr, void* userData);
 
   bool CreateEncoderLocked();
-  void DestroyEncoderLocked();
+  void DestroyEncoderLocked(std::unique_lock<std::mutex>& lk);
   void DrainPendingInputs();
   void BroadcastPage(const std::vector<uint8_t>& page);
   static std::vector<uint8_t> BuildOggPage(uint8_t headerType, uint64_t granule,
@@ -89,6 +89,8 @@ class OpusStream {
   };
   std::deque<PendingInput> pendingInputs_;
   bool drainActive_ = false;
+  bool encoderDestroying_ = false;
+  std::condition_variable pcmCv_;
   std::vector<uint8_t> headPages_;  // cached OpusHead+OpusTags ogg pages
 
   // clients (guarded by clientsMu_)
@@ -97,8 +99,6 @@ class OpusStream {
   std::vector<std::shared_ptr<Client>> clients_;
   uint32_t pageSerial_ = 0x4950434DU;  // 'IPCM'
   uint32_t pageSequence_ = 0;
-  uint64_t granule_ = 0;
-  bool headersSent_ = false;
 
   std::atomic<bool> sourceActive_{false};
 };

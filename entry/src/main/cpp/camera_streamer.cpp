@@ -206,11 +206,35 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
     }
   }
 
+  // `chosen` borrows from `devices`, so these lists must stay alive until
+  // CreateCameraInput. They must be freed BEFORE Cleanup() deletes the
+  // manager: error paths call Free() first, and the destructor only acts while
+  // the manager is still alive (it references manager_, never a stale copy).
+  struct CameraListsGuard {
+    Camera_Manager*& mgr;
+    Camera_Device* devs;
+    uint32_t count;
+    Camera_OutputCapability* cap;
+    void Free() {
+      if (mgr != nullptr && devs != nullptr) {
+        OH_CameraManager_DeleteSupportedCameras(mgr, devs, count);
+      }
+      if (mgr != nullptr && cap != nullptr) {
+        OH_CameraManager_DeleteSupportedCameraOutputCapability(mgr, cap);
+      }
+      devs = nullptr;
+      cap = nullptr;
+    }
+    ~CameraListsGuard() { Free(); }
+  };
+  CameraListsGuard lists{manager_, devices, devCount, nullptr};
+
   Camera_OutputCapability* capability = nullptr;
   err = OH_CameraManager_GetSupportedCameraOutputCapability(manager_, chosen, &capability);
+  lists.cap = capability;
   if (err != CAMERA_OK || capability == nullptr || capability->previewProfilesSize == 0) {
     Fail("GetSupportedCameraOutputCapability", err);
-    OH_CameraManager_DeleteSupportedCameras(manager_, devices, devCount);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -229,12 +253,10 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
       profile = *p;
     }
   }
-  // NOTE: devices/capability stay alive until the camera input is created below
-  // (chosen points into the devices array).
-
   encoder_ = OH_VideoEncoder_CreateByMime(mime.c_str());
   if (encoder_ == nullptr) {
     Fail("CreateVideoEncoder", 0);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -247,6 +269,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   OH_AVErrCode aerr = OH_VideoEncoder_RegisterCallback(encoder_, cb, this);
   if (aerr != AV_ERR_OK) {
     Fail("EncoderRegisterCallback", aerr);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -322,6 +345,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   OH_AVFormat_Destroy(format);
   if (aerr != AV_ERR_OK) {
     Fail("EncoderConfigure", aerr);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -329,6 +353,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   aerr = OH_VideoEncoder_Prepare(encoder_);
   if (aerr != AV_ERR_OK) {
     Fail("EncoderPrepare", aerr);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -338,6 +363,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
     aerr = OH_VideoEncoder_GetSurface(encoder_, &window_);
     if (aerr != AV_ERR_OK || window_ == nullptr) {
       Fail("EncoderGetSurface", aerr);
+      lists.Free();
       Cleanup();
       running_ = false;
       return false;
@@ -346,6 +372,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   aerr = OH_VideoEncoder_Start(encoder_);
   if (aerr != AV_ERR_OK) {
     Fail("EncoderStart", aerr);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -360,6 +387,7 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   err = OH_CameraManager_CreatePreviewOutput(manager_, &profile, sidStr, &preview_);
   if (err != CAMERA_OK || preview_ == nullptr) {
     Fail("CreatePreviewOutput", err);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
@@ -367,14 +395,12 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   err = OH_CameraManager_CreateCameraInput(manager_, chosen, &input_);
   if (err != CAMERA_OK || input_ == nullptr) {
     Fail("CreateCameraInput", err);
-    OH_CameraManager_DeleteSupportedCameras(manager_, devices, devCount);
-    OH_CameraManager_DeleteSupportedCameraOutputCapability(manager_, capability);
+    lists.Free();
     Cleanup();
     running_ = false;
     return false;
   }
-  OH_CameraManager_DeleteSupportedCameras(manager_, devices, devCount);
-  OH_CameraManager_DeleteSupportedCameraOutputCapability(manager_, capability);
+  lists.Free();
   err = OH_CameraInput_Open(input_);
   if (err != CAMERA_OK) {
     Fail("CameraInputOpen (permission?)", err);
@@ -477,7 +503,13 @@ bool CameraStreamer::AttachPreview(uint64_t surfaceId) {
     g_lastKnownRotation.store(osd_->rotation());
     return ok;
   }
-  if (previewUi_ != nullptr) return true;  // already attached
+  if (previewUi_ != nullptr) {
+    // Keep the newest surface id — a later Restart/SwitchFacing must attach
+    // the recreated XComponent, not the stale one.
+    pendingPreviewId_ = surfaceId;
+    hasPendingPreview_ = true;
+    return true;
+  }
   if (!running_.load() || session_ == nullptr || manager_ == nullptr) {
     pendingPreviewId_ = surfaceId;
     hasPendingPreview_ = true;
@@ -498,27 +530,6 @@ bool CameraStreamer::AttachPreview(uint64_t surfaceId) {
   hasPendingPreview_ = true;
   return Start(lastWidth_, lastHeight_, lastBitrate_, lastMime_.c_str(), lastFront_,
                lastIFrameMs_, surfaceId, lastOsd_, sink, onError);
-  char sidStr[32];
-  snprintf(sidStr, sizeof(sidStr), "%llu", static_cast<unsigned long long>(surfaceId));
-  Camera_PreviewOutput* out = nullptr;
-  Camera_ErrorCode err =
-      OH_CameraManager_CreatePreviewOutput(manager_, &uiProfile_, sidStr, &out);
-  if (err != CAMERA_OK || out == nullptr) {
-    LogErr("AttachPreview: CreatePreviewOutput", err);
-    return false;
-  }
-  err = OH_CaptureSession_BeginConfig(session_);
-  if (err == CAMERA_OK) err = OH_CaptureSession_AddPreviewOutput(session_, out);
-  if (err == CAMERA_OK) err = OH_CaptureSession_CommitConfig(session_);
-  if (err == CAMERA_OK) err = OH_PreviewOutput_Start(out);
-  if (err != CAMERA_OK) {
-    LogErr("AttachPreview: config/start", err);
-    OH_PreviewOutput_Release(out);
-    return false;
-  }
-  previewUi_ = out;
-  OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "UI preview attached");
-  return true;
 }
 
 void CameraStreamer::Stop() {

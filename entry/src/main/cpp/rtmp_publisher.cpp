@@ -1,4 +1,5 @@
 #include "rtmp_publisher.h"
+#include "rtmp_chunk_parser.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -850,7 +851,8 @@ bool RtmpPublisher::ConnectAndPublish(const std::string& host, int port,
     if (error != nullptr) *error = "unsupported RTMP handshake version";
     return false;
   }
-  if (!SendAll(fd, s0s1s2 + 1 + 1536, 1536, deadlineUs,
+  // C2 echoes S1 (time + random bytes), not S2.
+  if (!SendAll(fd, s0s1s2 + 1, 1536, deadlineUs,
                cancelRequested_, error)) {
     return false;
   }
@@ -905,15 +907,7 @@ void RtmpPublisher::SenderLoop(int fd) {
   uint64_t received = 0;
   uint64_t lastAck = 0;
   uint32_t windowAckSize = 2500000;
-  uint32_t peerChunkSize = 128;
-
-  struct PeerState {
-    uint32_t tsDelta = 0;
-    uint32_t length = 0;
-    uint8_t type = 0;
-    bool inMsg = false;
-  };
-  std::map<uint32_t, PeerState> peer;
+  RtmpChunkParser parser(static_cast<uint32_t>(kMaxInboundBufferBytes));
   std::vector<uint8_t> rbuf;
 
   while (!cancelRequested_.load()) {
@@ -995,88 +989,16 @@ void RtmpPublisher::SenderLoop(int fd) {
         break;
       }
 
-      size_t pos = 0;
-      while (true) {
-        if (pos >= rbuf.size()) break;
-        const size_t chunkStart = pos;
-        const uint8_t b0 = rbuf[pos];
-        const uint8_t fmt = b0 >> 6;
-        uint32_t csid = b0 & 0x3F;
-        size_t basicHeader = 1;
-        if (csid == 0) {
-          if (pos + 2 > rbuf.size()) break;
-          csid = 64 + rbuf[pos + 1];
-          basicHeader = 2;
-        } else if (csid == 1) {
-          if (pos + 3 > rbuf.size()) break;
-          csid = 64 + rbuf[pos + 1] + rbuf[pos + 2] * 256;
-          basicHeader = 3;
-        }
-
-        PeerState& st = peer[csid];
-        const size_t messageHeader =
-            (fmt == 0) ? 11 : (fmt == 1 ? 7 : (fmt == 2 ? 3 : 0));
-        if (fmt == 3 && !st.inMsg) {
-          pos += basicHeader;
-          continue;
-        }
-        if (pos + basicHeader + messageHeader > rbuf.size()) break;
-
-        const uint8_t* h = rbuf.data() + pos + basicHeader;
-        uint32_t timestampField = st.tsDelta;
-        uint32_t newLength = st.length;
-        uint8_t newType = st.type;
-        if (fmt == 0) {
-          timestampField = (h[0] << 16) | (h[1] << 8) | h[2];
-          newLength = (h[3] << 16) | (h[4] << 8) | h[5];
-          newType = h[6];
-        } else if (fmt == 1) {
-          timestampField = (h[0] << 16) | (h[1] << 8) | h[2];
-          newLength = (h[3] << 16) | (h[4] << 8) | h[5];
-          newType = h[6];
-        } else if (fmt == 2) {
-          timestampField = (h[0] << 16) | (h[1] << 8) | h[2];
-        }
-
-        const bool extTs = timestampField == 0xFFFFFF;
-        const size_t extBytes = extTs ? 4 : 0;
-        if (pos + basicHeader + messageHeader + extBytes > rbuf.size()) {
-          break;
-        }
-        if (extTs) {
-          const size_t extPos = pos + basicHeader + messageHeader;
-          timestampField = (static_cast<uint32_t>(rbuf[extPos]) << 24) |
-                           (static_cast<uint32_t>(rbuf[extPos + 1]) << 16) |
-                           (static_cast<uint32_t>(rbuf[extPos + 2]) << 8) |
-                           static_cast<uint32_t>(rbuf[extPos + 3]);
-        }
-
-        size_t payloadPos = pos + basicHeader + messageHeader + extBytes;
-        const size_t piece = std::min<size_t>(peerChunkSize, newLength);
-        if (payloadPos + piece > rbuf.size()) {
-          pos = chunkStart;
-          break;
-        }
-
-        st.tsDelta = timestampField;
-        st.length = newLength;
-        st.type = newType;
-        st.inMsg = true;
-        if (st.type == MSG_SET_CHUNK_SIZE && st.length == 4 && piece == 4) {
-          const uint32_t newChunkSize =
-              (static_cast<uint32_t>(rbuf[payloadPos]) << 24) |
-              (static_cast<uint32_t>(rbuf[payloadPos + 1]) << 16) |
-              (static_cast<uint32_t>(rbuf[payloadPos + 2]) << 8) |
-              static_cast<uint32_t>(rbuf[payloadPos + 3]);
-          if (newChunkSize == 0 || newChunkSize > kMaxInboundBufferBytes) {
-            AbortRuntime("invalid server chunk size");
-            break;
-          }
-          peerChunkSize = newChunkSize;
-        }
-        pos = payloadPos + piece;
-        st.length -= static_cast<uint32_t>(piece);
-        if (st.length == 0) st.inMsg = false;
+      RtmpChunkParser::Status status = RtmpChunkParser::Status::kOk;
+      std::string detail;
+      const size_t pos = parser.Consume(rbuf.data(), rbuf.size(), &status, &detail);
+      if (status == RtmpChunkParser::Status::kInvalidChunkSize) {
+        AbortRuntime("invalid server chunk size");
+        break;
+      }
+      if (status == RtmpChunkParser::Status::kRejected) {
+        AbortRuntime("server rejected: " + detail);
+        break;
       }
 
       if (pos > 0) {
@@ -1407,12 +1329,16 @@ void RtmpPublisher::SendH264Packet(const uint8_t* data, size_t size,
   frame.streamId = 1;
   frame.tsMs = timestampMs;
   if (h265) {
+    // Enhanced-RTMP ex-header: isExHeader | FrameType | PacketType=CodedFrames.
+    // Inter frames must carry FrameType=2, and CodedFrames (unlike
+    // CodedFramesX) is followed by a 24-bit composition time, same as AVC.
     frame.payload.push_back(
-        static_cast<uint8_t>(0x80 | (hasKey ? 0x10 : 0x00) | 0x01));
+        static_cast<uint8_t>(0x80 | (hasKey ? 0x10 : 0x20) | 0x01));
     frame.payload.push_back('h');
     frame.payload.push_back('v');
     frame.payload.push_back('c');
     frame.payload.push_back('1');
+    Put3(frame.payload, 0);
   } else {
     frame.payload.push_back(static_cast<uint8_t>(hasKey ? 0x17 : 0x27));
     frame.payload.push_back(0x01);

@@ -135,7 +135,7 @@ bool Base64Decode(const std::string& in, std::string* out) {
   uint32_t buf = 0;
   int bits = 0;
   for (char c : in) {
-    if (c == '=' || c == '\r' || c == '\n') continue;
+    if (c == '=' || std::isspace(static_cast<unsigned char>(c))) continue;
     int8_t v = table[static_cast<uint8_t>(c)];
     if (v < 0) return false;
     buf = (buf << 6) | static_cast<uint32_t>(v);
@@ -209,6 +209,30 @@ bool SendAll(int fd, const uint8_t* data, size_t len,
   return off == len;
 }
 
+// Whether an RTSP request URL addresses the configured stream path
+// (`rtsp://host:port/<path>[/track...]`); relative control URLs and an
+// empty configured path always match.
+bool RtspPathMatches(const std::string& url, const std::string& path) {
+  if (path.empty()) return true;
+  std::string p = url;
+  const size_t scheme = p.find("://");
+  if (scheme != std::string::npos) {
+    const size_t slash = p.find('/', scheme + 3);
+    p = slash == std::string::npos ? "/" : p.substr(slash);
+  } else if (!p.empty() && p.front() != '/') {
+    return true;  // relative control url like "trackID=0" — applies to us
+  }
+  const size_t q = p.find('?');
+  if (q != std::string::npos) p.resize(q);
+  while (p.size() > 1 && p.back() == '/') p.pop_back();
+  std::string want = path;
+  while (!want.empty() && want.front() == '/') want.erase(want.begin());
+  while (!want.empty() && want.back() == '/') want.pop_back();
+  if (want.empty()) return true;
+  want = "/" + want;
+  return p == want || p.rfind(want + "/", 0) == 0;
+}
+
 }  // namespace
 
 struct RtspServer::Session : std::enable_shared_from_this<Session> {
@@ -272,6 +296,7 @@ struct RtspServer::Session : std::enable_shared_from_this<Session> {
 
   mutable std::mutex stateMu;
   TransportState transport;
+  std::string controlUrl;  // URL seen on DESCRIBE, used for RTP-Info
 
   std::mutex queueMu;
   std::condition_variable queueCv;
@@ -304,6 +329,7 @@ struct RtspServer::Session : std::enable_shared_from_this<Session> {
   void CloseUdp();
   bool HandleRequestText(const std::string& text);
   bool CheckAuth(const std::map<std::string, std::string>& headers);
+  bool StreamUrlAllowed(const std::string& url);
   bool SendResponse(const std::string& cseq, int code, const std::string& reason,
                     const std::string& extraHeaders, const std::string& body,
                     PlaybackChange playbackChange = PlaybackChange::kNone,
@@ -960,8 +986,10 @@ void RtspServer::Session::WriterLoop() {
         size_t end = item.response.rfind(separator);
         if (end != std::string::npos) {
           item.response.insert(end,
-              "RTP-Info: url=trackID=0;seq=" +
-              std::to_string(videoSeq) + "\r\n");
+              "RTP-Info: url=" +
+              (controlUrl.empty() ? std::string("trackID=0")
+                                  : controlUrl + "/trackID=0") +
+              ";seq=" + std::to_string(videoSeq) + "\r\n");
         }
       }
       if (!SendAll(socketFd,
@@ -1051,6 +1079,12 @@ bool RtspServer::Session::HandleRequestText(const std::string& text) {
   }
   std::string cseq = headers.count("cseq") ? headers["cseq"] : "0";
 
+  // OPTIONS is a capability probe; every other method must address the
+  // configured stream path.
+  if (method != "OPTIONS" && !StreamUrlAllowed(url)) {
+    return SendResponse(cseq, 404, "Stream not found", "", "");
+  }
+
   if (method == "OPTIONS") {
     return SendResponse(cseq, 200, "OK",
                         "Public: OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, "
@@ -1062,10 +1096,11 @@ bool RtspServer::Session::HandleRequestText(const std::string& text) {
       return SendResponse(cseq, 401, "Unauthorized",
                           "WWW-Authenticate: Basic realm=\"IPCamera\"\r\n", "");
     }
+    controlUrl = url;
     std::string sdp = server->BuildSdp();
+    // SendResponse appends Content-Length itself for a non-empty body.
     return SendResponse(cseq, 200, "OK",
-                        "Content-Type: application/sdp\r\n"
-                        "Content-Length: " + std::to_string(sdp.size()) + "\r\n",
+                        "Content-Type: application/sdp\r\n",
                         sdp);
   }
   if (method == "SETUP") {
@@ -1188,6 +1223,15 @@ bool RtspServer::Session::HandleRequestText(const std::string& text) {
   return SendResponse(cseq, 501, "Not implemented", "", "");
 }
 
+bool RtspServer::Session::StreamUrlAllowed(const std::string& url) {
+  std::string path;
+  {
+    std::lock_guard<std::mutex> lk(server->configMu_);
+    path = server->config_.path;
+  }
+  return RtspPathMatches(url, path);
+}
+
 bool RtspServer::Session::CheckAuth(const std::map<std::string, std::string>& headers) {
   RtspConfig cfg;
   {
@@ -1198,10 +1242,10 @@ bool RtspServer::Session::CheckAuth(const std::map<std::string, std::string>& he
   auto it = headers.find("authorization");
   if (it == headers.end()) return false;
   const std::string& auth = it->second;
-  const std::string prefix = "Basic ";
-  if (auth.rfind(prefix, 0) != 0) return false;
+  // RFC 7617: the scheme token is case-insensitive.
+  if (auth.size() < 6 || ToLower(auth.substr(0, 6)) != "basic ") return false;
   std::string decoded;
-  if (!Base64Decode(auth.substr(prefix.size()), &decoded)) return false;
+  if (!Base64Decode(auth.substr(6), &decoded)) return false;
   std::string expect = cfg.user + ":" + cfg.password;
   return decoded == expect;
 }

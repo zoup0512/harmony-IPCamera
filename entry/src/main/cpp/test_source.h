@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -41,6 +42,13 @@ class TestPatternSource {
 
   void FillFrame(uint8_t* dst, size_t capacity, uint64_t ptsUs);
   void WaitNextFrameSlot();
+
+  // Codec callbacks may still be in flight when Stop runs; they can hold the
+  // codec for a full frame slot, so Stop must wait them out before Destroy.
+  std::mutex cbMu_;
+  std::condition_variable cbCv_;
+  int cbInFlight_ = 0;
+  bool cbStopping_ = false;
 
   OH_AVCodec* encoder_ = nullptr;
   std::atomic<bool> running_{false};
