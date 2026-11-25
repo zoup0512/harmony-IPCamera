@@ -273,6 +273,8 @@
     {
       "name": "permission_location_reason",
       "value": "Show GPS coordinates on the OSD overlay"
-    }
+    },
+    { "name": "srv_port_invalid", "value": "Port must be a number from 1 to 65535; the previous port is kept." },
+    { "name": "srv_color_invalid", "value": "Use #RRGGBB or #RRGGBBAA; the previous color is kept." }
   ]
 }

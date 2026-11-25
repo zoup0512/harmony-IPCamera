@@ -102,9 +102,35 @@ void races() {
   }
 }
 }
+void staleSecondary() {
+  // Once running, a stalled secondary camera must not stop primary frames.
+  for (int mode=1; mode <= 3; ++mode) {
+    DualFrameGate gate;
+    assert(gate.Configure(mode,24,24,8,8,0));
+    auto second = frame(8,8,132,150,195);
+    gate.Publish(second.data(),second.size(),8,8);
+    auto first = frame(24,24,81,95,120);
+    assert(gate.Composite(first.data(),first.size(),24,24));
+    std::this_thread::sleep_for(1100ms);
+    auto main = frame(24,24,81,95,120);
+    assert(gate.Composite(main.data(),main.size(),24,24));
+    assert(std::find(main.begin(),main.begin()+24*24,132)==main.begin()+24*24);  // no stale PiP pixels
+    if (mode==1) assert(main == frame(24,24,81,95,120));
+    gate.Publish(second.data(),second.size(),8,8);  // recovery redraws the secondary
+    assert(gate.Composite(main.data(),main.size(),24,24));
+    assert(std::find(main.begin(),main.begin()+24*24,132)!=main.begin()+24*24);
+  }
+  // Before the first composite, staleness still fails startup instead of hiding a dead lens.
+  DualFrameGate gate;
+  assert(gate.Configure(1,24,24,8,8,0));
+  auto second = frame(8,8,132,150,195), main = frame(24,24,81,95,120);
+  gate.Publish(second.data(),second.size(),8,8);
+  std::this_thread::sleep_for(1100ms);
+  assert(!gate.Composite(main.data(),main.size(),24,24) && !gate.Wait(0ms));
+}
 int main() {
   DualFrameGate bad;
   assert(!bad.Configure(0,8,8,8,8,0)); assert(!bad.Configure(1,8,8,7,8,0));
   assert(!bad.Configure(1,4096,4096,8,8,0)); assert(!bad.Configure(1,8,8,8,8,45));
-  layouts(); rotation(); oddSplitAndGuards(); races();
+  layouts(); rotation(); oddSplitAndGuards(); races(); staleSecondary();
 }

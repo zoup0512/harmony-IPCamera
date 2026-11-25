@@ -88,6 +88,8 @@ export interface DualCameraPlan {
 export const cameraSetDualLayout: (server: object, layout: number, plan?: DualCameraPlan) => number;
 export const cameraDualLayout: (server: object) => number;
 export const cameraFocusInfo: (server: object) => string;
+/** Single-camera only. A successful mode (and capture FPS below) is re-applied after native
+ * rebuilds of the same run (resolution, lens, restart) when the new session supports it. */
 export const cameraSetFocusMode: (server: object, mode: number) => boolean;
 /** Coordinates are normalized to [0, 1] in camera space. */
 export const cameraFocusAt: (server: object, x: number, y: number) => boolean;

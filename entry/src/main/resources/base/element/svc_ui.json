@@ -103,6 +103,9 @@
     {
       "name": "svc_ui_torch_failed",
       "value": "This camera could not switch its light."
-    }
+    },
+    { "name": "svc_ui_exit_title", "value": "Server" },
+    { "name": "svc_ui_exit_prompt", "value": "Are you sure to exit?" },
+    { "name": "svc_ui_exit", "value": "Exit" }
   ]
 }

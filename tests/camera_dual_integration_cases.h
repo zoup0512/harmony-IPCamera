@@ -76,23 +76,21 @@ static void TestDualIntegration(bool singleOsd) {
     assert(!camera.SwitchFacing() && camera.ChangeResolution(8,4)==R::Rejected);
     assert(camera.ChangeResolution(640,480)==R::Rejected && starts==before);
   }
-  // A stale secondary must NOT repeat the previous composition or lose the
-  // codec input index. Hold it past the single path's old 200ms fallback.
-  auto waitForFresh = [] {
-    waitingInput=std::async(std::launch::async, [c=live] {
-      OH_AVBuffer b;
-      c->cb.onNeedInputBuffer(c,0,&b,c->ctx);
-    });
-    assert(waitingInput.wait_for(std::chrono::milliseconds(300))==std::future_status::timeout);
-  };
+  // Without a new composition the callback neither blocks the codec thread nor
+  // repeats the previous frame; its index stays queued for the next frame.
+  static OH_AVBuffer held[2];
   const int pushedBefore=pushed;
-  waitForFresh();
+  auto returned=std::async(std::launch::async, [c=live] { c->cb.onNeedInputBuffer(c,0,&held[0],c->ctx); });
+  assert(returned.wait_for(std::chrono::milliseconds(300))==std::future_status::ready);
+  returned.get();
+  assert(pushed==pushedBefore);
   uint8_t latest[48]{};
   assert(dualMockHook(latest,sizeof(latest),4,8));
   OsdPipeline::feed(latest,sizeof(latest));
-  waitingInput.get();
+  assert(pushed==pushedBefore+1 && held[0].attr.size==48 && held[0].bytes[0]==0x42);
+  // A queued index of this encoder must be discarded by the transition, not reused.
+  live->cb.onNeedInputBuffer(live,0,&held[1],live->ctx);
   assert(pushed==pushedBefore+1);
-  waitForFresh();  // The upcoming transition must wake this callback before codec destruction.
   assert(camera.AttachPreview(85));
   dualWaitsToFail=1;
   assert(camera.SetDualLayout(2,&plan)==R::Restored && camera.DualLayout()==3 && ui=="85");

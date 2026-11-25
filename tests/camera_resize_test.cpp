@@ -168,15 +168,22 @@ int OH_VideoEncoder_Start(OH_AVCodec* c) {
   assert(c->mime==expectedMime && c->fmt.value[OH_MD_KEY_BITRATE]==1876000 && c->fmt.value[OH_MD_KEY_I_FRAME_INTERVAL]==1234);
   assert((c->fmt.value[OH_MD_KEY_PIXEL_FORMAT]==AV_PIXEL_FORMAT_NV12)==(expectedOsd || dualMockHook));
   assert(c->fmt.value[OH_MD_KEY_FRAME_RATE]==30 && c->fmt.value[OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE]==BITRATE_MODE_CBR);
-  OH_AVBuffer b;
+  // Codec-owned input buffers outlive the callback; a queued index may be filled later.
+  static OH_AVBuffer inputs[64];
+  OH_AVBuffer& b=inputs[starts%64];
+  b=OH_AVBuffer{};
   if (dualMockHook) {
     assert(compositeReady && dualProducers);
     const int before=pushed;
     c->cb.onNeedInputBuffer(c,0,&b,c->ctx);
     assert(pushed==before+1 && b.attr.size==48 && b.bytes[0]==0x42);
-  } else if (expectedOsd) { int before=pushed; c->cb.onNeedInputBuffer(c,0,&b,c->ctx); assert(pushed==before); }
-  b.bytes[0]=static_cast<uint8_t>(starts);  // epoch marker, NOT a decodable bitstream
-  c->cb.onNewOutputBuffer(c,0,&b,c->ctx);
+  } else if (expectedOsd) {
+    // Before the camera has delivered a frame the index is queued, not pushed or lost.
+    int before=pushed; c->cb.onNeedInputBuffer(c,0,&b,c->ctx); assert(pushed==before);
+  }
+  OH_AVBuffer out;
+  out.bytes[0]=static_cast<uint8_t>(starts);  // epoch marker, NOT a decodable bitstream
+  c->cb.onNewOutputBuffer(c,0,&out,c->ctx);
   return 0;
 }
 
@@ -240,6 +247,10 @@ static void TestCameraSettings() {
   assert(camera.FocusAt(.25,.7) && lastPoint.x==.25 && lastPoint.y==.7);
   assert(camera.CaptureFpsJson()==R"({"ranges":[{"min":15,"max":30},{"min":30,"max":30}],"active":{"min":15,"max":30}})");
   assert(!camera.SetCaptureFps(60,60) && camera.SetCaptureFps(30,30) && activeRate.min==30);
+  // A rebuild opens a new session/output with device defaults; user choices are re-applied.
+  activeRate={15,30};
+  assert(camera.Restart() && activeRate.min==30 && activeRate.max==30);
+  assert(camera.FocusInfoJson()==R"({"modes":[1,2],"active":2})");
   camera.Stop(); assert(!camera.FocusAt(.5,.5) && !outstandingLists && !live);
 }
 
@@ -308,10 +319,13 @@ int main(int argc,char** argv) {
   enumerateFails=false;
   assert(starts==1 && destroys==0 && errors==0 && frames==1);
   if (expectedOsd) {
-    // Seed BOTH the last-consumed fallback and a still-pending old raw frame.
-    OH_AVBuffer b; ipcam::OsdPipeline::feed(b.bytes,1);
+    // The index queued during Start is filled by the first camera frame.
+    static OH_AVBuffer b; ipcam::OsdPipeline::feed(b.bytes,1); assert(pushed==1);
+    // A callback without a waiting frame returns immediately and keeps its index.
     live->cb.onNeedInputBuffer(live,0,&b,live->ctx); assert(pushed==1);
-    ipcam::OsdPipeline::feed(b.bytes,1);
+    ipcam::OsdPipeline::feed(b.bytes,1); assert(pushed==2 && b.attr.size==1);
+    // No free index: this raw frame waits, and must not survive the rebuild below.
+    ipcam::OsdPipeline::feed(b.bytes,1); assert(pushed==2);
   }
   assert(camera.ChangeResolution(640,480)==Result::Changed);
   assert(camera.CaptureWidth()==640 && camera.CaptureHeight()==480 && formats.back()==geometry(640,480));

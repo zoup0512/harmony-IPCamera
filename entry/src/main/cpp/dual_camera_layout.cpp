@@ -71,11 +71,14 @@ void DualFrameGate::Publish(const uint8_t* pixels, size_t size, int w, int h) {
 }
 bool DualFrameGate::Composite(uint8_t* primary, size_t size, int w, int h) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (closed_ || !received_ || !primary || w != w_ || h != h_ || size != Bytes(w,h) ||
-      std::chrono::steady_clock::now() - last_ > std::chrono::seconds(1)) return false;
+  if (closed_ || !received_ || !primary || w != w_ || h != h_ || size != Bytes(w,h)) return false;
+  // After the first composite, a stalled secondary must not freeze the primary
+  // stream: keep emitting primary frames and leave the secondary slot empty.
+  const bool stale = std::chrono::steady_clock::now() - last_ > std::chrono::seconds(1);
+  if (stale && !composed_) return false;
   if (layout_ == 1) {
     int pw = std::max(2, Even(w / 3)), ph = std::max(2, Even(h / 3));
-    Draw(second_.data(), sw_, sh_, rotation_, primary, w, h, {w - pw, 0, pw, ph});
+    if (!stale) Draw(second_.data(), sw_, sh_, rotation_, primary, w, h, {w - pw, 0, pw, ph});
   } else {
     const size_t y = static_cast<size_t>(w) * h;
     std::memset(scratch_.data(), 16, y);
@@ -84,7 +87,7 @@ bool DualFrameGate::Composite(uint8_t* primary, size_t size, int w, int h) {
     Rect a = layout_ == 2 ? Rect{0,0,split,h} : Rect{0,0,w,split};
     Rect b = layout_ == 2 ? Rect{split,0,w-split,h} : Rect{0,split,w,h-split};
     Draw(primary, w, h, 0, scratch_.data(), w, h, a);
-    Draw(second_.data(), sw_, sh_, rotation_, scratch_.data(), w, h, b);
+    if (!stale) Draw(second_.data(), sw_, sh_, rotation_, scratch_.data(), w, h, b);
     std::memcpy(primary, scratch_.data(), size);
   }
   if (!composed_) { composed_ = true; cv_.notify_all(); }

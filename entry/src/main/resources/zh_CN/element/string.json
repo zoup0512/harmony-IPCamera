@@ -238,6 +238,16 @@
     { "name": "dm_device_added", "value": "摄像头已保存" },
     { "name": "dm_copy", "value": "复制流地址" },
     { "name": "dm_copied", "value": "已复制流地址" },
-    { "name": "dm_copy_error", "value": "无法复制流地址。" }
+    { "name": "dm_copy_error", "value": "无法复制流地址。" },
+    { "name": "srv_port_invalid", "value": "端口须为 1–65535 的数字，已保留原端口。" },
+    { "name": "srv_color_invalid", "value": "颜色格式应为 #RRGGBB 或 #RRGGBBAA，已保留原颜色。" },
+    { "name": "module_desc", "value": "IPCamera RTSP 推流模块" },
+    { "name": "entry_ability_desc", "value": "IPCamera 主界面" },
+    { "name": "EntryAbility_label", "value": "IP摄像头" },
+    { "name": "permission_internet_reason", "value": "RTSP 推流需要访问网络" },
+    { "name": "permission_wifi_info_reason", "value": "显示本机 IP 地址以生成 RTSP 地址" },
+    { "name": "permission_camera_reason", "value": "通过 RTSP 推送摄像头画面" },
+    { "name": "permission_mic_reason", "value": "通过 RTSP 推送麦克风声音" },
+    { "name": "permission_location_reason", "value": "在 OSD 叠加层显示 GPS 坐标" }
   ]
 }

@@ -385,9 +385,16 @@ struct ServerHolder {
     return camera && camera->IsRunning();
   }
 
+  // Encoder rebuilds share mediaControlMu with resize, dual layout and camera start.
+  // A busy holder is itself rebuilding the encoder, which already emits a fresh IDR.
   bool RestartCamera() {
+    std::unique_lock<std::mutex> control(mediaControlMu, std::try_to_lock);
+    if (!control.owns_lock()) return false;
     std::lock_guard<std::mutex> lk(cameraMu);
-    return camera && !MediaOutputInUse() && camera->Restart();
+    if (!camera || !camera->IsRunning() || MediaOutputInUse()) return false;
+    const bool ok = camera->Restart();
+    if (!camera->IsRunning()) ResetVideoFormat(0, 0, videoIsH265.load());  // rollback also failed
+    return ok;
   }
 
   bool AttachCameraPreview(uint64_t surfaceId) {
@@ -396,15 +403,23 @@ struct ServerHolder {
   }
 
   bool HandleCameraCommand(const std::string& command) {
-    std::lock_guard<std::mutex> lk(cameraMu);
-    if (!camera || !camera->IsRunning()) return false;
     if (command == "light") {
+      std::lock_guard<std::mutex> lk(cameraMu);
+      if (!camera || !camera->IsRunning()) return false;
       bool nextTorch = !torchOn.load();
       if (!camera->SetTorch(nextTorch)) return false;
       torchOn.store(nextTorch);
       return true;
     }
-    return command == "camswitch" && !MediaOutputInUse() && camera->SwitchFacing();
+    if (command != "camswitch") return false;
+    // Same serialization as other encoder rebuilds (mediaControlMu, then cameraMu).
+    std::unique_lock<std::mutex> control(mediaControlMu, std::try_to_lock);
+    if (!control.owns_lock()) return false;
+    std::lock_guard<std::mutex> lk(cameraMu);
+    if (!camera || !camera->IsRunning() || MediaOutputInUse()) return false;
+    const bool ok = camera->SwitchFacing();
+    if (!camera->IsRunning()) ResetVideoFormat(0, 0, videoIsH265.load());
+    return ok;
   }
 
   void StopRtmpOutputs() {

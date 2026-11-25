@@ -42,3 +42,6 @@ Thumbs.db
 # native build artifacts (CMake/ninja output)
 entry/.cxx/
 *.dmp
+
+# Local Android reference (decompiled sources), never committed
+_ref/

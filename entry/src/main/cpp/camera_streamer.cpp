@@ -65,41 +65,51 @@ void CameraStreamer::OnStreamChanged(OH_AVCodec*, OH_AVFormat*, void*) {}
 
 void CameraStreamer::OnNeedInputBuffer(OH_AVCodec* codec, uint32_t index,
                                        OH_AVBuffer* buffer, void* userData) {
-  // Buffer mode (OSD on): pull the latest composited NV12 frame and push it.
-  // Surface mode (OSD off) never gets input callbacks (camera feeds directly).
+  // Buffer mode (OSD/dual/pixel rotation). Surface mode never gets input
+  // callbacks (camera feeds the encoder surface directly).
+  // Never block the codec thread and never drop an index: queue it until the
+  // producer delivers the next frame, or consume the frame already waiting.
+  (void)codec;
   auto self = static_cast<CameraStreamer*>(userData);
-  if (!self->bufferInput_.load() || !self->running_.load()) return;
+  if (!self->bufferInput_.load()) return;
   std::vector<uint8_t> frame;
+  const FreeInput input{index, buffer};
   {
-    std::unique_lock<std::mutex> lk(self->pendingMu_);
-    auto ready = [self] { return self->hasPending_ || !self->running_.load(); };
-    if (self->freshInputOnly_) {
-      // Hold this codec input index until both cameras produce a usable frame.
-      // Returning unused indices on timeout would starve the codec on recovery.
-      self->pendingCv_.wait(lk, ready);
-    } else {
-      self->pendingCv_.wait_for(lk, std::chrono::milliseconds(200), ready);
+    std::lock_guard<std::mutex> lk(self->pendingMu_);
+    if (!self->running_.load()) return;
+    if (!self->hasPending_) {
+      self->freeInputs_.push_back(input);
+      return;
     }
-    if (self->hasPending_) {
-      frame.swap(self->pendingFrame_);
-      self->hasPending_ = false;
-      if (!self->freshInputOnly_) self->lastFrame_ = frame;
-    } else if (!self->freshInputOnly_ && !self->lastFrame_.empty()) {
-      frame = self->lastFrame_;
-    }
+    frame.swap(self->pendingFrame_);
+    self->hasPending_ = false;
   }
-  if (frame.empty() || !self->running_.load()) return;
-  uint8_t* addr = OH_AVBuffer_GetAddr(buffer);
-  if (addr == nullptr || frame.size() > OH_AVBuffer_GetCapacity(buffer)) return;
-  memcpy(addr, frame.data(), frame.size());
+  if (!self->PushFrame(input, frame.data(), frame.size())) {
+    std::lock_guard<std::mutex> lk(self->pendingMu_);
+    if (self->running_.load()) self->freeInputs_.push_back(input);
+  }
+  std::lock_guard<std::mutex> lk(self->pendingMu_);
+  if (!self->hasPending_ && self->pendingFrame_.capacity() < frame.capacity()) {
+    self->pendingFrame_.swap(frame);  // recycle the allocation for the producer
+  }
+}
+
+// Called without pendingMu_ from the codec callback or the OSD worker. Cleanup
+// joins the OSD worker and stops the codec before destroying it.
+bool CameraStreamer::PushFrame(const FreeInput& input, const uint8_t* frame, size_t size) {
+  if (encoder_ == nullptr || !running_.load() || size == 0) return false;
+  uint8_t* addr = OH_AVBuffer_GetAddr(input.buffer);
+  if (addr == nullptr || size > static_cast<size_t>(OH_AVBuffer_GetCapacity(input.buffer))) return false;
+  memcpy(addr, frame, size);
   OH_AVCodecBufferAttr attr{};
-  attr.size = static_cast<int32_t>(frame.size());
+  attr.size = static_cast<int32_t>(size);
   attr.pts = std::chrono::duration_cast<std::chrono::microseconds>(
                  std::chrono::steady_clock::now().time_since_epoch())
                  .count();
   attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
-  OH_AVBuffer_SetBufferAttr(buffer, &attr);
-  OH_VideoEncoder_PushInputBuffer(codec, index);
+  OH_AVBuffer_SetBufferAttr(input.buffer, &attr);
+  OH_VideoEncoder_PushInputBuffer(encoder_, input.index);
+  return true;
 }
 
 void CameraStreamer::OnNewOutputBuffer(OH_AVCodec* codec, uint32_t index, OH_AVBuffer* buffer,
@@ -122,7 +132,7 @@ void CameraStreamer::OnNewOutputBuffer(OH_AVCodec* codec, uint32_t index, OH_AVB
 
 void CameraStreamer::Cleanup() {
   {
-    // Synchronize the final notification with the sleeping dual input callback.
+    // Producers and codec callbacks check running_ under this lock.
     std::lock_guard<std::mutex> lk(pendingMu_);
     running_ = false;
   }
@@ -177,12 +187,11 @@ void CameraStreamer::Cleanup() {
   encW_ = encH_ = 0;
   orientation_ = 0;
   // Producer and codec callbacks have stopped. Neither an unconsumed NV12
-  // frame nor the repeat-frame slot belongs to the next encoder geometry.
+  // frame nor a queued input index belongs to the next encoder.
   std::lock_guard<std::mutex> lk(pendingMu_);
   hasPending_ = false;
-  freshInputOnly_ = false;
   pendingFrame_.clear();
-  lastFrame_.clear();
+  freeInputs_.clear();
 }
 
 bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeType,
@@ -276,10 +285,25 @@ bool CameraStreamer::StartRun(RunConfig config, FrameSink sink, ErrorSink onErro
         width, height, config.previewId,
         &cameraSurfaceId,
         [this](const uint8_t* nv12, size_t size) {
-          std::lock_guard<std::mutex> lk(pendingMu_);
-          pendingFrame_.assign(nv12, nv12 + size);
-          hasPending_ = true;
-          pendingCv_.notify_one();
+          FreeInput input{};
+          {
+            std::lock_guard<std::mutex> lk(pendingMu_);
+            if (!running_.load()) return;
+            if (freeInputs_.empty()) {
+              // Keep only the newest frame until the codec offers an index.
+              pendingFrame_.assign(nv12, nv12 + size);
+              hasPending_ = true;
+              pendingCv_.notify_all();
+              return;
+            }
+            input = freeInputs_.front();
+            freeInputs_.erase(freeInputs_.begin());
+            hasPending_ = false;  // this frame is newer than any waiting one
+          }
+          if (!PushFrame(input, nv12, size)) {
+            std::lock_guard<std::mutex> lk(pendingMu_);
+            if (running_.load()) freeInputs_.insert(freeInputs_.begin(), input);
+          }
         },
         [](const std::string& err) {
           OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "osd: %{public}s",
@@ -333,7 +357,9 @@ bool CameraStreamer::StartRun(RunConfig config, FrameSink sink, ErrorSink onErro
     OH_AVFormat_Destroy(format);
     return fail("Set encoder options", CAMERA_INVALID_ARGUMENT);
   }
-  OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE, 30.0);
+  // Rate control follows the chosen capture range; 30 when the device default is used.
+  OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE,
+                             config.fpsMax > 0 ? static_cast<double>(config.fpsMax) : 30.0);
   if (cameraSurfaceId != 0) {
     // Buffer mode: pin the input layout to the tightly-packed NV12 the OSD
     // pipeline produces. Without this the codec falls back to its default
@@ -353,17 +379,13 @@ bool CameraStreamer::StartRun(RunConfig config, FrameSink sink, ErrorSink onErro
   if (aerr != AV_ERR_OK) return fail("EncoderPrepare", aerr);
   bufferInput_ = cameraSurfaceId != 0;
   if (useDual) {
-    {
-      std::lock_guard<std::mutex> lk(pendingMu_);
-      freshInputOnly_ = true;
-    }
     // Overlapping cameras cannot be inferred from two single-camera profiles.
     // The dual owner opens both sessions using the pair's concurrent plan.
     if (!dual_->Start(config.dualPlan, config.dualLayout, cameraSurfaceId, osd_->rotation())) {
       return fail("Start concurrent cameras", CAMERA_INVALID_ARGUMENT);
     }
-    // Wait before starting the buffer-input codec: dropping all early input
-    // callbacks while the second camera warms up could starve this encoder.
+    // Do not publish a dual stream until both cameras have produced a frame;
+    // a lens that never starts is rolled back instead of shown as half-black.
     constexpr auto timeout = std::chrono::milliseconds(3000);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     if (!dual_->WaitForComposite(timeout)) {
@@ -418,6 +440,7 @@ bool CameraStreamer::StartRun(RunConfig config, FrameSink sink, ErrorSink onErro
     if (err != CAMERA_OK) return fail("UI preview start", err);
   }
   config_ = std::move(config);  // Commit only after all outputs started.
+  ApplyCaptureControls();
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
                "camera streaming %{public}ux%{public}u -> encoder %{public}dx%{public}d",
                profile.size.width, profile.size.height, encW, encH);

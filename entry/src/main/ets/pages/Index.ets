@@ -100,6 +100,22 @@ function toSelectOptions(arr: ResourceStr[]): SelectOption[] {
   return out;
 }
 
+// Android uses a 5-digit numeric field with a port validator. 0 means invalid here.
+function settingsPort(text: string): number {
+  const v = text.trim();
+  if (!/^[0-9]{1,5}$/.test(v)) return 0;
+  const port = Number(v);
+  return port >= 1 && port <= 65535 ? port : 0;
+}
+
+// Native OSD expects #RRGGBBAA. #RRGGBB is accepted as opaque. '' means invalid.
+function osdColorValue(text: string): string {
+  const v = text.trim();
+  if (/^#[0-9A-Fa-f]{8}$/.test(v)) return v.toUpperCase();
+  if (/^#[0-9A-Fa-f]{6}$/.test(v)) return `${v.toUpperCase()}FF`;
+  return '';
+}
+
 function loadSettings(ctx: common.UIAbilityContext): Settings {
   const pref = preferences.getPreferencesSync(ctx, { name: 'ipcamSettings' });
   const s: Settings = {
@@ -184,6 +200,7 @@ struct Index {
   @State osdFontStyleIdx: number = 0;
   @State osdPadding: string = '1';
   @State osdColor: string = '#FFFFFFFF';
+  private osdColorSaved: string = '#FFFFFFFF';  // last complete color sent to native
   @State osdShowTimestamp: boolean = true;
   @State osdShowDevName: boolean = true;
   @State osdShowBattery: boolean = true;
@@ -209,6 +226,7 @@ struct Index {
   @State overflowOpen: boolean = false;
   @State shareWeb: boolean = false;
   private enteredFromSettings: boolean = false;
+  private exitConfirmed: boolean = false;
   @State cameraStarting: boolean = false;
   @State micStarting: boolean = false;
   @State httpUrl: string = '';
@@ -390,6 +408,7 @@ struct Index {
     const remoteChanged = this.syncRemoteCameraSize();
     this.startRemoteSizeTimer();
     if (!this.cameraRunning) this.refreshCameraSizesIfGranted();
+    if (this.osdEnabled && this.osdShowGps) this.startGpsTimer(false);
     this.updateKeepScreenOn();
     const ctx = getContext(this) as common.UIAbilityContext;
     const pref = preferences.getPreferencesSync(ctx, { name: 'ipcamSettings' });
@@ -418,6 +437,7 @@ struct Index {
     if (this.recordStarting) this.releaseRecording();
     this.stopRemoteSizeTimer();
     if (this.rtmpState === 'waiting' || this.rtmpState === 'connecting') this.onStopRtmp();
+    this.stopGpsTimer();  // No location polling while the page is hidden.
     this.updateKeepScreenOn();
   }
 
@@ -539,7 +559,7 @@ struct Index {
 
   makeConfig(): RtspStartConfig {
     const cfg: RtspStartConfig = {
-      port: parseInt(this.port) || 8554,
+      port: settingsPort(this.port) || 8554,
       path: this.streamPath.trim() === '' ? 'live' : this.streamPath.trim(),
       user: this.user,
       password: this.password
@@ -660,6 +680,22 @@ struct Index {
     if (!this.cameraChangeBusy()) return false;
     this.reportProblem(this.msg('srv_camera_busy'));
     return true;
+  }
+
+  // Per-keystroke field validation: show a notice while invalid, clear it once fixed. No log spam.
+  fieldNotice(valid: boolean, key: string): void {
+    const message = this.msg(key);
+    if (!valid) this.serviceNotice = message;
+    else if (this.serviceNotice === message) this.serviceNotice = '';
+  }
+
+  // The running encoder keeps its codec; never show a codec the stream is not using.
+  selectCodec(idx: number): void {
+    if (idx === this.codecIdx || this.cameraStarting || this.rejectBusyCameraChange()) return;
+    this.codecIdx = idx;
+    this.saveSetting('codec', idx);
+    this.loadCodecSettings();
+    if (this.cameraRunning) this.requestCameraStart();
   }
 
   async requestCameraStart(armMotion: boolean = false, resume: boolean = false): Promise<void> {
@@ -1218,7 +1254,7 @@ struct Index {
       return;
     }
     const opts: HttpOptions = {
-      port: parseInt(this.httpPort) || 8081,
+      port: settingsPort(this.httpPort) || 8081,
       user: this.user,
       password: this.password,
       allowLegacyVideoPassword: this.allowLegacyVideoPassword,
@@ -1427,6 +1463,7 @@ struct Index {
       this.osdFontStyleIdx = pref.getSync('font_style', 0) as number;
       this.osdPadding = `${pref.getSync('osd_padding_int', 1) as number}`;
       this.osdColor = pref.getSync('text_color', '#FFFFFFFF') as string;
+      this.osdColorSaved = osdColorValue(this.osdColor) || '#FFFFFFFF';
       this.osdShowTimestamp = pref.getSync('display_timestamp', true) as boolean;
       this.osdShowDevName = pref.getSync('display_dev_name', true) as boolean;
       this.osdShowBattery = pref.getSync('display_battery_info', true) as boolean;
@@ -1460,7 +1497,7 @@ struct Index {
       position: this.osdPositionIdx,
       fontStyle: this.osdFontStyleIdx,
       fontSize: this.osdFont.fontSize, fontFamily: this.osdFont.fontFamily, fontPath: this.osdFont.fontPath,
-      color: this.osdColor,
+      color: osdColorValue(this.osdColor) || this.osdColorSaved,
       showTimestamp: this.osdShowTimestamp,
       showDevName: this.osdShowDevName,
       showBattery: this.osdShowBattery,
@@ -1475,7 +1512,9 @@ struct Index {
     return cfg;
   }
 
-  applyOsd(needCameraRestart: boolean): void {
+  // Only a user turning on the location overlay (or the overlay itself) may show
+  // the permission dialog; other edits and page entry use an existing grant only.
+  applyOsd(needCameraRestart: boolean, promptGps: boolean = false): void {
     this.server.setOsdConfig(this.buildOsdConfig());
     if (this.osdEnabled && this.osdShowBattery) {
       this.startBatteryTimer();
@@ -1483,7 +1522,7 @@ struct Index {
       this.stopBatteryTimer();
     }
     if (this.osdShowGps && this.osdEnabled) {
-      this.startGpsTimer();
+      this.startGpsTimer(promptGps);
     } else {
       this.stopGpsTimer();
     }
@@ -1505,7 +1544,7 @@ struct Index {
     if (restart && this.cameraRunning && this.rejectBusyCameraChange()) return;
     this.osdEnabled = on;
     this.saveSetting('osdEnabled', on);
-    this.applyOsd(restart);
+    this.applyOsd(restart, on);
     this.appendLog(on ? 'OSD overlay ON (text baked into the stream)'
                       : 'OSD overlay OFF');
   }
@@ -1532,15 +1571,27 @@ struct Index {
     }
   }
 
-  async startGpsTimer(): Promise<void> {
+  async startGpsTimer(prompt: boolean = false): Promise<void> {
     if (this.gpsTimerId >= 0 || this.gpsPermissionPending) return;
+    const ctx = getContext(this) as common.UIAbilityContext;
+    const atManager = abilityAccessCtrl.createAtManager();
+    const perms: Array<Permissions> = ['ohos.permission.APPROXIMATELY_LOCATION',
+      'ohos.permission.LOCATION'];
+    let alreadyGranted = false;
+    try {
+      // Approximate location is enough for the OSD position/speed readout.
+      alreadyGranted = atManager.checkAccessTokenSync(ctx.applicationInfo.accessTokenId, perms[0]) === 0;
+    } catch (_) {}
+    // No grant and no explicit user action: show "GPS Waiting" without asking.
+    if (!alreadyGranted && !prompt) return;
     const generation = ++this.gpsGeneration;
+    if (alreadyGranted) {
+      this.pollGps(generation);
+      this.gpsTimerId = setInterval(() => this.pollGps(generation), 5000);
+      return;
+    }
     this.gpsPermissionPending = true;
     try {
-      const ctx = getContext(this) as common.UIAbilityContext;
-      const atManager = abilityAccessCtrl.createAtManager();
-      const perms: Array<Permissions> = ['ohos.permission.APPROXIMATELY_LOCATION',
-        'ohos.permission.LOCATION'];
       const result = await atManager.requestPermissionsFromUser(ctx, perms);
       if (generation !== this.gpsGeneration) return;
       let granted = result.authResults.length === perms.length;
@@ -1672,7 +1723,17 @@ RTSP: ${counts.rtsp}`,
     }
     if (this.panel === 'settings' && this.enteredFromSettings) return false;
     if (this.panel !== 'preview') { this.openPanel('preview'); return true; }
-    return false;
+    if (this.exitConfirmed) return false;
+    // Android BaseServerActivity.onBackPressed: leaving stops every service, so confirm first.
+    this.getUIContext().showAlertDialog({ title: $r('app.string.svc_ui_exit_title'),
+      message: $r('app.string.svc_ui_exit_prompt'),
+      primaryButton: { value: $r('app.string.srv_cancel'), action: () => {} },
+      secondaryButton: { value: $r('app.string.svc_ui_exit'), action: () => {
+        if (!this.pageActive) return;
+        this.exitConfirmed = true;
+        router.back();
+      } } });
+    return true;
   }
 
   panelTitle(): Resource {
@@ -1908,9 +1969,7 @@ RTSP: ${counts.rtsp}`,
   encoderSettings() {
     Column({ space: 10 }) {
       this.heading($r('app.string.svc_ui_encoder'), () => $r('app.string.srv_video_hint'))
-      this.choice($r('app.string.srv_codec'), CODECS, () => this.codecIdx, (idx: number) => {
-        this.codecIdx = idx; this.saveSetting('codec', idx); this.loadCodecSettings();
-      })
+      this.choice($r('app.string.srv_codec'), CODECS, () => this.codecIdx, (idx: number) => this.selectCodec(idx))
       CameraProfilePicker({ encoderOnly: true, cameraRunning: this.cameraRunning, encoders: this.encoders,
         encoderName: this.encoderName, avcProfile: this.avcProfile, onEncoder: (v: EncoderOption) => this.selectEncoder(v),
         onAvcProfile: (v: number) => this.selectProfile(v) })
@@ -1928,10 +1987,16 @@ RTSP: ${counts.rtsp}`,
     Column({ space: 10 }) {
       this.heading($r('app.string.srv_network'), () => $r('app.string.srv_network_hint'))
       this.field($r('app.string.srv_rtsp_port'), () => this.port, InputType.Number, (v: string) => {
-        this.port = v; this.saveSetting('port', parseInt(v) || 8554); this.refreshUrl();
+        this.port = v;
+        const port = settingsPort(v);
+        this.fieldNotice(port > 0, 'srv_port_invalid');
+        if (port) { this.saveSetting('port', port); this.refreshUrl(); }
       })
       this.field($r('app.string.srv_http_port'), () => this.httpPort, InputType.Number, (v: string) => {
-        this.httpPort = v; this.saveSetting('httpPort', parseInt(v) || 8081);
+        this.httpPort = v;
+        const port = settingsPort(v);
+        this.fieldNotice(port > 0, 'srv_port_invalid');
+        if (port) this.saveSetting('httpPort', port);
       })
       this.field($r('app.string.srv_path'), () => this.streamPath, InputType.Normal, (v: string) => {
         this.streamPath = v; this.saveSetting('path', v); this.refreshUrl();
@@ -1974,7 +2039,9 @@ RTSP: ${counts.rtsp}`,
         this.segFourGb = on; this.saveSetting('four_gb_limit', on);
       })
       this.field($r('app.string.srv_segment'), () => this.segMinutes, InputType.Number, (v: string) => {
-        this.segMinutes = v; this.saveSetting('each_segment_length', parseInt(v) || 0);
+        // Android: up to 4 digits. An empty or non-numeric field keeps the saved length.
+        this.segMinutes = v;
+        if (/^[0-9]{1,4}$/.test(v.trim())) this.saveSetting('each_segment_length', Number(v.trim()));
       })
       Row({ space: 8 }) {
         Text($r('app.string.srv_motion_hold')).fontSize(14).fontColor(INK).layoutWeight(1)
@@ -2035,7 +2102,10 @@ RTSP: ${counts.rtsp}`,
         this.osdPadding = v; this.saveSetting('osd_padding_int', parseInt(v) || 0); this.applyOsd(false);
       })
       this.field($r('app.string.srv_color'), () => this.osdColor, InputType.Normal, (v: string) => {
-        this.osdColor = v; this.saveSetting('text_color', v); this.applyOsd(false);
+        this.osdColor = v;  // Keep the user's text while typing; save only a complete color.
+        const color = osdColorValue(v);
+        this.fieldNotice(!!color, 'srv_color_invalid');
+        if (color) { this.osdColorSaved = color; this.saveSetting('text_color', color); this.applyOsd(false); }
       })
       this.field($r('app.string.srv_custom'), () => this.osdCustomText, InputType.Normal, (v: string) => {
         this.osdCustomText = v; this.saveSetting('text_custom', v); this.applyOsd(false);
@@ -2050,7 +2120,7 @@ RTSP: ${counts.rtsp}`,
         this.osdShowBattery = on; this.saveSetting('display_battery_info', on); this.applyOsd(false);
       })
       this.toggle($r('app.string.srv_location'), () => this.osdShowGps, (on: boolean) => {
-        this.osdShowGps = on; this.saveSetting('display_gps_location', on); this.applyOsd(false);
+        this.osdShowGps = on; this.saveSetting('display_gps_location', on); this.applyOsd(false, on);
       })
       this.choice($r('app.string.srv_speed'), ['km/h', 'mph'], () => this.osdSpeedUnitIdx, (idx: number) => {
         this.osdSpeedUnitIdx = idx; this.osdSpeedMph = idx === 1; this.saveSetting('speed_unit', idx); this.applyOsd(false);
@@ -2090,7 +2160,7 @@ RTSP: ${counts.rtsp}`,
       Row() {
         Button('‹', { type: ButtonType.Normal }).width(44).height(48).padding(0).fontSize(28)
           .backgroundColor(Color.Transparent).fontColor('#FFFFFF').accessibilityText($r('app.string.svc_ui_back'))
-          .onClick(() => router.back())
+          .onClick(() => { if (!this.onBackPress()) router.back(); })
         Blank().layoutWeight(1)
         this.toolIcon($r('app.media.svc_ui_switch_webcam'), () => $r('app.string.svc_ui_switch_lens'),
           () => this.selectFacing(1 - this.facingIdx), () => !this.cameraStarting && this.dualLayout === 0)

@@ -103,6 +103,9 @@
     {
       "name": "svc_ui_torch_failed",
       "value": "当前相机无法切换补光灯。"
-    }
+    },
+    { "name": "svc_ui_exit_title", "value": "服务器" },
+    { "name": "svc_ui_exit_prompt", "value": "退出后实时视频将关闭，您确定退出吗？" },
+    { "name": "svc_ui_exit", "value": "退出" }
   ]
 }

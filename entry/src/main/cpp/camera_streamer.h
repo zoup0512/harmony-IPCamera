@@ -110,20 +110,27 @@ class CameraStreamer {
     uint64_t previewId = 0;
     int dualLayout = 0;
     DualCameraPlan dualPlan;
+    // User capture controls; re-applied best-effort after every rebuild.
+    int fpsMin = 0, fpsMax = 0;  // 0: device default
+    int focusMode = -1;          // -1: device default
   } config_;
+  void ApplyCaptureControls();
   bool StartRun(RunConfig config, FrameSink sink, ErrorSink onError, bool allowOsdFallback);
   ResizeResult ReplaceRun(const RunConfig& next);
   std::function<void(int, int)> formatSink_;
   std::atomic<bool> bufferInput_{false};
   std::unique_ptr<DualCameraCapture> dual_;
   std::unique_ptr<OsdPipeline> osd_;
-  // buffer-mode input path (OSD on): latest composited NV12 frame slot
+  // Buffer-mode input path (OSD/dual/pixel rotation). Codec input indices are
+  // queued, never dropped or held by a sleeping callback: whichever side comes
+  // second (a new frame or a free index) pushes. Stale frames are never repeated.
+  struct FreeInput { uint32_t index; OH_AVBuffer* buffer; };
+  bool PushFrame(const FreeInput& input, const uint8_t* frame, size_t size);
   std::mutex pendingMu_;
   std::condition_variable pendingCv_;
   bool hasPending_ = false;
-  bool freshInputOnly_ = false;  // under pendingMu_: never repeat a stale dual composition
   std::vector<uint8_t> pendingFrame_;
-  std::vector<uint8_t> lastFrame_;
+  std::vector<FreeInput> freeInputs_;  // under pendingMu_, FIFO
   std::atomic<bool> running_{false};
   std::atomic<int> orientation_{0};
   int encW_ = 0;  // encoder dimensions of the current run

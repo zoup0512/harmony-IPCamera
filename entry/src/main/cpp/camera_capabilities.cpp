@@ -266,7 +266,29 @@ bool CameraStreamer::SetCaptureFps(int min, int max) {
   if (!running_.load() || !preview_ || min <= 0 || max < min) return false;
   const auto ranges = SupportedRates(preview_);
   if (std::find(ranges.begin(), ranges.end(), Range{min, max}) == ranges.end()) return false;
-  return OH_PreviewOutput_SetFrameRate(preview_, min, max) == CAMERA_OK;
+  if (OH_PreviewOutput_SetFrameRate(preview_, min, max) != CAMERA_OK) return false;
+  config_.fpsMin = min;  // Survives resolution/lens/layout rebuilds of this run.
+  config_.fpsMax = max;
+  return true;
+}
+
+void CameraStreamer::ApplyCaptureControls() {
+  // Best effort: a rebuilt profile or another lens may not offer the same
+  // choices. Keep the request so a later rebuild can apply it again.
+  if (config_.fpsMax > 0 && preview_) {
+    const auto ranges = SupportedRates(preview_);
+    const Range wanted{static_cast<uint32_t>(config_.fpsMin), static_cast<uint32_t>(config_.fpsMax)};
+    if (std::find(ranges.begin(), ranges.end(), wanted) != ranges.end()) {
+      OH_PreviewOutput_SetFrameRate(preview_, config_.fpsMin, config_.fpsMax);
+    }
+  }
+  if (config_.focusMode >= 0 && session_) {
+    for (auto candidate : focusModes) {
+      if (config_.focusMode == candidate && SupportsFocus(session_, candidate)) {
+        OH_CaptureSession_SetFocusMode(session_, candidate);
+      }
+    }
+  }
 }
 
 std::string CameraStreamer::FocusInfoJson() const {
@@ -289,7 +311,9 @@ std::string CameraStreamer::FocusInfoJson() const {
 bool CameraStreamer::SetFocusMode(int mode) {
   for (auto candidate : focusModes) {
     if (mode == candidate && IsRunning() && SupportsFocus(session_, candidate)) {
-      return OH_CaptureSession_SetFocusMode(session_, candidate) == CAMERA_OK;
+      if (OH_CaptureSession_SetFocusMode(session_, candidate) != CAMERA_OK) return false;
+      config_.focusMode = mode;
+      return true;
     }
   }
   return false;

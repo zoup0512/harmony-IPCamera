@@ -67,7 +67,7 @@ function rig({ settings = {}, cold = false, grant = true, section } = {}) {
     leaseBindings: { set(...args) { (remote.bindings ??= new Map()).set(args[0], args.slice(1)); }, stop(k) { remote.bindings?.delete(k); }, stopAll() { remote.bindings?.clear(); } },
     leaseCredentials: (u, p) => u === 'operator' && p === 'Bound-Secret123',
     queryDualCamera: () => remote.plan, lanServiceAnnouncements: () => ({rtsp:{setBoundPort(){}},http:{setBoundPort(){}},stopAll(){}}),
-    RtmpRetryController, canPublish, RtspServer: Server, router: { getParams: () => ({ coldAutoStart: cold, section }) },
+    RtmpRetryController, canPublish, RtspServer: Server, router: { getParams: () => ({ coldAutoStart: cold, section }), back: () => { calls.push('back'); } },
     pasteboard: { MIMETYPE_TEXT_PLAIN:'text/plain',ShareOption:{LOCALDEVICE:1},
       createData:(type,text)=>({text, prop:{},getProperty(){return this.prop},setProperty(p){this.prop=p}}),
       getSystemPasteboard:()=>({setDataSync:d=>{remote.copied=d}}) },
@@ -132,9 +132,40 @@ test('menu and panel back order preserves the active camera, mic and listeners',
   for (const panel of ['capture', 'addresses', 'share', 'publish', 'diagnostics']) {
     page.openPanel(panel); assert.ok(page.onBackPress()); assert.equal(page.panel, 'preview');
   }
-  assert.equal(page.onBackPress(), false);
+  // Android BaseServerActivity.onBackPressed: leaving the preview asks first; cancel keeps everything.
+  let dialog; page.getUIContext = () => ({ showAlertDialog: d => { dialog = d; } });
+  assert.ok(page.onBackPress()); assert.ok(dialog);
+  dialog.primaryButton.action();
   assert.ok(page.cameraRunning && page.micRunning && page.running && page.httpRunning);
   assert.deepEqual(calls, before); assert.deepEqual(settings, prefs);
+  dialog.secondaryButton.action(); assert.deepEqual(calls.slice(before.length), ['back']);
+  assert.equal(page.onBackPress(), false);  // the confirmed exit is not asked again
+});
+
+test('location is requested only by a user action; codec and port edits are validated', async () => {
+  const gps = 'permission:ohos.permission.APPROXIMATELY_LOCATION';
+  const { page, calls, settings, timers } = rig({ settings: { osdEnabled: true, display_gps_location: true } });
+  page.aboutToAppear(); page.onPageShow(); page.applyOsd(false); await next();
+  assert.ok(!calls.includes(gps));  // entering the page (or Settings) never prompts
+  assert.ok(![...timers.values()].some(t => t.ms === 5000));
+  page.applyOsd(false, true); await next(); await next();
+  assert.ok(calls.includes(gps));  // the explicit toggle may prompt
+  page.stopGpsTimer(); page.applyOsd(false); await next();
+  assert.ok([...timers.values()].some(t => t.ms === 5000));  // an existing grant is used silently
+  page.onPageHide(); assert.ok(![...timers.values()].some(t => t.ms === 5000));  // no polling while hidden
+
+  page.recording = true; page.selectCodec(1);
+  assert.equal(page.codecIdx, 0); assert.equal(settings.codec, undefined);
+  assert.equal(page.serviceNotice, strings.srv_camera_busy);
+  page.recording = false; page.selectCodec(1);
+  assert.equal(page.codecIdx, 1); assert.equal(settings.codec, 1);
+
+  for (const bad of ['0', '65536', '99999', '', '80a']) { page.port = bad; assert.equal(page.makeConfig().port, 8554); }
+  page.port = '554'; assert.equal(page.makeConfig().port, 554);
+  page.fieldNotice(false, 'srv_port_invalid'); assert.equal(page.serviceNotice, strings.srv_port_invalid);
+  page.fieldNotice(true, 'srv_port_invalid'); assert.equal(page.serviceNotice, '');
+  page.osdColor = '#12'; assert.equal(page.buildOsdConfig().color, '#FFFFFFFF');
+  page.osdColor = '#00ff00'; assert.equal(page.buildOsdConfig().color, '#00FF00FF');
 });
 
 test('client button uses the four current native counts, including HTTP-only viewers, not RTSP events', () => {
