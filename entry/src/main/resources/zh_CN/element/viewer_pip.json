@@ -1,0 +1,12 @@
+{
+  "string": [
+    { "name": "pip_enter", "value": "画中画" },
+    { "name": "pip_exit", "value": "退出画中画" },
+    { "name": "pip_external", "value": "视频已移至系统画中画窗口。" },
+    { "name": "pip_transition", "value": "正在切换视频窗口…" },
+    { "name": "pip_stop_failed", "value": "系统未确认关闭画中画，请重试退出。" },
+    { "name": "pip_unavailable", "value": "系统画中画不可用，可使用全屏观看。" },
+    { "name": "pip_surface_lost", "value": "当前视频画面已不可用于画中画。" },
+    { "name": "pip_interrupted", "value": "系统画中画已中断。" }
+  ]
+}

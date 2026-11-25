@@ -1,0 +1,108 @@
+{
+  "string": [
+    {
+      "name": "svc_ui_back",
+      "value": "返回"
+    },
+    {
+      "name": "svc_ui_camera",
+      "value": "相机"
+    },
+    {
+      "name": "svc_ui_camera_hint",
+      "value": "镜头、分辨率、帧率与方向"
+    },
+    {
+      "name": "svc_ui_encoder",
+      "value": "编码器设置"
+    },
+    {
+      "name": "svc_ui_overlay_hint",
+      "value": "文字、位置与图片水印"
+    },
+    {
+      "name": "svc_ui_lan_hint",
+      "value": "局域网服务公告与手动端口映射"
+    },
+    {
+      "name": "svc_ui_switch_lens",
+      "value": "切换前后摄像头"
+    },
+    {
+      "name": "svc_ui_more",
+      "value": "更多操作"
+    },
+    {
+      "name": "svc_ui_close_menu",
+      "value": "关闭菜单"
+    },
+    {
+      "name": "svc_ui_size_fps",
+      "value": "分辨率与帧率"
+    },
+    {
+      "name": "svc_ui_diagnostics",
+      "value": "测试画面与服务日志"
+    },
+    {
+      "name": "svc_ui_rtmp_active",
+      "value": "RTMP •"
+    },
+    {
+      "name": "svc_ui_connect",
+      "value": "连接"
+    },
+    {
+      "name": "svc_ui_share",
+      "value": "分享"
+    },
+    {
+      "name": "svc_ui_qr_hint",
+      "value": "请在同一网络下扫码。二维码只包含地址，不包含登录凭据。"
+    },
+    {
+      "name": "svc_ui_protocol",
+      "value": "地址类型"
+    },
+    {
+      "name": "svc_ui_format",
+      "value": "MP4 格式"
+    },
+    {
+      "name": "svc_ui_storage",
+      "value": "录像存储位置"
+    },
+    {
+      "name": "svc_ui_cloud_hint",
+      "value": "手动将已完成的录像归档到 OneDrive。"
+    },
+    {
+      "name": "svc_ui_motion_category",
+      "value": "运动检测"
+    },
+    {
+      "name": "svc_ui_viewer",
+      "value": "观看端"
+    },
+    {
+      "name": "svc_ui_server",
+      "value": "服务端"
+    },
+    {
+      "name": "svc_ui_clients",
+      "value": "客户端：%d"
+    },
+    {
+      "name": "svc_ui_done",
+      "value": "确定"
+    },
+    {
+      "name": "svc_ui_torch",
+      "value": "切换补光灯"
+    },
+    {
+      "name": "svc_ui_torch_failed",
+      "value": "当前相机无法切换补光灯。"
+    }
+  ]
+}

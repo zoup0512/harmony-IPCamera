@@ -1,0 +1,15 @@
+{
+  "string": [
+    { "name": "home_ui_title", "value": "IP Camera" },
+    { "name": "home_ui_local_service", "value": "Turn on IP Camera Server" },
+    { "name": "home_ui_scan_qr", "value": "Scan QR Code" },
+    { "name": "home_ui_add_onvif", "value": "Add ONVIF Camera" },
+    { "name": "home_ui_add_ip", "value": "Add IP Camera" },
+    { "name": "home_ui_close_add", "value": "Close add camera menu" },
+    { "name": "home_ui_close_search", "value": "Close search" },
+    { "name": "home_ui_settings", "value": "Settings" },
+    { "name": "home_ui_scan_unavailable", "value": "QR scanning unavailable" },
+    { "name": "home_ui_camera_actions", "value": "More actions for %s" },
+    { "name": "home_ui_play_camera", "value": "Play %s, %s" }
+  ]
+}

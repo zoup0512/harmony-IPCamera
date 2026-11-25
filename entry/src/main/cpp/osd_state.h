@@ -17,6 +17,9 @@ struct OsdSnapshot {
   int padding = 1;             // osd_padding_int (0..100), scaled to frame height
   int position = 0;            // text_position: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
   int fontStyle = 0;           // font_style: 0 normal, 1 bold, 2 italic, 3 bold-italic
+  int fontSize = 0;            // 0 = automatic, otherwise encoded pixels
+  std::string fontFamily;      // empty uses the system default
+  std::string fontPath;        // private copy of a user-selected .ttf/.otf
   uint32_t argb = 0xFFFFFFFF;  // text_color, 0xAARRGGBB
   bool showTimestamp = true;   // display_timestamp (yyyy-MM-dd HH:mm:ss)
   bool showDevName = true;     // display_dev_name
@@ -24,9 +27,9 @@ struct OsdSnapshot {
   bool showGps = false;        // display_gps_location
   bool speedMph = false;       // speed_unit: 0 km/h, 1 mph
   std::string customText;      // text_custom
-  std::string devName;         // deviceInfo.productModel, pushed from ArkTS
+  std::string devName;         // currently active camera label, not the phone model
   int batteryLevel = -1;       // percent; -1 = unknown (line hidden)
-  int batteryState = 0;        // batteryInfo.chargingState (2 = wireless)
+  int batteryState = 0;        // actively charging: 1 AC, 2 USB, 3 wireless; otherwise 0
   bool gpsValid = false;       // false renders "GPS Waiting"
   double gpsLat = 0;
   double gpsLng = 0;
@@ -51,13 +54,14 @@ void SetOsdTextConfig(bool enabled, int padding, int position, int fontStyle,
                       uint32_t argb, bool showTimestamp, bool showDevName,
                       bool showBattery, bool showGps, bool speedMph,
                       const std::string& customText);
+void SetOsdFontConfig(int size, const std::string& family, const std::string& path);
 void SetOsdDeviceName(const std::string& name);
 void SetOsdBattery(int level, int chargeState);
 void SetOsdGps(bool valid, double lat, double lng, double speed);
 void SetOsdWatermarkConfig(bool enabled, int padding, int maxAreaPercent,
                            int position);
 // Copies the RGBA_8888 buffer; bumps wmVersion.
-void SetOsdWatermarkPixels(const uint8_t* rgba, int width, int height);
+void SetOsdWatermarkPixels(const uint8_t* rgba, int width, int height, bool premultiplied = false);
 
 }  // namespace ipcam
 

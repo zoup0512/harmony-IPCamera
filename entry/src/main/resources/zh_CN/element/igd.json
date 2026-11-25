@@ -1,0 +1,20 @@
+{
+  "string": [
+    {"name":"igd_title","value":"一次性 IGDv2 有限租约"},
+    {"name":"igd_risk","value":"建议优先使用 VPN。开放端口可能把明文 HTTP 控制接口或 RTSP 音视频及可重复使用的登录凭据暴露到公网。强密码不能加密连接。"},
+    {"name":"igd_lifetime","value":"仅请求 TCP，建议外部端口为 0，由网关分配；请求租期 60 秒，从网关处理时开始。应用停服不会主动删除或续租，不能保证立即撤销，也不能保证网关遵守租期。超时或结果未知时请手工在网关检查，本应用不会重发。"},
+    {"name":"igd_unprovisioned","value":"此版本未配置经审核的“只新建、不替换”网关。不启用普通路由器自动映射，不会联系网关。"},
+    {"name":"igd_enable","value":"为我有管理权的 Wi-Fi 网关配置一次请求"},
+    {"name":"igd_pair","value":"请登录自己网关的管理员控制台，为已审核的“只新建”策略设置下方本次校验码。共享或非自管 Wi-Fi 请勿继续。应用不会代为配置网关。"},
+    {"name":"igd_url","value":"管理员控制台提供的完整 HTTPS 描述 URL"},
+    {"name":"igd_auth","value":"仅可选择已监听、已启用非默认强密码的服务（12–63 位可打印 ASCII，含大小写字母和数字）。HTTP 旧式 URL 密码模式不可用。此操作不会启动服务。"},
+    {"name":"igd_http","value":"核对 HTTP 租约"}, {"name":"igd_rtsp","value":"核对 RTSP 租约"},
+    {"name":"igd_first","value":"第 1 次确认：公网明文风险"}, {"name":"igd_cancel","value":"取消"}, {"name":"igd_review","value":"我管理此网关，继续核对"},
+    {"name":"igd_final","value":"第 2 次确认：仅发送一次？"},
+    {"name":"igd_details","value":"把明文 %s 服务 %s:%d 通过网关 %s:%d 开放到公网。凭据和摄像头数据可能被截获。仅请求一个新 TCP 端口（建议值 0），租期 60 秒从网关处理时开始。停服不删除、不续租；网关不一定遵守。结果未知请手工在网关检查。建议改用 VPN。"},
+    {"name":"igd_send","value":"接受公网明文风险并发送一次"}, {"name":"igd_pending","value":"正在为本次请求核验已配置的网关…"},
+    {"name":"igd_blocked","value":"未发送映射请求。请核对监听状态、凭据、描述 URL、Wi-Fi 路由、证书和网关只新建策略的校验码。"},
+    {"name":"igd_unknown","value":"请求可能已生效。请勿重发；请手工在网关检查端口映射。"},
+    {"name":"igd_success","value":"网关报告已分配外部 TCP 端口 %d。这不证明公网可达或映射会按时到期；请以网关实际配置为准。"}
+  ]
+}

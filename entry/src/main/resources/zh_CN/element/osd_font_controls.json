@@ -1,0 +1,32 @@
+{
+  "string": [
+    {
+      "name": "osdf_default",
+      "value": "系统默认"
+    },
+    {
+      "name": "osdf_filter",
+      "value": "字体"
+    },
+    {
+      "name": "osdf_failure",
+      "value": "请选择不超过 32 MB 的 TTF 或 OTF 字体"
+    },
+    {
+      "name": "osdf_size",
+      "value": "字号（像素，0 为自动）"
+    },
+    {
+      "name": "osdf_family",
+      "value": "字体族"
+    },
+    {
+      "name": "osdf_local",
+      "value": "本地字体"
+    },
+    {
+      "name": "osdf_pick",
+      "value": "选择字体文件"
+    }
+  ]
+}

@@ -19,6 +19,7 @@ struct RtspConfig {
   std::string path = "live";
   std::string user;      // empty disables basic auth
   std::string password;
+  bool loopbackOnly = false;  // bind ::1 / 127.0.0.1 instead of wildcard addresses
 };
 
 enum class RtspEvent : int {
@@ -26,6 +27,7 @@ enum class RtspEvent : int {
   kClientDisconnected = 1,
   kClientPlaying = 2,
   kServerError = 3,
+  kCameraSizeChanged = 4,
 };
 
 using RtspStatusCallback = std::function<void(RtspEvent event, int clients, const std::string& detail)>;
@@ -46,7 +48,15 @@ class RtspServer {
   bool Start(const RtspConfig& config, RtspStatusCallback callback);
   void Stop();
   bool IsRunning() const { return running_.load(); }
+  int BoundV4Port() const { return IsRunning() ? boundV4Port_.load() : 0; }
   int ClientCount();
+
+  // Exclusive admission window, independent of Start/Stop. Fails without changes
+  // if another window or any unfinished TCP session exists (even before PLAY).
+  // Registrations during the window are closed without session events. Only a
+  // successful caller must call EndVideoChange(), exactly once, on every exit.
+  bool TryBeginVideoChange();
+  void EndVideoChange();
 
   void PushH264(const uint8_t* data, size_t size, TimestampUs tsUs);
   void PushAdts(const uint8_t* data, size_t size, TimestampUs tsUs);
@@ -61,15 +71,23 @@ class RtspServer {
   // Cached parameter sets (encoders emit them once at stream start; late
   // joiners like the recorder/snapshot need them injected).
   VideoParams GetVideoParams() const;
+  // Caller fences the old producer first. hevc hints the SDP codec until the
+  // next parameter anchor; it does not mark the empty sets ready. Keeps AAC.
+  void ResetVideoParams(bool hevc = false);
+  // Caller fences the microphone producer; SDP omits audio until fresh ADTS.
+  // Does not renegotiate existing sessions or discard cached video parameters.
+  void ResetAudioParams();
 
  private:
   struct Session;
 
   void AcceptLoop();
-  void AddSession(const std::shared_ptr<Session>& session);
+  void AcceptOne(int listenFd);
+  void CloseListeners();
+  bool TryAddSession(const std::shared_ptr<Session>& session);
   void ReapFinishedSessions();
   void Notify(RtspEvent event, int clients, const std::string& detail);
-  std::string BuildSdp() const;
+  std::string BuildSdp(bool ipv6, const std::string& localIp) const;
 
   enum class VideoCodec { H264, H265 };
 
@@ -78,8 +96,7 @@ class RtspServer {
     std::vector<uint8_t> sps;
     std::vector<uint8_t> pps;
   };
-  ParamSets GetParamSets() const;
-  void UpdateParamSets(const uint8_t* nal, size_t size);
+  void UpdateParamSetsLocked(const uint8_t* nal, size_t size);
   static bool DetectH265(const uint8_t* data, size_t size);
 
   struct AacInfo {
@@ -93,14 +110,17 @@ class RtspServer {
 
   static TimestampUs NowUs();
 
+  std::atomic<int> boundV4Port_{0};
   std::atomic<bool> running_{false};
-  std::atomic<int> listenFd_{-1};
+  int listeners_[2]{-1, -1};  // immutable until acceptThread_ joined
+  int listenerCount_ = 0;
   mutable std::mutex lifecycleMu_;
   std::thread acceptThread_;
   mutable std::mutex configMu_;
   RtspConfig config_{};
 
   mutable std::mutex sessionsMu_;
+  bool videoChangeInProgress_ = false;  // guarded by sessionsMu_
   std::vector<std::shared_ptr<Session>> sessions_;
 
   mutable std::mutex paramMu_;

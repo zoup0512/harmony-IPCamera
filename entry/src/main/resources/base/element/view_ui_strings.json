@@ -1,0 +1,13 @@
+{
+  "string": [
+    {"name": "view_ui_back", "value": "Back"},
+    {"name": "view_ui_close", "value": "Close"},
+    {"name": "view_ui_more", "value": "More options"},
+    {"name": "view_ui_info", "value": "Stream information"},
+    {"name": "view_ui_connection", "value": "Connection settings"},
+    {"name": "view_ui_local", "value": "Local recordings"},
+    {"name": "view_ui_list", "value": "File list"},
+    {"name": "view_ui_empty_local", "value": "No recordings on this device."},
+    {"name": "view_ui_current", "value": "Current file"}
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "string": [
+    {"name": "view_ui_back", "value": "返回"},
+    {"name": "view_ui_close", "value": "关闭"},
+    {"name": "view_ui_more", "value": "更多选项"},
+    {"name": "view_ui_info", "value": "视频流信息"},
+    {"name": "view_ui_connection", "value": "连接设置"},
+    {"name": "view_ui_local", "value": "本地录像"},
+    {"name": "view_ui_list", "value": "文件列表"},
+    {"name": "view_ui_empty_local", "value": "此设备暂无本地录像。"},
+    {"name": "view_ui_current", "value": "当前文件"}
+  ]
+}

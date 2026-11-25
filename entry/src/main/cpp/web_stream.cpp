@@ -1,6 +1,9 @@
 #include "web_stream.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
 #include <unistd.h>
 #include <cstring>
 
@@ -124,7 +127,7 @@ bool DecodeOneFrame(bool h265, const std::vector<uint8_t>& params,
     auto* c = static_cast<Ctx*>(ud);
     OH_AVCodecBufferAttr attr{};
     OH_AVBuffer_GetBufferAttr(buffer, &attr);
-    if (!(attr.flags & AVCODEC_BUFFER_FLAGS_EOS) && attr.size > 0 && !c->gotFrame) {
+    if (!(attr.flags & AVCODEC_BUFFER_FLAGS_EOS) && attr.size > 0) {
       std::lock_guard<std::mutex> lk(c->mu);
       if (!c->gotFrame) {
         c->frame.assign(OH_AVBuffer_GetAddr(buffer),
@@ -156,7 +159,7 @@ bool DecodeOneFrame(bool h265, const std::vector<uint8_t>& params,
   {
     std::unique_lock<std::mutex> lk(ctx->mu);
     ctx->cv.wait_for(lk, std::chrono::seconds(3), [&] { return ctx->gotFrame || ctx->failed; });
-    ok = ctx->gotFrame && !ctx->frame.empty();
+    ok = !ctx->failed && ctx->gotFrame && !ctx->frame.empty();
     if (ok) *nv12Out = std::move(ctx->frame);
   }
   OH_VideoDecoder_Stop(ctx->dec);
@@ -171,13 +174,40 @@ WebStream::~WebStream() {
   if (workerThread_.joinable()) workerThread_.join();
 }
 
+void WebStream::ResetVideoInput() {
+  std::scoped_lock lk(stateMu_, motionMu_);
+  InvalidateVideoLocked();
+  processedArrival_ = arrival_.load(); // discard any pre-reset FeedVideo still parsing
+  params_.clear();
+  h265_ = false;
+  paramsSet_ = false;
+  // Never rewind idrGeneration_: the worker remembers the last decoded IDR.
+  ++motionGeneration_;
+  prevGrid_.clear();
+  lastMotionUs_ = 0;
+  motionLatch_ = false;
+}
+
+void WebStream::InvalidateVideoLocked() {
+  ++inputGeneration_;
+  lastIdr_.clear();
+  lastJpeg_.clear();
+  jpegArrival_ = 0;
+  freshCv_.notify_all();
+}
+
 void WebStream::SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB, int width,
                           int height) {
+  auto params = MergeParamSets({}, paramsAnnexB, h265);
   std::lock_guard<std::mutex> lk(stateMu_);
+  if (paramsSet_ && (h265 != h265_ || width != width_ || height != height_ || params != params_)) {
+    InvalidateVideoLocked();
+    processedArrival_ = arrival_.load();
+  }
   h265_ = h265;
   width_ = width;
   height_ = height;
-  params_ = paramsAnnexB;
+  params_ = std::move(params);
   paramsSet_ = !params_.empty();
 }
 
@@ -241,18 +271,30 @@ void WebStream::UpdateWorker() {
     }
     return;
   }
-  workerRunning_ = false;
+  {
+    std::lock_guard<std::mutex> state(stateMu_);
+    workerRunning_ = false;
+    ++jpegSession_;
+    freshCv_.notify_all();
+  }
   if (workerThread_.joinable()) workerThread_.join();
 }
 
 void WebStream::IncClients() {
-  jpegClients_.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(stateMu_);
+    ++jpegClients_;
+  }
   UpdateWorker();
 }
 
 void WebStream::DecClients() {
-  int current = jpegClients_.load();
-  while (current > 0 && !jpegClients_.compare_exchange_weak(current, current - 1)) {
+  {
+    std::lock_guard<std::mutex> lk(stateMu_);
+    if (jpegClients_ > 0 && --jpegClients_ == 0) { // Motion demand may keep the decoder alive across this edge.
+      ++jpegSession_;
+      freshCv_.notify_all();
+    }
   }
   UpdateWorker();
 }
@@ -262,14 +304,36 @@ std::vector<uint8_t> WebStream::LatestJpeg() const {
   return lastJpeg_;
 }
 
+std::vector<uint8_t> WebStream::WaitForFreshJpeg(const std::atomic<bool>& running,
+                                                  std::chrono::milliseconds timeout) {
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + timeout;
+  std::unique_lock<std::mutex> lk(stateMu_);
+  const auto after = arrival_.load(), epoch = inputGeneration_, session = jpegSession_;
+  while (running && workerRunning_ && jpegClients_ > 0 && epoch == inputGeneration_ &&
+         session == jpegSession_) {
+    const auto now = Clock::now();
+    if (now >= deadline) break;
+    if (jpegArrival_ > after) return lastJpeg_;
+    // Publication and local cancellation notify immediately. HTTP Stop owns
+    // the external flag (no WebStream lock); observe it even if input stalls.
+    freshCv_.wait_until(lk, std::min(deadline, now + std::chrono::milliseconds(50)));
+  }
+  return {};
+}
+
 void WebStream::FeedVideo(const uint8_t* data, size_t size) {
   if (data == nullptr || size < 5) return;
+  const auto arrival = ++arrival_;
   std::vector<NalView> nals = SplitAnnexB(data, size);
   std::vector<uint8_t> idr;
   std::vector<uint8_t> frameParams;
   bool sawIdr = false;
   {
     std::lock_guard<std::mutex> lk(stateMu_);
+    if (arrival <= processedArrival_) return;
+    processedArrival_ = arrival;
+    const bool previousCodec = h265_;
     for (auto& nal : nals) {
       while (nal.size > 1 && nal.data[nal.size - 1] == 0x00) nal.size--;
       if (nal.size < 2) continue;
@@ -281,7 +345,8 @@ void WebStream::FeedVideo(const uint8_t* data, size_t size) {
         AppendNal(frameParams, nal.data, nal.size);
         continue;
       }
-      if (h264Type == 7 || h264Type == 8) {
+      // HEVC IDR_N_LP (0x28) has the same low five bits as AVC PPS.
+      if ((h264Type == 7 || h264Type == 8) && !(h265_ && h265Type == 20)) {
         h265_ = false;
         AppendNal(frameParams, nal.data, nal.size);
         continue;
@@ -298,12 +363,15 @@ void WebStream::FeedVideo(const uint8_t* data, size_t size) {
     if (!frameParams.empty()) {
       // Replace per NAL type: encoders re-emit the sets on every keyframe (so
       // appending would grow without bound), and a buffer may carry only some.
-      params_ = MergeParamSets(params_, frameParams, h265_);
-      paramsSet_ = true;
+      if (previousCodec != h265_) params_.clear();
+      auto merged = MergeParamSets(params_, frameParams, h265_);
+      if (paramsSet_ && (previousCodec != h265_ || merged != params_)) InvalidateVideoLocked();
+      params_ = std::move(merged);
+      paramsSet_ = !params_.empty();
     }
     if (sawIdr) {
       lastIdr_ = std::move(idr);
-      idrGeneration_.fetch_add(1);  // a new picture is available to decode
+      idrGeneration_ = arrival;
     }
   }
 }
@@ -314,7 +382,7 @@ void WebStream::DecodeLoop() {
     std::vector<uint8_t> idr;
     bool h265;
     int w, h;
-    uint64_t gen;
+    uint64_t gen, inputGeneration, jpegSession, motionGeneration;
     {
       std::lock_guard<std::mutex> lk(stateMu_);
       params = params_;
@@ -323,6 +391,9 @@ void WebStream::DecodeLoop() {
       w = width_.load();
       h = height_.load();
       gen = idrGeneration_.load();
+      inputGeneration = inputGeneration_;
+      jpegSession = jpegSession_;
+      motionGeneration = motionGeneration_.load();
     }
     if (params.empty() || idr.empty() || w <= 0 || h <= 0) {
       usleep(500 * 1000);
@@ -332,7 +403,6 @@ void WebStream::DecodeLoop() {
     // new keyframe arrives would only reproduce the same picture: skip it and
     // keep the last JPEG/motion sample instead.
     if (gen != decodedIdrGeneration_) {
-      const uint64_t motionGeneration = motionGeneration_.load();
       std::vector<uint8_t> nv12;
       if (DecodeOneFrame(h265, params, idr, w, h, &nv12) &&
           nv12.size() >= static_cast<size_t>(w) * h * 3 / 2) {
@@ -343,7 +413,11 @@ void WebStream::DecodeLoop() {
           auto jpg = JpegEncoder::EncodeNV12(nv12.data(), w, h);
           if (!jpg.empty()) {
             std::lock_guard<std::mutex> lk(stateMu_);
-            lastJpeg_ = std::move(jpg);
+            if (inputGeneration == inputGeneration_ && jpegSession == jpegSession_) {
+              lastJpeg_ = std::move(jpg);
+              jpegArrival_ = gen;
+              freshCv_.notify_all();
+            }
           }
         }
         CheckMotion(nv12.data(), w, h, motionGeneration);

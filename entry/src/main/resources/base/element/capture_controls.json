@@ -1,0 +1,88 @@
+{
+  "string": [
+    {
+      "name": "cap_front",
+      "value": "Front"
+    },
+    {
+      "name": "cap_rear",
+      "value": "Rear"
+    },
+    {
+      "name": "cap_hardware",
+      "value": "Hardware"
+    },
+    {
+      "name": "cap_software",
+      "value": "Software"
+    },
+    {
+      "name": "cap_auto",
+      "value": "Automatic"
+    },
+    {
+      "name": "cap_focus_manual",
+      "value": "Manual"
+    },
+    {
+      "name": "cap_focus_continuous",
+      "value": "Continuous auto"
+    },
+    {
+      "name": "cap_focus_single",
+      "value": "Single auto"
+    },
+    {
+      "name": "cap_focus_locked",
+      "value": "Locked"
+    },
+    {
+      "name": "cap_choose_focus",
+      "value": "Select mode"
+    },
+    {
+      "name": "cap_lens",
+      "value": "Camera lens"
+    },
+    {
+      "name": "cap_choose_lens",
+      "value": "Select lens"
+    },
+    {
+      "name": "cap_encoder",
+      "value": "Video encoder"
+    },
+    {
+      "name": "cap_focus",
+      "value": "Focus"
+    },
+    {
+      "name": "cap_focus_center",
+      "value": "Focus at center"
+    },
+    {
+      "name": "cap_size",
+      "value": "Preview resolution"
+    },
+    {
+      "name": "cap_choose_size",
+      "value": "Select resolution"
+    },
+    {
+      "name": "cap_no_sizes",
+      "value": "No usable resolution. Check the lens and camera permission."
+    },
+    {
+      "name": "cap_fps",
+      "value": "Capture frame rate"
+    },
+    {
+      "name": "cap_choose_fps",
+      "value": "Select range"
+    },
+    {
+      "name": "cap_fps_readonly",
+      "value": "Reported active range only"
+    }
+  ]
+}

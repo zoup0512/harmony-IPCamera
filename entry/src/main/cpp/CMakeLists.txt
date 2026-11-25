@@ -6,17 +6,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(streaming SHARED
         rtsp_server.cpp
+        rtsp_client.cpp
+        rtmp_viewer.cpp
+        rtsp_client_digest.cpp
+        camera_capabilities.cpp
+        dual_camera.cpp
+        dual_camera_layout.cpp
         test_source.cpp
         camera_streamer.cpp
         mic_streamer.cpp
         opus_stream.cpp
         rtmp_publisher.cpp
+        rtmp_tls_napi.cpp
         recorder.cpp
+        record_video_encoder.cpp
         snapshot.cpp
         web_stream.cpp
         jpeg_encoder.cpp
         http_server.cpp
         voice_player.cpp
+        m4a_voice.cpp
         osd_state.cpp
         osd_renderer.cpp
         osd_pipeline.cpp
@@ -27,6 +36,7 @@ target_include_directories(streaming PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(streaming PUBLIC
         libace_napi.z.so
+        libohcrypto.so
         libhilog_ndk.z.so
         libnative_media_core.so
         libnative_media_codecbase.so
@@ -34,6 +44,8 @@ target_link_libraries(streaming PUBLIC
         libnative_media_vdec.so
         libnative_media_adec.so
         libnative_media_avmuxer.so
+        libnative_media_avsource.so
+        libnative_media_avdemuxer.so
         libnative_media_aenc.so
         libohcamera.so
         libohaudio.so

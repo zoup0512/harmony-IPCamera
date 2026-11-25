@@ -1,0 +1,368 @@
+{
+  "string": [
+    {
+      "name": "viewer_choose_auth",
+      "value": "请先选择 RTSP 鉴权方式（Basic 或 Digest），再点击播放。"
+    },
+    {
+      "name": "viewer_limits",
+      "value": "{0} 码流参数超出播放器支持范围"
+    },
+    {
+      "name": "viewer_codec",
+      "value": "当前设备无法解码此{0}画面"
+    },
+    {
+      "name": "viewer_initial",
+      "value": "点击播放以连接"
+    },
+    {
+      "name": "viewer_system_error",
+      "value": "{0} 播放失败，请检查流格式、网络和系统解码能力"
+    },
+    {
+      "name": "viewer_http_auth",
+      "value": "HTTP {0}：鉴权失败，请检查用户名和密码或地址中的令牌"
+    },
+    {
+      "name": "viewer_http_error",
+      "value": "HTTP 请求失败（{0}）"
+    },
+    {
+      "name": "viewer_video",
+      "value": "视频"
+    },
+    {
+      "name": "viewer_rtsp_auth",
+      "value": "RTSP 鉴权或权限被拒，请检查凭据及观看权限。"
+    },
+    {
+      "name": "viewer_tracks",
+      "value": "未找到兼容的 H.264 或 H.265 视频轨"
+    },
+    {
+      "name": "viewer_rtp_tcp",
+      "value": "摄像机不支持 RTP over TCP"
+    },
+    {
+      "name": "viewer_rtsp_session",
+      "value": "RTSP 会话无效或摄像机拒绝请求"
+    },
+    {
+      "name": "viewer_frame_timeout",
+      "value": "等待视频帧超时"
+    },
+    {
+      "name": "viewer_rtsp_digest",
+      "value": "设备的鉴权挑战与所选 RTSP 模式不兼容；不会切换鉴权方式。"
+    },
+    {
+      "name": "viewer_rtsp_error",
+      "value": "RTSP 连接失败或连接已断开"
+    },
+    {
+      "name": "viewer_enter",
+      "value": "请输入播放地址"
+    },
+    {
+      "name": "viewer_stopped",
+      "value": "已停止"
+    },
+    {
+      "name": "viewer_rtmp",
+      "value": "RTMP 仅接受 rtmp://主机/应用/流，不支持用户名、密码或 Digest。"
+    },
+    {
+      "name": "viewer_connecting",
+      "value": "正在连接…"
+    },
+    {
+      "name": "viewer_rtsps",
+      "value": "此版本不支持 RTSPS，不会降级为明文"
+    },
+    {
+      "name": "viewer_public_url",
+      "value": "HLS 仅接受无凭据的公开地址；HLS 和 FLV 地址均不能含查询参数"
+    },
+    {
+      "name": "viewer_invalid",
+      "value": "地址或凭据无效，请检查后重试"
+    },
+    {
+      "name": "viewer_archives_error",
+      "value": "无法打开远端录像"
+    },
+    {
+      "name": "viewer_playing",
+      "value": "正在播放 · "
+    },
+    {
+      "name": "viewer_completed",
+      "value": "播放已结束"
+    },
+    {
+      "name": "viewer_rtsp_start",
+      "value": "无法启动 RTSP 播放器"
+    },
+    {
+      "name": "viewer_audio_unavailable",
+      "value": "音频输出不可用"
+    },
+    {
+      "name": "viewer_no_audio",
+      "value": "无兼容音轨"
+    },
+    {
+      "name": "viewer_muted",
+      "value": "已静音"
+    },
+    {
+      "name": "viewer_waiting_audio",
+      "value": "等待 AAC 音频"
+    },
+    {
+      "name": "viewer_listening",
+      "value": "AAC 监听中"
+    },
+    {
+      "name": "viewer_timeout",
+      "value": "等待可播放的视频帧超时"
+    },
+    {
+      "name": "viewer_mjpeg_invalid",
+      "value": "无效的 MJPEG 分帧或图像过大"
+    },
+    {
+      "name": "viewer_mjpeg_end",
+      "value": "MJPEG 视频流已结束"
+    },
+    {
+      "name": "viewer_not_mjpeg",
+      "value": "不是 MJPEG 视频流；不会打开网页"
+    },
+    {
+      "name": "viewer_redirect",
+      "value": "为保护凭据，已阻止 HTTP 重定向"
+    },
+    {
+      "name": "viewer_http_network",
+      "value": "HTTP 连接失败，请检查地址、网络或 TLS 证书"
+    },
+    {
+      "name": "viewer_mjpeg_playing",
+      "value": "正在播放 · MJPEG"
+    },
+    {
+      "name": "viewer_jpeg_decode",
+      "value": "JPEG 无法解码或尺寸过大"
+    },
+    {
+      "name": "viewer_title",
+      "value": "实时画面播放"
+    },
+    {
+      "name": "viewer_address",
+      "value": "HTTP(S) MJPEG / .m3u8 / .flv、RTSP 或 RTMP"
+    },
+    {
+      "name": "viewer_user",
+      "value": "用户名（可选）"
+    },
+    {
+      "name": "viewer_password",
+      "value": "密码（可选）"
+    },
+    {
+      "name": "viewer_retry",
+      "value": "重试"
+    },
+    {
+      "name": "viewer_play",
+      "value": "播放"
+    },
+    {
+      "name": "viewer_stop",
+      "value": "停止"
+    },
+    {
+      "name": "viewer_fullscreen",
+      "value": "全屏"
+    },
+    {
+      "name": "viewer_archives",
+      "value": "远端录像"
+    },
+    {
+      "name": "viewer_adts",
+      "value": "格式：Harmony ADTS"
+    },
+    {
+      "name": "viewer_m4a",
+      "value": "格式：Android M4A"
+    },
+    {
+      "name": "viewer_record_voice",
+      "value": "录制对讲"
+    },
+    {
+      "name": "viewer_send_voice",
+      "value": "发送到此设备"
+    },
+    {
+      "name": "viewer_cancel",
+      "value": "取消"
+    },
+    {
+      "name": "viewer_unmute",
+      "value": "开启监听"
+    },
+    {
+      "name": "viewer_mute",
+      "value": "静音"
+    },
+    {
+      "name": "viewer_exit_full",
+      "value": "退出全屏"
+    },
+    {
+      "name": "viewer_help",
+      "value": "RTSP/TCP：H.264、H.265（8 位，最高 1080p），可显式选择 Basic 或 Digest。RTMP 仅支持 AVC 视频和 AAC-LC 音频，不支持 RTMPS、HEVC 或账号鉴权。默认静音。公开 HLS (.m3u8) 和 HTTP-FLV (.flv) 由系统播放器解码，取决于设备支持。受保护的 FLV 仅向选定地址发送 Basic，不跟随重定向。仅在可信网络使用明文 HTTP/RTSP/RTMP。对讲只发到所选 HTTP(S) 设备；旧 Harmony 接收端请选择 ADTS。"
+    },
+    {
+      "name": "viewer_voice_recording",
+      "value": "正在录音（最多 {0} 秒），不会自动发送"
+    },
+    {
+      "name": "viewer_voice_rejected",
+      "value": "设备未接受语音（HTTP {0}），请检查接收格式"
+    },
+    {
+      "name": "viewer_voice_permission",
+      "value": "等待麦克风授权…"
+    },
+    {
+      "name": "viewer_voice_denied",
+      "value": "未获麦克风权限，没有录音或发送"
+    },
+    {
+      "name": "viewer_voice_error",
+      "value": "录音器出错"
+    },
+    {
+      "name": "viewer_voice_ready",
+      "value": "已到时停止，点击发送或丢弃"
+    },
+    {
+      "name": "viewer_voice_start_error",
+      "value": "录音未启动，请检查权限和设备是否支持所选格式"
+    },
+    {
+      "name": "viewer_voice_sending",
+      "value": "正在发送语音…"
+    },
+    {
+      "name": "viewer_voice_ok",
+      "value": "设备已接收语音"
+    },
+    {
+      "name": "viewer_voice_auth",
+      "value": "语音上传鉴权失败"
+    },
+    {
+      "name": "viewer_voice_redirect",
+      "value": "已阻止语音上传重定向"
+    },
+    {
+      "name": "viewer_voice_failed",
+      "value": "语音发送失败，未自动重试"
+    },
+    {
+      "name": "viewer_device_url_hint",
+      "value": "http://、rtsp:// 或 rtmp://…"
+    },
+    {
+      "name": "viewer_device_invalid_url",
+      "value": "请输入 HTTP(S)、RTSP(S) 或 rtmp://主机/应用/流 地址。RTMP 不接受账号密码。"
+    },
+    {
+      "name": "viewer_rtmps",
+      "value": "不支持 RTMPS，不会降级为明文。"
+    },
+    {
+      "name": "viewer_digest_login",
+      "value": "Digest 仅用于 RTSP，需要用户名和密码。"
+    },
+    {
+      "name": "viewer_rtsp_basic_mode",
+      "value": "RTSP 鉴权：Basic"
+    },
+    {
+      "name": "viewer_rtsp_digest_mode",
+      "value": "RTSP 鉴权：Digest"
+    },
+    {
+      "name": "viewer_retry_option",
+      "value": "MJPEG/RTSP 断线后重连（最多 3 次）"
+    },
+    {
+      "name": "viewer_reconnecting",
+      "value": "{0} 秒后重连"
+    },
+    {
+      "name": "viewer_rtmp_network",
+      "value": "RTMP 连接失败或已断开"
+    },
+    {
+      "name": "viewer_rtmp_denied",
+      "value": "RTMP 服务器拒绝播放"
+    },
+    {
+      "name": "viewer_rtmp_codec",
+      "value": "不支持的 RTMP 视频编码或 AVC 参数"
+    },
+    {
+      "name": "viewer_rtmp_transport",
+      "value": "不支持的 RTMP 传输或握手"
+    },
+    {
+      "name": "viewer_rtmp_protocol",
+      "value": "RTMP 地址或协议无效"
+    },
+    {
+      "name": "viewer_rtmp_decode",
+      "value": "RTMP 解码器或显示表面不可用"
+    },
+    {
+      "name": "viewer_rtmp_enhanced",
+      "value": "不支持增强 RTMP 视频"
+    },
+    {
+      "name": "viewer_rtmp_end",
+      "value": "RTMP 流已结束"
+    },
+    {
+      "name": "viewer_rtmp_busy",
+      "value": "RTMP 播放器忙"
+    },
+    {
+      "name": "viewer_rtmp_hevc",
+      "value": "不支持 RTMP HEVC，请使用 AVC"
+    },
+    {
+      "name": "viewer_rtmp_missing",
+      "value": "未找到 RTMP 流"
+    },
+    {
+      "name": "viewer_rtmp_aggregate",
+      "value": "不支持 RTMP 聚合消息"
+    },
+    {
+      "name": "viewer_rtmp_start",
+      "value": "无法启动 RTMP 播放器"
+    },
+    {
+      "name": "viewer_rtmp_audio",
+      "value": "音轨不支持（仅 AAC-LC）"
+    }
+  ]
+}

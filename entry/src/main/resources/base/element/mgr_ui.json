@@ -1,0 +1,13 @@
+{
+  "string": [
+    {"name":"mgr_ui_back","value":"Back"},
+    {"name":"mgr_ui_search","value":"Search names or hosts"},
+    {"name":"mgr_ui_options","value":"More options"},
+    {"name":"mgr_ui_no_matches","value":"No matching addresses"},
+    {"name":"mgr_ui_rename","value":"Rename"},
+    {"name":"mgr_ui_choose_recording","value":"Choose a recording"},
+    {"name":"mgr_ui_server_ext","value":"Server connection · HarmonyOS"},
+    {"name":"mgr_ui_confirm_device","value":"Stream: %s\nAdd only this camera, or copy its full URL to this device’s clipboard. The copied URL may contain credentials."},
+    {"name":"mgr_ui_confirm_origin","value":"Load recordings only from %s? Any entered credentials will be sent to this server. HTTP does not encrypt them."}
+  ]
+}

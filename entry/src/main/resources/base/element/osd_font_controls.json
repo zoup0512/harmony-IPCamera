@@ -1,0 +1,32 @@
+{
+  "string": [
+    {
+      "name": "osdf_default",
+      "value": "System default"
+    },
+    {
+      "name": "osdf_filter",
+      "value": "Fonts"
+    },
+    {
+      "name": "osdf_failure",
+      "value": "Choose a TTF or OTF font up to 32 MB"
+    },
+    {
+      "name": "osdf_size",
+      "value": "Font size (px; 0 = auto)"
+    },
+    {
+      "name": "osdf_family",
+      "value": "Font family"
+    },
+    {
+      "name": "osdf_local",
+      "value": "Local font"
+    },
+    {
+      "name": "osdf_pick",
+      "value": "Choose font file"
+    }
+  ]
+}

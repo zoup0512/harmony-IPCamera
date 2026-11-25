@@ -22,6 +22,12 @@ class Snapshotter {
   void FeedVideo(const uint8_t* data, size_t size);  // Annex-B, both codecs
   // Inject parameter sets captured at stream start (Annex-B built by caller).
   void SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB);
+  // Forget shared input only. A previously accepted capture owns its input and
+  // may finish its original file and callback; it cannot repopulate the cache.
+  void ResetVideoInput();
+  // Observation, not a reservation. Serialize capture admission with switching
+  // externally if an active capture must veto the switch.
+  bool IsBusy() const { return workerBusy_->load(); }
   // Asynchronous: spawns a thread, reports via the returned... fire-and-forget.
   void CaptureAsync(const std::string& bmpPath, int width, int height,
                     std::function<void(bool, const std::string&)> done);

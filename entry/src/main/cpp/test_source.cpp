@@ -48,6 +48,7 @@ bool TestPatternSource::Start(int width, int height, int fps, int bitrate, Frame
   if (encoder_ == nullptr) {
     running_ = false;
     OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "create encoder failed");
+    if (onError_) onError_("测试图案无法创建 H.264 编码器；仍可观看远端视频");
     return false;
   }
 

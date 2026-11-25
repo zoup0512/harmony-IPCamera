@@ -18,6 +18,7 @@
 #include <ohaudio/native_audiostreambuilder.h>
 
 #include "codec_records.h"
+#include "m4a_voice.h"
 
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -62,8 +63,8 @@ struct VoicePlayer::Impl {
     size_t capacity = 0;
   };
 
-  explicit Impl(std::atomic<bool>* activeFlag)
-      : pcmRing(kPcmRingBytes), active(activeFlag) {}
+  explicit Impl(std::atomic<bool>* activeFlag, size_t pcmBytes = kPcmRingBytes)
+      : pcmRing(pcmBytes), active(activeFlag) {}
 
   OH_AVCodec* decoder = nullptr;
   OH_AudioStreamBuilder* builder = nullptr;
@@ -90,6 +91,7 @@ struct VoicePlayer::Impl {
   bool stopping = false;
   bool fatal = false;
   bool drainActive = false;
+  bool completeClip = false;
   size_t callbacksInFlight = 0;
   int64_t nextPtsUs = 0;
   std::atomic<bool>* active = nullptr;
@@ -141,11 +143,9 @@ class CallbackGuard {
   }
 
   ~CallbackGuard() {
-    {
-      std::lock_guard<std::mutex> lock(impl_->mu);
-      --impl_->callbacksInFlight;
-    }
-    impl_->cv.notify_all();
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    --impl_->callbacksInFlight;
+    impl_->cv.notify_all();  // shutdown may free impl as soon as we unlock
   }
 
  private:
@@ -184,6 +184,7 @@ void DrainDecoderInput(VoicePlayer::Impl* impl) {
     OH_AVCodec* decoder = nullptr;
     int64_t pts = 0;
     bool droppedOversize = false;
+    bool eos = false;
     {
       std::lock_guard<std::mutex> lock(impl->mu);
       if (impl->stopping || impl->fatal || !impl->decoderStarted ||
@@ -203,6 +204,13 @@ void DrainDecoderInput(VoicePlayer::Impl* impl) {
           }
         }
         if (fitsAnyPending) break;
+        if (impl->completeClip) {
+          impl->fatal = true;
+          impl->active->store(false);
+          impl->drainActive = false;
+          impl->cv.notify_all();
+          return;
+        }
         impl->queuedFrameBytes -= frameSize;
         impl->frames.pop_front();
         droppedOversize = true;
@@ -229,6 +237,7 @@ void DrainDecoderInput(VoicePlayer::Impl* impl) {
       frame = std::move(impl->frames.front());
       impl->frames.pop_front();
       impl->queuedFrameBytes -= frame.size();
+      eos = impl->completeClip && frame.empty();
       decoder = impl->decoder;
       pts = impl->nextPtsUs;
       if (impl->config.sampleRate > 0) {
@@ -247,12 +256,12 @@ void DrainDecoderInput(VoicePlayer::Impl* impl) {
       FinishDrain(impl);
       return;
     }
-    std::memcpy(address, frame.data(), frame.size());
+    if (!eos) std::memcpy(address, frame.data(), frame.size());
     OH_AVCodecBufferAttr attr{};
     attr.pts = pts;
     attr.size = static_cast<int32_t>(frame.size());
     attr.offset = 0;
-    attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
+    attr.flags = eos ? AVCODEC_BUFFER_FLAGS_EOS : AVCODEC_BUFFER_FLAGS_NONE;
     if (OH_AudioDecoder_PushInputData(decoder, pending.index, attr) != AV_ERR_OK) {
       OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "decoder input push failed");
       MarkFatal(impl);
@@ -271,8 +280,14 @@ void OnVoiceNeedInput(OH_AVCodec* codec, uint32_t index, OH_AVMemory* data, void
   {
     std::lock_guard<std::mutex> lock(impl->mu);
     if (impl->stopping || impl->fatal || codec != impl->decoder) return;
-    impl->pendingInputs.push_back(
-        VoicePlayer::Impl::PendingInput{index, data, static_cast<size_t>(capacity)});
+    try {
+      impl->pendingInputs.push_back(
+          VoicePlayer::Impl::PendingInput{index, data, static_cast<size_t>(capacity)});
+    } catch (const std::bad_alloc&) {
+      impl->fatal = true;
+      impl->active->store(false);
+      return;
+    }
   }
   DrainDecoderInput(impl);
 }
@@ -281,8 +296,8 @@ void OnVoiceNewOutput(OH_AVCodec* codec, uint32_t index, OH_AVMemory* data,
                       OH_AVCodecBufferAttr* attr, void* userData) {
   auto* impl = static_cast<VoicePlayer::Impl*>(userData);
   CallbackGuard guard(impl);
-  if (data != nullptr && attr != nullptr && attr->size > 0 && attr->offset >= 0 &&
-      (attr->flags & AVCODEC_BUFFER_FLAGS_EOS) == 0) {
+  // EOS may accompany the last non-empty PCM output.
+  if (data != nullptr && attr != nullptr && attr->size > 0 && attr->offset >= 0) {
     int32_t capacity = OH_AVMemory_GetSize(data);
     size_t offset = static_cast<size_t>(attr->offset);
     size_t size = static_cast<size_t>(attr->size);
@@ -404,15 +419,16 @@ bool InitializePlayback(VoicePlayer::Impl* impl, const AacConfig& config) {
   }
 
   OH_AVFormat* format = OH_AVFormat_Create();
-  std::vector<uint8_t> codecConfig =
-      AacConfigBytes(config.profileBits, config.sfIndex, config.channels);
+  uint8_t codecConfig[] = {
+      static_cast<uint8_t>(((config.profileBits + 1) << 3) | (config.sfIndex >> 1)),
+      static_cast<uint8_t>(((config.sfIndex & 1) << 7) | (config.channels << 3))};
   bool formatOk =
       format != nullptr &&
       OH_AVFormat_SetStringValue(format, OH_MD_KEY_CODEC_MIME, "audio/mp4a-latm") &&
       OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_SAMPLE_RATE, config.sampleRate) &&
       OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_CHANNEL_COUNT, config.channels) &&
-      OH_AVFormat_SetBuffer(format, OH_MD_KEY_CODEC_CONFIG, codecConfig.data(),
-                            codecConfig.size());
+      (!impl->completeClip || OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUDIO_SAMPLE_FORMAT, SAMPLE_S16LE)) &&
+      OH_AVFormat_SetBuffer(format, OH_MD_KEY_CODEC_CONFIG, codecConfig, sizeof(codecConfig));
   if (!formatOk || OH_AudioDecoder_Configure(decoder, format) != AV_ERR_OK) {
     if (format != nullptr) OH_AVFormat_Destroy(format);
     DestroyLocalResources(decoder, nullptr, nullptr);
@@ -586,6 +602,7 @@ VoicePlayer::FeedResult VoicePlayer::Feed(const uint8_t* data, size_t size) {
   try {
     std::lock_guard<std::mutex> lock(impl->mu);
     if (impl->stopping || impl->fatal) return FeedResult::Unavailable;
+    if (impl->completeClip) return FeedResult::Busy;
     parsed = ParseFeedBytes(impl->adtsTail, data, size, impl->haveConfig, impl->config);
     if (parsed.hardInvalid) return FeedResult::Invalid;
     if (impl->frames.size() + parsed.frames.size() > kMaxQueuedFrames ||
@@ -630,6 +647,48 @@ VoicePlayer::FeedResult VoicePlayer::Feed(const uint8_t* data, size_t size) {
     if (impl->fatal) return FeedResult::Unavailable;
   }
   return FeedResult::Accepted;
+}
+
+VoicePlayer::FeedResult VoicePlayer::FeedUpload(const uint8_t* data, size_t size) {
+  // One outstanding parse per player; don't retain concurrent uploads while
+  // waiting on the native demuxer. Nothing is queued before validated EOS.
+  std::unique_lock<std::mutex> apiLock(apiMu_, std::try_to_lock);
+  if (!apiLock.owns_lock()) return FeedResult::Busy;
+  std::unique_ptr<Impl> next;
+  try {
+    VoiceClip clip;
+    auto result = ParseVoiceUpload(data, size, clip);
+    if (result != VoiceClipResult::Ok) {
+      return result == VoiceClipResult::Invalid ? FeedResult::Invalid : FeedResult::Unavailable;
+    }
+    // The decoder can outrun the speaker. Reserve exactly one validated clip's
+    // PCM (at most 30 s * 48 kHz * stereo S16) so its beginning isn't discarded.
+    next = std::make_unique<Impl>(&active_, clip.frames.size() * 1024 * clip.config.channels * 2);
+    next->frames.swap(clip.frames);
+    next->frames.emplace_back();  // EOS marker after the last complete access unit
+    next->queuedFrameBytes = clip.bytes;
+    next->config = ConfigFromAdts(clip.config);
+    next->haveConfig = next->completeClip = true;
+  } catch (const std::bad_alloc&) {
+    return FeedResult::Unavailable;
+  }
+  active_.store(false);
+  if (impl_) ShutdownImpl(impl_.get());
+  impl_ = std::move(next);
+  AacConfig config = impl_->config;
+  if (InitializePlayback(impl_.get(), config)) {
+    DrainDecoderInput(impl_.get());
+    {
+      std::lock_guard<std::mutex> lock(impl_->mu);
+      if (!impl_->fatal) {
+        active_.store(true);
+        return FeedResult::Accepted;
+      }
+    }
+    ShutdownImpl(impl_.get());
+  }
+  impl_.reset();
+  return FeedResult::Unavailable;
 }
 
 void VoicePlayer::Stop() {

@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "mic_preferred_format",
+      "value": "首选麦克风格式"
+    },
+    {
+      "name": "mic_actual_format",
+      "value": "实际采集"
+    },
+    {
+      "name": "mic_rate_auto",
+      "value": "自动"
+    },
+    {
+      "name": "mic_mono",
+      "value": "单声道"
+    },
+    {
+      "name": "mic_stereo",
+      "value": "双声道"
+    }
+  ]
+}

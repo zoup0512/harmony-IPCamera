@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,7 +30,7 @@ class RtmpPublisher {
   // publish share one absolute 10-second deadline and can be interrupted by
   // Cancel()/Stop().
   bool Start(const std::string& url, int width, int height, bool h265Hint,
-             ErrorSink onError);
+             ErrorSink onError, uint32_t authenticatedTlsToken = 0);
   // Requests cancellation without waiting for a synchronous Start worker. The
   // async completion path or Stop() performs the final join and cleanup.
   void Cancel();
@@ -60,14 +61,15 @@ class RtmpPublisher {
     std::vector<uint8_t> payload;
   };
 
-  bool ConnectAndPublish(const std::string& host, int port,
-                         const std::string& app, const std::string& stream,
-                         int fd, int64_t deadlineUs, std::string* error);
-  void SenderLoop(int fd);
+  struct PeerSession;
+  bool ConnectAndPublish(const std::string& tcUrl, const std::string& app,
+                         const std::string& stream, int fd, PeerSession& peer,
+                         int64_t deadlineUs, std::string* error);
+  bool ReceivePeer(int fd, PeerSession& peer, bool wait, int64_t deadlineUs, std::string* error);
+  void SenderLoop(int fd, std::unique_ptr<PeerSession> peer);
   bool EnqueueVideo(OutMsg frame, OutMsg sequenceHeader, bool keyFrame,
                     uint64_t configVersion);
   bool EnqueueAudio(OutMsg frame, OutMsg sequenceHeader, uint32_t configKey);
-  bool EnqueueControl(OutMsg msg);
   bool WaitingForKeyframe();
   bool TimestampToMs(int64_t tsUs, bool video, uint32_t* tsMs);
   void FailOnce(const std::string& detail, bool startup);

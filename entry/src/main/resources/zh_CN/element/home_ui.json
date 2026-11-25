@@ -1,0 +1,15 @@
+{
+  "string": [
+    { "name": "home_ui_title", "value": "IP摄像头" },
+    { "name": "home_ui_local_service", "value": "打开IP摄像头服务器" },
+    { "name": "home_ui_scan_qr", "value": "扫描二维码" },
+    { "name": "home_ui_add_onvif", "value": "添加ONVIF摄像头" },
+    { "name": "home_ui_add_ip", "value": "添加IP摄像头" },
+    { "name": "home_ui_close_add", "value": "关闭添加摄像头菜单" },
+    { "name": "home_ui_close_search", "value": "关闭搜索" },
+    { "name": "home_ui_settings", "value": "设置" },
+    { "name": "home_ui_scan_unavailable", "value": "此设备不支持扫码" },
+    { "name": "home_ui_camera_actions", "value": "%s 的更多操作" },
+    { "name": "home_ui_play_camera", "value": "播放 %s，%s" }
+  ]
+}

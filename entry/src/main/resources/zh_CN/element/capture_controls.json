@@ -1,0 +1,88 @@
+{
+  "string": [
+    {
+      "name": "cap_front",
+      "value": "前置"
+    },
+    {
+      "name": "cap_rear",
+      "value": "后置"
+    },
+    {
+      "name": "cap_hardware",
+      "value": "硬件"
+    },
+    {
+      "name": "cap_software",
+      "value": "软件"
+    },
+    {
+      "name": "cap_auto",
+      "value": "自动"
+    },
+    {
+      "name": "cap_focus_manual",
+      "value": "手动模式"
+    },
+    {
+      "name": "cap_focus_continuous",
+      "value": "连续自动"
+    },
+    {
+      "name": "cap_focus_single",
+      "value": "单次自动"
+    },
+    {
+      "name": "cap_focus_locked",
+      "value": "锁定"
+    },
+    {
+      "name": "cap_choose_focus",
+      "value": "选择对焦模式"
+    },
+    {
+      "name": "cap_lens",
+      "value": "镜头"
+    },
+    {
+      "name": "cap_choose_lens",
+      "value": "选择镜头"
+    },
+    {
+      "name": "cap_encoder",
+      "value": "视频编码器"
+    },
+    {
+      "name": "cap_focus",
+      "value": "对焦"
+    },
+    {
+      "name": "cap_focus_center",
+      "value": "中央对焦"
+    },
+    {
+      "name": "cap_size",
+      "value": "预览分辨率"
+    },
+    {
+      "name": "cap_choose_size",
+      "value": "选择分辨率"
+    },
+    {
+      "name": "cap_no_sizes",
+      "value": "无可用分辨率，请检查权限或镜头"
+    },
+    {
+      "name": "cap_fps",
+      "value": "采集帧率范围"
+    },
+    {
+      "name": "cap_choose_fps",
+      "value": "选择范围"
+    },
+    {
+      "name": "cap_fps_readonly",
+      "value": "仅报告当前范围"
+    }
+  ]
+}

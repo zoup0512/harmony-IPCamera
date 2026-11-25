@@ -1,0 +1,20 @@
+{
+  "string": [
+    {"name":"igd_title","value":"One-time IGDv2 lease"},
+    {"name":"igd_risk","value":"Prefer a VPN. This can expose unencrypted HTTP controls or RTSP video, audio and reusable login credentials to the Internet. A strong password does not encrypt the connection."},
+    {"name":"igd_lifetime","value":"Request: TCP, gateway-selected external port (suggestion 0), 60 seconds starting when the gateway processes the request. Stopping the app service does not delete or renew the lease. Neither immediate revocation nor gateway compliance is guaranteed. On timeout or any unknown result, check the gateway manually. The app will not resend."},
+    {"name":"igd_unprovisioned","value":"No reviewed create-only gateway is configured in this build. Automatic mapping on ordinary routers is not enabled. No gateway will be contacted."},
+    {"name":"igd_enable","value":"Configure one request on a Wi-Fi gateway I administer"},
+    {"name":"igd_pair","value":"In your gateway’s authenticated administrator console, set this fresh challenge for its reviewed create-only policy. Do not proceed on shared or unmanaged Wi-Fi. The app never configures the gateway for you."},
+    {"name":"igd_url","value":"Exact HTTPS description URL from your administrator console"},
+    {"name":"igd_auth","value":"Select a service already listening with a non-default strong password (12–63 printable ASCII characters, upper and lower case and digits). Legacy HTTP password URLs are not eligible. This does not start a service."},
+    {"name":"igd_http","value":"Review HTTP lease"}, {"name":"igd_rtsp","value":"Review RTSP lease"},
+    {"name":"igd_first","value":"1 of 2 · Public exposure"}, {"name":"igd_cancel","value":"Cancel"}, {"name":"igd_review","value":"I administer this gateway; review request"},
+    {"name":"igd_final","value":"2 of 2 · Send one request?"},
+    {"name":"igd_details","value":"Expose plaintext %s at %s:%d via gateway %s:%d. Credentials and camera data may be intercepted. Request one new TCP port, suggestion 0, for 60 seconds from gateway processing. Stopping does not revoke or renew it. The gateway may not comply; check it manually if the outcome is unknown. Prefer a VPN."},
+    {"name":"igd_send","value":"Accept public exposure and send once"}, {"name":"igd_pending","value":"Checking the configured gateway for this request…"},
+    {"name":"igd_blocked","value":"No mapping request sent. Check the selected listener, credentials, exact URL, Wi-Fi route, certificate and create-only pairing policy."},
+    {"name":"igd_unknown","value":"The request may have been processed. Do not resend. Check the gateway’s mappings manually."},
+    {"name":"igd_success","value":"Gateway reported external TCP port %d. This does not verify Internet reachability or expiry. Check the gateway to verify the mapping."}
+  ]
+}

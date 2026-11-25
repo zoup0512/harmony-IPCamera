@@ -113,13 +113,14 @@ struct OH_NativeBuffer {
 };
 struct OHNativeWindowBuffer {
   BufferHandle handle;
-  std::array<uint8_t, 24> pixels{};
+  std::array<uint8_t, 64> pixels{};  // Space for padded rectangular orientation fixtures too.
   OH_NativeBuffer native{this};
 };
+inline int initialTransform = 4;  // Pure flip unless the test supplies an original rotation.
 struct OHNativeWindow {
   uint64_t id;
   OHNativeWindowBuffer buffer;
-  int transform = 4;  // Pure flip: rotation stays zero; cleanup must restore it.
+  int transform = initialTransform;
   uint64_t usage = 0;
   std::atomic<bool> destroyed{false};
   std::atomic<int> outstanding{0}, requests{0}, flushes{0}, aborts{0}, destroys{0};
@@ -175,7 +176,12 @@ inline int OH_NativeWindow_NativeWindowHandleOpt(OHNativeWindow* w, int op, ...)
     case SET_FORMAT: w->buffer.handle.format = va_arg(args, int); break;
     case SET_BUFFER_GEOMETRY: {
       int width = va_arg(args, int), height = va_arg(args, int);
-      Check(width == 4 && height == 4, "unexpected host fixture geometry");
+      Check(width > 0 && height > 0 && width * height * 3 / 2 <= w->buffer.pixels.size(),
+            "unexpected host fixture geometry");
+      auto& handle = w->buffer.handle;
+      handle.width = handle.stride = width;
+      handle.height = height;
+      handle.size = width * height * 3 / 2;
       break;
     }
     case GET_BUFFER_GEOMETRY:
@@ -556,7 +562,7 @@ int main(int argc, char** argv) {
 """
 
 
-def build_harness(work, cpp_dir=CPP):
+def build_harness(work, cpp_dir=CPP, harness=HARNESS, extra_headers=()):
     """Compile unchanged production source; all scaffolding lives under work."""
     include = work / "include"
     include.mkdir()
@@ -565,6 +571,7 @@ def build_harness(work, cpp_dir=CPP):
         "native_buffer/native_buffer.h",
         "native_image/native_image.h",
         "native_window/external_window.h",
+        *extra_headers,
     ):
         path = include / header
         path.parent.mkdir(exist_ok=True)
@@ -586,7 +593,7 @@ def build_harness(work, cpp_dir=CPP):
             encoding="utf-8",
         )
     source = work / "preview_lifetime.cpp"
-    source.write_text(HARNESS, encoding="utf-8")
+    source.write_text(harness, encoding="utf-8")
     exe = work / ("preview_lifetime.exe" if os.name == "nt" else "preview_lifetime")
     cl = shutil.which("cl") if os.name == "nt" else None
     if cl or (os.name == "nt" and VCVARS.is_file()):

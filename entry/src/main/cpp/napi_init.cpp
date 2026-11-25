@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cmath>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,14 +19,23 @@
 #include <sys/stat.h>
 #include <chrono>
 
+#include "camera_capabilities.h"
 #include "camera_streamer.h"
+#include "rtsp_client.h"
+#include "rtmp_viewer.h"
+#include "rtmp_tls_napi.h"
+#include "rtmp_tls_pipe.h"
 #include "http_server.h"
+#include "flv_stream.h"
 #include "media_time.h"
 #include "mic_streamer.h"
 #include "onvif_client.h"
 #include "opus_stream.h"
 #include "osd_state.h"
 #include "recorder.h"
+#include "safe_archive_dir.h"
+#include "cloud_archive_napi.h"
+#include "record_video_encoder.h"
 #include "rtmp_publisher.h"
 #include "rtsp_server.h"
 #include "snapshot.h"
@@ -59,16 +69,122 @@ std::mutex g_holderMu;
 // starts; remember the id and attach it when (or after) the camera starts.
 std::atomic<uint64_t> g_pendingPreviewId{0};
 
+// Isolated from status/HTTP. Only the writer's successful-close sink may Post.
+// A TSFN wakeup refers only to its registration, never to a server or napi_env.
+struct ArchiveChannel {
+  static constexpr size_t kCapacity = 256;
+  struct Inbox {
+    std::mutex mu;
+    std::deque<std::string> paths;
+    bool scheduled = false, overflowReported = false;
+  };
+  using Wake = std::weak_ptr<Inbox>;
+  std::mutex mu;
+  napi_threadsafe_function fn = nullptr;
+  std::shared_ptr<Inbox> inbox;
+
+  static void Deliver(napi_env env, napi_value cb, void*, void* data) {
+    std::unique_ptr<Wake> wake(static_cast<Wake*>(data));
+    if (!wake || !env || !cb) return;
+    for (;;) {
+      std::string path;
+      {
+        auto box = wake->lock();  // a callback may have cleared/replaced its own registration
+        if (!box) return;
+        std::lock_guard<std::mutex> lk(box->mu);
+        if (box->paths.empty()) { box->scheduled = false; return; }
+        path = std::move(box->paths.front());
+        box->paths.pop_front();
+        box->overflowReported = false;
+      }
+      napi_value value, self;
+      if (napi_create_string_utf8(env, path.data(), path.size(), &value) != napi_ok ||
+          napi_get_undefined(env, &self) != napi_ok || napi_call_function(env, self, cb, 1, &value, nullptr) != napi_ok) {
+        // Keep remaining paths available to Take (or a later wakeup) on a throwing callback.
+        if (auto box = wake->lock()) { std::lock_guard<std::mutex> lk(box->mu); box->scheduled = false; }
+        return;
+      }
+    }
+  }
+
+  napi_env cleanupEnv = nullptr;  // used only on the owning JS thread
+  void ResetLocked() {
+    inbox.reset();  // all pending wakeups for the old generation become no-ops
+    if (fn) napi_release_threadsafe_function(fn, napi_tsfn_abort);
+    fn = nullptr;
+  }
+  static void EnvClosing(void* data) {
+    auto* channel = static_cast<ArchiveChannel*>(data);
+    std::lock_guard<std::mutex> lk(channel->mu);
+    channel->cleanupEnv = nullptr;  // hook is already being removed
+    channel->ResetLocked();        // writer cannot post to a torn-down env
+  }
+  bool Replace(napi_threadsafe_function next, napi_env env = nullptr) {
+    std::lock_guard<std::mutex> lk(mu);
+    if (cleanupEnv) napi_remove_env_cleanup_hook(cleanupEnv, EnvClosing, this);
+    cleanupEnv = nullptr;
+    ResetLocked();
+    if (!next) return true;
+    // Registered after the TSFN's own hook so we detach the native producer first.
+    if (napi_add_env_cleanup_hook(env, EnvClosing, this) != napi_ok) {
+      napi_release_threadsafe_function(next, napi_tsfn_abort);
+      return false;
+    }
+    cleanupEnv = env;
+    fn = next;
+    inbox = std::make_shared<Inbox>();
+    napi_unref_threadsafe_function(env, fn);  // subscription alone is not an app keep-alive
+    return true;
+  }
+
+  std::deque<std::string> Take() {
+    std::deque<std::string> out;
+    std::lock_guard<std::mutex> lk(mu);
+    if (inbox) {
+      std::lock_guard<std::mutex> queue(inbox->mu);
+      out.swap(inbox->paths);
+      inbox->overflowReported = false;
+    }
+    return out;
+  }
+
+  bool Post(const std::string& path) {
+    std::lock_guard<std::mutex> lk(mu);
+    if (!fn) return true;  // default: no registration, no retained paths
+    std::lock_guard<std::mutex> queue(inbox->mu);
+    if (inbox->paths.size() == kCapacity) return std::exchange(inbox->overflowReported, true);
+    inbox->paths.push_back(path);
+    if (!inbox->scheduled) {
+      auto* wake = new Wake(inbox);
+      if (napi_call_threadsafe_function(fn, wake, napi_tsfn_nonblocking) != napi_ok) {
+        delete wake;
+        return false;  // Take still owns the accepted path
+      }
+      inbox->scheduled = true;
+    }
+    return true;
+  }
+};
+
+struct EncodedSize { int width, height; };
+
 struct ServerHolder {
   ipcam::RtspServer server;
+  std::shared_ptr<ipcam::FlvStream> flv = std::make_shared<ipcam::FlvStream>();
   std::unique_ptr<ipcam::TestPatternSource> pattern;
   std::unique_ptr<ipcam::CameraStreamer> camera;
   std::mutex cameraMu;
+  // Serialize remote reconfiguration with starting consumers. The encoder's
+  // callbacks must never take this lock (stopping the encoder drains them).
+  std::mutex mediaControlMu;
+  uint64_t remoteSizeGeneration = 0;  // guarded by cameraMu
   std::unique_ptr<ipcam::MicStreamer> mic;
   std::unique_ptr<ipcam::OpusStream> opus = std::make_unique<ipcam::OpusStream>();
   std::shared_ptr<ipcam::RtmpPublisher> rtmp;
   std::shared_ptr<ipcam::RtmpPublisher> pendingRtmp;
   std::shared_ptr<ipcam::StreamRecorder> recorder;
+  std::shared_ptr<ipcam::RecordVideoEncoder> recordEncoder;  // published/removed with recorder
+  ArchiveChannel archives;
   std::mutex outputsMu;
   std::shared_ptr<std::atomic<uint64_t>> rtmpGeneration =
       std::make_shared<std::atomic<uint64_t>>(0);
@@ -83,24 +199,108 @@ struct ServerHolder {
   std::atomic<bool> torchOn{false};
   napi_threadsafe_function tsfn = nullptr;
   std::mutex tsfnMu;
-  std::atomic<int> streamWidth{1280};
-  std::atomic<int> streamHeight{720};
+  std::atomic<EncodedSize> encodedSize{EncodedSize{1280, 720}};
   std::atomic<bool> videoIsH265{false};  // last camera mime, used as RTMP hint
   std::atomic<bool> webParamsInjected{false};
-  std::atomic<int> webParamsWidth{0};
-  std::atomic<bool> webParamsH265{false};
   bool httpWebStreamActive = false;
+
+  void ResetVideoFormat(int width, int height, bool hevc) {
+    server.ResetVideoParams(hevc);
+    flv->ResetVideoFormat(hevc);
+    webStream->ResetVideoInput();
+    snapshot->ResetVideoInput();
+    encodedSize.store({width, height});
+    videoIsH265.store(hevc);
+    webParamsInjected.store(false);
+  }
+
+  ipcam::HttpServer::SizeResult RemoteSizeList(ipcam::HttpServer::SizeList& out) {
+    using Result = ipcam::HttpServer::SizeResult;
+    std::lock_guard<std::mutex> lk(cameraMu);
+    if (!camera || !camera->IsRunning()) return Result::CameraClosed;
+    if (camera->DualLayout() != 0) return Result::Busy;
+    out.sizes.clear();
+    out.currentIndex = -1;
+    for (const auto& size : camera->AvailableResolutions()) {
+      if (size.first == camera->CaptureWidth() && size.second == camera->CaptureHeight()) {
+        out.currentIndex = static_cast<int>(out.sizes.size());
+      }
+      out.sizes.push_back({size.first, size.second});
+    }
+    return out.sizes.empty() ? Result::CameraClosed : Result::Ok;
+  }
+
+  // Caller holds mediaControlMu (take cameraMu second when needed). Reserve admission, not just
+  // current client counts: an RTSP/FLV client may arrive during a restart.
+  struct VideoChangeLease {
+    ServerHolder& h;
+    bool rtspHeld = false, flvHeld = false;
+    bool Acquire() {
+      if (h.webStream->MotionEnabled() || h.snapshot->IsBusy() || h.MediaOutputInUse()) return false;
+      return ReserveSubscribers();
+    }
+    bool ReserveSubscribers() {
+      rtspHeld = h.server.TryBeginVideoChange();
+      if (rtspHeld) flvHeld = h.flv->TryBeginVideoChange();
+      return flvHeld;
+    }
+    ~VideoChangeLease() {
+      if (flvHeld) h.flv->EndVideoChange();
+      if (rtspHeld) h.server.EndVideoChange();
+    }
+  };
+
+  ipcam::HttpServer::SizeResult SelectRemoteSize(int index) {
+    using Result = ipcam::HttpServer::SizeResult;
+    using Resize = ipcam::CameraStreamer::ResizeResult;
+    std::unique_lock<std::mutex> control(mediaControlMu, std::try_to_lock);
+    if (!control.owns_lock()) return Result::Busy;
+    std::lock_guard<std::mutex> lk(cameraMu);
+    if (!camera || !camera->IsRunning()) return Result::CameraClosed;
+    if (camera->DualLayout() != 0) return Result::Busy;
+    const auto sizes = camera->AvailableResolutions();
+    if (index < 0 || static_cast<size_t>(index) >= sizes.size()) return Result::NotFound;
+    const auto [w, h] = sizes[index];
+    if (camera->CaptureWidth() == w && camera->CaptureHeight() == h) return Result::Ok;
+    VideoChangeLease lease{*this};
+    if (!lease.Acquire()) return Result::Busy;
+    const auto result = camera->ChangeResolution(w, h);
+    if (result == Resize::Rejected) return Result::NotFound;
+    if (result == Resize::Unchanged) return Result::Ok;
+    if (result == Resize::Stopped) ResetVideoFormat(0, 0, videoIsH265.load());
+    ++remoteSizeGeneration;
+    PostEvent(this, ipcam::RtspEvent::kCameraSizeChanged, server.ClientCount(),
+              result == Resize::Changed ? "resolution changed" :
+              result == Resize::Restored ? "previous resolution restored" : "camera stopped");
+    return result == Resize::Changed ? Result::Ok : Result::RestartFailed;
+  }
+
+  int ChangeDualLayout(int layout, const ipcam::DualCameraPlan* plan) {
+    using Resize = ipcam::CameraStreamer::ResizeResult;
+    std::unique_lock<std::mutex> control(mediaControlMu, std::try_to_lock);
+    if (!control.owns_lock()) return 1;
+    std::lock_guard<std::mutex> lk(cameraMu);
+    if (!camera || !camera->IsRunning()) return 3;
+    if (layout == 0 && camera->DualLayout() == 0) return 0;
+    VideoChangeLease lease{*this};
+    if (!lease.Acquire()) return 1;
+    switch (camera->SetDualLayout(layout, plan)) {
+      case Resize::Changed: case Resize::Unchanged: return 0;
+      case Resize::Rejected: return 1;
+      case Resize::Restored: return 2;
+      case Resize::Stopped: ResetVideoFormat(0, 0, videoIsH265.load()); return 3;
+    }
+    return 1;
+  }
 
   void PushVideo(const uint8_t* data, size_t size, ipcam::TimestampUs tsUs) {
     if (tsUs == ipcam::kNoTimestampUs) tsUs = ipcam::NowMonotonicUs();
     if (tsUs < 0) return;
     server.PushH264(data, size, tsUs);
-    // The RTSP server caches codec params from the first frame; inject them
-    // into the web decoder lazily once they are available — and again when the
-    // geometry or codec changes, since the decode/JPEG/motion grid all work on
-    // the frame size the decoder was told about.
-    if (!webParamsInjected.load() || webParamsWidth.load() != streamWidth.load() ||
-        webParamsH265.load() != videoIsH265.load()) {
+    flv->FeedVideo(data, size, tsUs);
+    // ResetVideoFormat clears both the latch and old parameter sets before the
+    // new encoder can deliver buffers, including on rollback to the old size.
+    if (!webParamsInjected.load()) {
       auto vp = server.GetVideoParams();
       if (vp.ready) {
         std::vector<uint8_t> annexB;
@@ -113,10 +313,9 @@ struct ServerHolder {
         if (vp.h265) append(vp.vps);
         append(vp.sps);
         append(vp.pps);
-        webStream->SetParams(vp.h265, annexB, streamWidth.load(), streamHeight.load());
+        const auto size = encodedSize.load();
+        webStream->SetParams(vp.h265, annexB, size.width, size.height);
         webParamsInjected.store(true);
-        webParamsWidth.store(streamWidth.load());
-        webParamsH265.store(vp.h265);
       }
     }
     webStream->FeedVideo(data, size);
@@ -124,29 +323,51 @@ struct ServerHolder {
 
     std::shared_ptr<ipcam::RtmpPublisher> rtmpSnapshot;
     std::shared_ptr<ipcam::StreamRecorder> recorderSnapshot;
+    std::shared_ptr<ipcam::RecordVideoEncoder> encoderSnapshot;
     {
       std::lock_guard<std::mutex> lk(outputsMu);
       rtmpSnapshot = rtmp;
       recorderSnapshot = recorder;
+      encoderSnapshot = recordEncoder;
     }
     if (rtmpSnapshot) rtmpSnapshot->SendH264Packet(data, size, tsUs);
-    if (recorderSnapshot) recorderSnapshot->FeedVideo(data, size, tsUs);
+    if (encoderSnapshot) encoderSnapshot->FeedVideo(data, size, tsUs);
+    else if (recorderSnapshot) recorderSnapshot->FeedVideo(data, size, tsUs);
   }
 
   void PushAudio(const uint8_t* data, size_t size, ipcam::TimestampUs tsUs) {
     if (tsUs == ipcam::kNoTimestampUs) tsUs = ipcam::NowMonotonicUs();
     if (tsUs < 0) return;
     server.PushAdts(data, size, tsUs);
+    flv->FeedAudio(data, size, tsUs);
 
     std::shared_ptr<ipcam::RtmpPublisher> rtmpSnapshot;
     std::shared_ptr<ipcam::StreamRecorder> recorderSnapshot;
+    std::shared_ptr<ipcam::RecordVideoEncoder> encoderSnapshot;
     {
       std::lock_guard<std::mutex> lk(outputsMu);
       rtmpSnapshot = rtmp;
       recorderSnapshot = recorder;
+      encoderSnapshot = recordEncoder;
     }
     if (rtmpSnapshot) rtmpSnapshot->SendAdtsPacket(data, size, tsUs);
-    if (recorderSnapshot) recorderSnapshot->FeedAudio(data, size, tsUs);
+    if (encoderSnapshot) encoderSnapshot->FeedAudio(data, size, tsUs);
+    else if (recorderSnapshot) recorderSnapshot->FeedAudio(data, size, tsUs);
+  }
+
+  bool MediaOutputInUse() {
+    std::lock_guard<std::mutex> lk(outputsMu);
+    return recorder || rtmp || pendingRtmp;
+  }
+
+  // Call under mediaControlMu or after sources have been detached at finalization.
+  void StopMicOutput() {
+    opus->SetSourceActive(false);
+    if (mic) {
+      mic->Stop();
+      mic.reset();
+    }
+    server.ResetAudioParams();  // no old-format callbacks remain after Stop
   }
 
   void StopCameraOutput() {
@@ -154,13 +375,9 @@ struct ServerHolder {
     {
       std::lock_guard<std::mutex> lk(cameraMu);
       current = std::move(camera);
+      if (current && torchOn.exchange(false)) current->SetTorch(false);
     }
     if (current) current->Stop();
-  }
-
-  int CameraOrientation() {
-    std::lock_guard<std::mutex> lk(cameraMu);
-    return camera ? camera->Orientation() : 0;
   }
 
   bool CameraIsRunning() {
@@ -170,7 +387,7 @@ struct ServerHolder {
 
   bool RestartCamera() {
     std::lock_guard<std::mutex> lk(cameraMu);
-    return camera && camera->Restart();
+    return camera && !MediaOutputInUse() && camera->Restart();
   }
 
   bool AttachCameraPreview(uint64_t surfaceId) {
@@ -178,19 +395,16 @@ struct ServerHolder {
     return camera && camera->AttachPreview(surfaceId);
   }
 
-  void HandleCameraCommand(const std::string& command) {
+  bool HandleCameraCommand(const std::string& command) {
     std::lock_guard<std::mutex> lk(cameraMu);
-    if (!camera) return;
+    if (!camera || !camera->IsRunning()) return false;
     if (command == "light") {
       bool nextTorch = !torchOn.load();
+      if (!camera->SetTorch(nextTorch)) return false;
       torchOn.store(nextTorch);
-      camera->SetTorch(nextTorch);
-      PostEvent(this, ipcam::RtspEvent::kClientPlaying, 0,
-                std::string("torch ") + (nextTorch ? "on" : "off"));
-    } else if (command == "camswitch") {
-      camera->SwitchFacing();
-      PostEvent(this, ipcam::RtspEvent::kClientPlaying, 0, "camera switched");
+      return true;
     }
+    return command == "camswitch" && !MediaOutputInUse() && camera->SwitchFacing();
   }
 
   void StopRtmpOutputs() {
@@ -206,13 +420,86 @@ struct ServerHolder {
     if (active) active->Stop();
   }
 
+  bool StartRecording(const std::string& path, const ipcam::StreamRecorder::Options& options,
+                      const ipcam::RecordVideoEncoder::Options* transcode) {
+    std::lock_guard<std::mutex> control(mediaControlMu);
+    std::lock_guard<std::mutex> cameraLock(cameraMu);  // snapshot a single encoder epoch, including preview restarts
+    auto vp = server.GetVideoParams();
+    const auto size = encodedSize.load();
+    const auto report = [this](const std::string& error) {
+      PostEvent(this, ipcam::RtspEvent::kServerError, server.ClientCount(), "record: " + error);
+    };
+    if (transcode && (!vp.ready || vp.sps.empty() || vp.pps.empty() || (vp.h265 && vp.vps.empty()) ||
+                      size.width <= 0 || size.height <= 0)) {
+      report("source codec parameters not ready");
+      return false;
+    }
+    StopRecorderOutput();
+    auto rec = std::make_shared<ipcam::StreamRecorder>();
+    rec->SetOptions(options);
+    if (!transcode && vp.ready) rec->SetVideoParams(vp.h265, vp.vps, vp.sps, vp.pps, size.width, size.height);
+    auto failed = std::make_shared<std::atomic<bool>>(false);
+    auto lifecycle = std::make_shared<std::mutex>();  // serialize early codec failure with writer startup
+    std::shared_ptr<ipcam::RecordVideoEncoder> encoder;
+    if (transcode) {
+      encoder = std::make_shared<ipcam::RecordVideoEncoder>();
+      ipcam::RecordVideoEncoder::Sinks sinks;
+      sinks.params = [rec](const ipcam::RecordVideoEncoder::Source& p) {
+        rec->SetVideoParams(p.h265, p.vps, p.sps, p.pps, p.width, p.height);
+      };
+      sinks.video = [rec](const uint8_t* d, size_t n, int64_t ts) { rec->FeedVideo(d, n, ts); };
+      if (options.includeAudio) sinks.audio = [rec](const uint8_t* d, size_t n, int64_t ts) { rec->FeedAudio(d, n, ts); };
+      sinks.fatal = [rec, report, failed, lifecycle](const std::string& error) {
+        std::lock_guard<std::mutex> lk(*lifecycle);
+        failed->store(true);
+        report(error);
+        rec->Stop();  // encoder worker, not recorder writer; control joins this worker first
+      };
+      ipcam::RecordVideoEncoder::Source input{vp.h265, size.width, size.height, vp.vps, vp.sps, vp.pps};
+      std::string error;
+      if (!encoder->Configure(*transcode, input, std::move(sinks), error)) {
+        failed->store(true);
+        encoder->Stop();
+        if (!error.empty()) report(error);
+        return false;  // resource/capability failure: never opened a recording file
+      }
+    }
+    {
+      std::lock_guard<std::mutex> startup(*lifecycle);
+      if (!failed->load() && rec->Start(path, camera ? camera->Orientation() : 0, report,
+          [this, failed](const ipcam::StreamRecorder::CompletedFile& file) {
+            if (!failed->load() && !archives.Post(file.path)) {
+              PostEvent(this, ipcam::RtspEvent::kServerError, server.ClientCount(), "local archive notification queue unavailable");
+            }
+          })) {
+        std::lock_guard<std::mutex> lk(outputsMu);
+        recordEncoder = std::move(encoder);
+        recorder = std::move(rec);
+        return true;
+      }
+      failed->store(true);
+    }
+    if (encoder) encoder->Stop();  // no locks needed by fatal/JS held
+    rec->Stop();
+    return false;
+  }
+
   void StopRecorderOutput() {
     std::shared_ptr<ipcam::StreamRecorder> current;
+    std::shared_ptr<ipcam::RecordVideoEncoder> encoder;
     {
       std::lock_guard<std::mutex> lk(outputsMu);
-      current = std::move(recorder);
+      current = recorder;  // keep IsWritingPath visible during finalization
+      encoder = recordEncoder;
     }
-    if (current) current->Stop();
+    // Stop accepts no new input, drains its worker (including any fatal sink)
+    // before touching the writer. No lock held, and no passthrough window.
+    if (encoder) encoder->Stop();
+    if (current) {
+      current->Stop();
+      std::lock_guard<std::mutex> lk(outputsMu);
+      if (recorder == current) { recordEncoder.reset(); recorder.reset(); }
+    }
   }
 };
 
@@ -283,11 +570,9 @@ void ServerFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
   holder->webStream->SetMotionEnabled(false);
   holder->webStream->SetMotionSink(nullptr);
   holder->StopCameraOutput();
-  if (holder->mic) {
-    holder->mic->Stop();
-    holder->mic.reset();
-  }
+  holder->StopMicOutput();
   holder->StopRtmpOutputs();
+  holder->archives.Replace(nullptr);
   holder->StopRecorderOutput();
   holder->snapshot->Stop();
   holder->voice.Stop();
@@ -413,6 +698,18 @@ napi_value RtspStop(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+napi_value ServiceBoundV4Port(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2], result;
+  bool http = false;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc != 2 || napi_get_value_bool(env, argv[1], &http) != napi_ok) return InvalidArgs(env);
+  auto* h = HolderFromArg(env, argv[0]);
+  int port = h ? (http ? (h->http ? h->http->BoundV4Port() : 0) : h->server.BoundV4Port()) : 0;
+  napi_create_int32(env, port, &result);
+  return result;
+}
+
 napi_value RtspIsRunning(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -422,6 +719,34 @@ napi_value RtspIsRunning(napi_env env, napi_callback_info info) {
   napi_value result;
   napi_get_boolean(env, holder != nullptr && holder->server.IsRunning(), &result);
   return result;
+}
+
+napi_value ServiceViewerCounts(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  if (napi_create_object(env, &result) != napi_ok) return nullptr;
+  auto setCount = [&](const char* key, uint32_t count) {
+    napi_value value;
+    return napi_create_uint32(env, count, &value) == napi_ok &&
+           napi_set_named_property(env, result, key, value) == napi_ok;
+  };
+  if (!setCount("rtsp", holder->server.ClientCount()) ||
+      !setCount("mjpeg", holder->http ? holder->http->MjpegViewerCount() : 0) ||
+      !setCount("flv", static_cast<uint32_t>(holder->flv->ViewerCount())) ||
+      !setCount("opus", holder->opus->ViewerCount())) return nullptr;
+  return result;
+}
+
+napi_value CameraToggleTorch(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  return napi_get_boolean(env, holder->HandleCameraCommand("light"), &result) == napi_ok ? result : nullptr;
 }
 
 napi_value RtspClientCount(napi_env env, napi_callback_info info) {
@@ -581,7 +906,13 @@ napi_value RtspStartTestPattern(napi_env env, napi_callback_info info) {
     holder->pattern->Stop();
     holder->pattern.reset();
   }
+  if (holder->CameraIsRunning()) {
+    napi_value result;
+    napi_get_boolean(env, false, &result);
+    return result;
+  }
   holder->patternClock.Reset();
+  holder->ResetVideoFormat(static_cast<int>(width), static_cast<int>(height), false);
   auto pattern = std::make_unique<ipcam::TestPatternSource>();
   bool ok = pattern->Start(
       static_cast<int>(width), static_cast<int>(height), static_cast<int>(fps),
@@ -594,6 +925,8 @@ napi_value RtspStartTestPattern(napi_env env, napi_callback_info info) {
       });
   if (ok) {
     holder->pattern = std::move(pattern);
+  } else {
+    holder->ResetVideoFormat(0, 0, false);
   }
   napi_value result;
   napi_get_boolean(env, ok, &result);
@@ -615,33 +948,240 @@ napi_value RtspStopTestPattern(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+bool PositiveInt(napi_env env, napi_value value, int32_t& out) {
+  double n = 0;
+  if (napi_get_value_double(env, value, &n) != napi_ok || !std::isfinite(n) ||
+      n < 1 || n > INT32_MAX || n != std::floor(n)) return false;
+  out = static_cast<int32_t>(n);
+  return true;
+}
+
+// Do not silently truncate explicit device/codec names or a file path into another selection.
+bool MediaString(napi_env env, napi_value arg, std::string& out) {
+  size_t bytes = 0, copied = 0;
+  if (napi_get_value_string_utf8(env, arg, nullptr, 0, &bytes) != napi_ok || bytes > 4095) return false;
+  std::string buf(bytes + 1, '\0');
+  if (napi_get_value_string_utf8(env, arg, buf.data(), buf.size(), &copied) != napi_ok || copied != bytes) return false;
+  buf.resize(bytes);
+  if (buf.find('\0') != std::string::npos) return false;
+  out = std::move(buf);
+  return true;
+}
+
+bool MediaArgPresent(napi_env env, napi_value arg) {
+  napi_valuetype type;
+  return arg && napi_typeof(env, arg, &type) == napi_ok && type != napi_undefined;
+}
+
+bool MediaInt(napi_env env, napi_value arg, int low, int high, int& out) {
+  double n;
+  if (napi_get_value_double(env, arg, &n) != napi_ok || !std::isfinite(n) ||
+      n < low || n > high || n != std::floor(n)) return false;
+  out = static_cast<int>(n);
+  return true;
+}
+
+napi_value MediaJson(napi_env env, const std::string& json) {
+  napi_value result;
+  return napi_create_string_utf8(env, json.c_str(), json.size(), &result) == napi_ok ? result : nullptr;
+}
+
+napi_value MediaBool(napi_env env, bool value) {
+  napi_value result;
+  return napi_get_boolean(env, value, &result) == napi_ok ? result : nullptr;
+}
+
+napi_value CameraDevices(napi_env env, napi_callback_info) {
+  return MediaJson(env, ipcam::CameraDevicesJson());
+}
+
+napi_value EncoderOptions(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  std::string mime;
+  if (!argc || !MediaString(env, argv[0], mime)) return InvalidArgs(env);
+  return MediaJson(env, ipcam::EncoderOptionsJson(mime));
+}
+
+napi_value CameraResolutions(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  bool front;
+  std::string deviceId;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || napi_get_value_bool(env, argv[0], &front) != napi_ok ||
+      (argc > 1 && MediaArgPresent(env, argv[1]) && !MediaString(env, argv[1], deviceId))) return InvalidArgs(env);
+  return MediaJson(env, ipcam::CameraResolutionsJson(front, deviceId));
+}
+
+napi_value CameraRemoteSizeState(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc == 1 ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  std::string state;
+  {
+    std::lock_guard<std::mutex> lk(holder->cameraMu);
+    const bool running = holder->camera && holder->camera->IsRunning();
+    state = "{\"generation\":" + std::to_string(holder->remoteSizeGeneration) +
+        ",\"running\":" + (running ? "true" : "false") +
+        ",\"width\":" + std::to_string(running ? holder->camera->CaptureWidth() : 0) +
+        ",\"height\":" + std::to_string(running ? holder->camera->CaptureHeight() : 0) + "}";
+  }
+  napi_create_string_utf8(env, state.c_str(), state.size(), &result);
+  return result;
+}
+
+napi_value CameraCaptureFps(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc == 1 ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  std::string json;
+  {
+    std::lock_guard<std::mutex> lk(holder->cameraMu);
+    json = holder->camera ? holder->camera->CaptureFpsJson() : "{\"ranges\":[]}";
+  }
+  napi_create_string_utf8(env, json.c_str(), json.size(), &result);
+  return result;
+}
+
+napi_value CameraSetCaptureFps(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  int32_t min, max;
+  if (argc < 3 || !PositiveInt(env, argv[1], min) || !PositiveInt(env, argv[2], max)) return InvalidArgs(env);
+  auto* holder = HolderFromArg(env, argv[0]);
+  if (!holder) return InvalidArgs(env);
+  bool ok;
+  {
+    std::lock_guard<std::mutex> lk(holder->cameraMu);
+    ok = holder->camera && holder->camera->SetCaptureFps(min, max);
+  }
+  napi_get_boolean(env, ok, &result);
+  return result;
+}
+
+bool ReadDualPlan(napi_env env, napi_value obj, ipcam::DualCameraPlan& p) {
+  napi_valuetype type;
+  if (napi_typeof(env, obj, &type) != napi_ok || type != napi_object) return false;
+  napi_value v;
+  auto id = [&](const char* key, std::string& s) {
+    return napi_get_named_property(env, obj, key, &v) == napi_ok && MediaString(env, v, s) && !s.empty();
+  };
+  auto number = [&](const char* key, int low, int high, int& n) {
+    return napi_get_named_property(env, obj, key, &v) == napi_ok && MediaInt(env, v, low, high, n);
+  };
+  return id("primaryId", p.primaryId) && id("secondaryId", p.secondaryId) && p.primaryId != p.secondaryId &&
+      number("primaryType", 0, 1, p.primaryType) && number("secondaryType", 0, 1, p.secondaryType) &&
+      number("width", 4, 4096, p.width) && number("height", 4, 4096, p.height) &&
+      number("secondaryWidth", 4, 4096, p.secondaryWidth) && number("secondaryHeight", 4, 4096, p.secondaryHeight) &&
+      !((p.width | p.height | p.secondaryWidth | p.secondaryHeight) & 1) &&
+      p.width * p.height <= 4096 * 2160 && p.secondaryWidth * p.secondaryHeight <= 4096 * 2160;
+}
+
+napi_value CameraSetDualLayout(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc >= 2 ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  ipcam::DualCameraPlan plan;
+  int layout = 0, code = 1;
+  if (MediaInt(env, argv[1], 0, 3, layout) && (layout == 0 || (argc >= 3 && ReadDualPlan(env, argv[2], plan)))) {
+    code = holder->ChangeDualLayout(layout, layout == 0 ? nullptr : &plan);
+  }
+  return napi_create_int32(env, code, &result) == napi_ok ? result : nullptr;
+}
+
+napi_value CameraDualLayout(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  std::lock_guard<std::mutex> lk(holder->cameraMu);
+  return napi_create_int32(env, holder->camera ? holder->camera->DualLayout() : 0, &result) == napi_ok ? result : nullptr;
+}
+
+napi_value CameraFocusInfo(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  std::lock_guard<std::mutex> lk(holder->cameraMu);
+  return MediaJson(env, holder->camera ? holder->camera->FocusInfoJson() : "{\"modes\":[]}");
+}
+
+napi_value CameraSetFocusMode(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  int mode;
+  auto* holder = argc >= 2 ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder || !MediaInt(env, argv[1], 0, INT32_MAX, mode)) return InvalidArgs(env);
+  std::lock_guard<std::mutex> lk(holder->cameraMu);
+  return MediaBool(env, holder->camera && holder->camera->SetFocusMode(mode));
+}
+
+napi_value CameraFocusAt(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  double x, y;
+  auto* holder = argc >= 3 ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder || napi_get_value_double(env, argv[1], &x) != napi_ok ||
+      napi_get_value_double(env, argv[2], &y) != napi_ok) return InvalidArgs(env);
+  std::lock_guard<std::mutex> lk(holder->cameraMu);
+  return MediaBool(env, x >= 0 && x <= 1 && y >= 0 && y <= 1 && holder->camera && holder->camera->FocusAt(x, y));
+}
+
 napi_value RtspStartCamera(napi_env env, napi_callback_info info) {
-  size_t argc = 7;
-  napi_value argv[7];
+  size_t argc = 12;
+  napi_value argv[12];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 7) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
   if (holder == nullptr) return InvalidArgs(env);
-  double width = 1280, height = 720, bitrate = 2000000;
-  napi_get_value_double(env, argv[1], &width);
-  napi_get_value_double(env, argv[2], &height);
-  napi_get_value_double(env, argv[3], &bitrate);
-  char mime[32] = "video/avc";
+  int32_t width, height, bitrate, iFrameMs;
+  char mime[32]{};
   size_t mimeLen = 0;
-  napi_get_value_string_utf8(env, argv[4], mime, sizeof(mime), &mimeLen);
   bool front = false;
-  napi_get_value_bool(env, argv[5], &front);
-  double iFrameMs = 2000;
-  napi_get_value_double(env, argv[6], &iFrameMs);
+  if (!PositiveInt(env, argv[1], width) || !PositiveInt(env, argv[2], height) ||
+      !PositiveInt(env, argv[3], bitrate) || !PositiveInt(env, argv[6], iFrameMs) ||
+      napi_get_value_bool(env, argv[5], &front) != napi_ok ||
+      napi_get_value_string_utf8(env, argv[4], mime, sizeof(mime), &mimeLen) != napi_ok ||
+      (std::string(mime, mimeLen) != "video/avc" && std::string(mime, mimeLen) != "video/hevc")) {
+    return InvalidArgs(env);
+  }
 
+  std::string deviceId, encoderName;
+  int avcProfile = -1, degrees = -1;
+  ipcam::CaptureOrientation orientation{};
+  if ((argc >= 11 && MediaArgPresent(env, argv[10]) && !MediaInt(env, argv[10], -1, 270, degrees)) ||
+      (argc >= 12 && MediaArgPresent(env, argv[11]) && napi_get_value_bool(env, argv[11], &orientation.mirror) != napi_ok)) return InvalidArgs(env);
+  orientation.rotation = static_cast<ipcam::CaptureRotation>(degrees);
+  if (!orientation.Valid()) return InvalidArgs(env);
+  if ((argc >= 8 && MediaArgPresent(env, argv[7]) && !MediaString(env, argv[7], deviceId)) ||
+      (argc >= 9 && MediaArgPresent(env, argv[8]) && !MediaString(env, argv[8], encoderName)) ||
+      (argc >= 10 && MediaArgPresent(env, argv[9]) && !MediaInt(env, argv[9], -1, INT32_MAX, avcProfile))) return InvalidArgs(env);
+  std::lock_guard<std::mutex> control(holder->mediaControlMu);
+  ServerHolder::VideoChangeLease lease{*holder};
+  if (holder->MediaOutputInUse() || ((holder->CameraIsRunning() || holder->pattern) && !lease.Acquire())) return MediaBool(env, false);
   if (holder->pattern) {
     holder->pattern->Stop();
     holder->pattern.reset();
   }
   holder->StopCameraOutput();
-  holder->videoIsH265.store(std::string(mime) == "video/hevc");
-  holder->webParamsInjected.store(false);
   auto camera = std::make_unique<ipcam::CameraStreamer>();
+  camera->SetVideoFormatCallback([holder, hevc = std::string(mime) == "video/hevc"](int w, int h) {
+    holder->ResetVideoFormat(w, h, hevc);
+  });
   bool ok = camera->Start(
       static_cast<int>(width), static_cast<int>(height), static_cast<int>(bitrate),
       mime, front, static_cast<int>(iFrameMs), g_pendingPreviewId.load(),
@@ -653,34 +1193,16 @@ napi_value RtspStartCamera(napi_env env, napi_callback_info info) {
       },
       [holder](const std::string& err) {
         PostEvent(holder, ipcam::RtspEvent::kServerError, holder->server.ClientCount(), err);
-      });
+      }, deviceId, encoderName, avcProfile, orientation);
   if (ok) {
-    // Encoded dims, not requested dims: OSD mode may rotate the stream 90/270
-    // (portrait mount), and every downstream consumer (web decoder, snapshot,
-    // recorder, serverinfo) keys off these atoms.
-    holder->streamWidth.store(camera->EncodedWidth());
-    holder->streamHeight.store(camera->EncodedHeight());
     {
       std::lock_guard<std::mutex> lk(holder->cameraMu);
       holder->camera = std::move(camera);
     }
-    auto vp = holder->server.GetVideoParams();
-    if (vp.ready) {
-      std::vector<uint8_t> annexB;
-      const uint8_t sc[4] = {0x00, 0x00, 0x00, 0x01};
-      auto append = [&annexB, &sc](const std::vector<uint8_t>& nal) {
-        if (nal.empty()) return;
-        annexB.insert(annexB.end(), sc, sc + 4);
-        annexB.insert(annexB.end(), nal.begin(), nal.end());
-      };
-      if (vp.h265) append(vp.vps);
-      append(vp.sps);
-      append(vp.pps);
-      holder->webStream->SetParams(vp.h265, annexB, holder->streamWidth.load(),
-                                   holder->streamHeight.load());
-    }
-    uint64_t previewId = g_pendingPreviewId.load();
-    if (previewId != 0) holder->AttachCameraPreview(previewId);
+    std::lock_guard<std::mutex> lk(g_holderMu);
+    if (holder == g_holder) holder->AttachCameraPreview(g_pendingPreviewId.load());
+  } else {
+    holder->ResetVideoFormat(0, 0, std::string(mime) == "video/hevc");
   }
   napi_value result;
   napi_get_boolean(env, ok, &result);
@@ -693,28 +1215,35 @@ napi_value RtspStopCamera(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr) holder->StopCameraOutput();
+  if (holder != nullptr) {
+    std::lock_guard<std::mutex> control(holder->mediaControlMu);
+    holder->StopCameraOutput();
+  }
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
 }
 
 napi_value RtspStartMic(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1];
+  size_t argc = 3;
+  napi_value argv[3];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder == nullptr) return InvalidArgs(env);
-
-  if (holder->mic) {
-    holder->mic->Stop();
-    holder->mic.reset();
-  }
+  int rate = 48000, channels = 1;
+  if (!holder || (argc >= 2 && MediaArgPresent(env, argv[1]) && !MediaInt(env, argv[1], 0, 192000, rate)) ||
+      (argc >= 3 && MediaArgPresent(env, argv[2]) && !MediaInt(env, argv[2], 1, 2, channels))) return InvalidArgs(env);
+  std::lock_guard<std::mutex> control(holder->mediaControlMu);
+  ServerHolder::VideoChangeLease lease{*holder};
+  if (holder->MediaOutputInUse() || !lease.ReserveSubscribers()) return MediaBool(env, false);
+  holder->StopMicOutput();
   holder->audioClock.Reset();
   auto mic = std::make_unique<ipcam::MicStreamer>();
+  mic->SetPcmTap([holder](const uint8_t* pcm, size_t bytes, int rate, int ch) {
+    holder->opus->FeedPcm(pcm, bytes, rate, ch);
+  });
   bool ok = mic->Start(
-      48000, 1, 64000,
+      rate, channels, 64000,
       [holder](const uint8_t* data, size_t size, ipcam::TimestampUs ptsUs) {
         holder->PushAudio(data, size, holder->audioClock.Map(ptsUs));
       },
@@ -722,14 +1251,27 @@ napi_value RtspStartMic(napi_env env, napi_callback_info info) {
         PostEvent(holder, ipcam::RtspEvent::kServerError, holder->server.ClientCount(), err);
       });
   if (ok) {
+    holder->opus->SetSourceActive(true, mic->SampleRate(), mic->Channels());
     holder->mic = std::move(mic);
-    holder->mic->SetPcmTap([holder](const uint8_t* pcm, size_t bytes, int rate, int ch) {
-      holder->opus->FeedPcm(pcm, bytes, rate, ch);
-    });
   }
-  holder->opus->SetSourceActive(ok);
   napi_value result;
   napi_get_boolean(env, ok, &result);
+  return result;
+}
+
+napi_value RtspMicFormat(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result, hz, ch;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  std::lock_guard<std::mutex> control(holder->mediaControlMu);
+  bool active = holder->mic && holder->mic->IsRunning();
+  if (napi_create_object(env, &result) != napi_ok ||
+      napi_create_int32(env, active ? holder->mic->SampleRate() : 0, &hz) != napi_ok ||
+      napi_create_int32(env, active ? holder->mic->Channels() : 0, &ch) != napi_ok ||
+      napi_set_named_property(env, result, "sampleRate", hz) != napi_ok ||
+      napi_set_named_property(env, result, "channels", ch) != napi_ok) return nullptr;
   return result;
 }
 
@@ -739,11 +1281,10 @@ napi_value RtspStopMic(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr && holder->mic) {
-    holder->mic->Stop();
-    holder->mic.reset();
+  if (holder) {
+    std::lock_guard<std::mutex> control(holder->mediaControlMu);
+    holder->StopMicOutput();
   }
-  if (holder != nullptr) holder->opus->SetSourceActive(false);
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -756,6 +1297,7 @@ struct RtmpStartContext {
   napi_ref holderRef = nullptr;
   std::shared_ptr<ipcam::RtmpPublisher> publisher;
   std::string url;
+  uint32_t tlsToken = 0;
   uint64_t generation = 0;
   int width = 0;
   int height = 0;
@@ -781,7 +1323,7 @@ void ExecuteRtmpStart(napi_env /*env*/, void* data) {
           }
         }
         PostRtmpEvent(holder, generation, "rtmp: " + err);
-      });
+      }, ctx->tlsToken);
 }
 
 void CompleteRtmpStart(napi_env env, napi_status status, void* data) {
@@ -825,26 +1367,55 @@ void CompleteRtmpStart(napi_env env, napi_status status, void* data) {
   if (ctx->work != nullptr) napi_delete_async_work(env, ctx->work);
 }
 
+napi_value RtmpFailure(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc == 1 ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  std::shared_ptr<ipcam::RtmpPublisher> active;
+  {
+    std::lock_guard<std::mutex> lk(holder->outputsMu);
+    active = holder->rtmp;
+  }
+  const auto error = active ? active->LastError() : std::string();
+  napi_create_string_utf8(env, error.c_str(), error.size(), &result);
+  return result;
+}
+
 napi_value RtmpStart(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2];
+  size_t argc = 3;
+  napi_value argv[3];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 2) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
   if (holder == nullptr) return InvalidArgs(env);
-  char url[1024];
-  size_t len = 0;
-  if (napi_get_value_string_utf8(env, argv[1], url, sizeof(url), &len) != napi_ok) {
-    napi_throw_type_error(env, nullptr, "expect url string");
-    return nullptr;
+  size_t len = 0, used = 0;
+  if (napi_get_value_string_utf8(env, argv[1], nullptr, 0, &len) != napi_ok || !len || len > 65535) {
+    return InvalidArgs(env);
   }
+  std::string url(len + 1, char(0));
+  if (napi_get_value_string_utf8(env, argv[1], url.data(), url.size(), &used) != napi_ok || used != len) {
+    return InvalidArgs(env);
+  }
+  url.resize(used);
+  if (url.find(char(0)) != std::string::npos) return InvalidArgs(env);
 
+  std::lock_guard<std::mutex> control(holder->mediaControlMu);
   auto ctx = std::make_unique<RtmpStartContext>();
   ctx->holder = holder;
   ctx->publisher = std::make_shared<ipcam::RtmpPublisher>();
-  ctx->url.assign(url, len);
-  ctx->width = holder->streamWidth.load();
-  ctx->height = holder->streamHeight.load();
+  if (argc >= 3) {
+    double token = 0;
+    if (napi_get_value_double(env, argv[2], &token) != napi_ok || !std::isfinite(token) ||
+        token < 1 || token > UINT32_MAX || token != std::floor(token)) return InvalidArgs(env);
+    ctx->tlsToken = static_cast<uint32_t>(token);
+    if (!ipcam::RtmpTlsPipe::Instance().IsOwned(ctx->tlsToken, env)) return InvalidArgs(env);
+  }
+  ctx->url = std::move(url);
+  const auto size = holder->encodedSize.load();
+  ctx->width = size.width;
+  ctx->height = size.height;
   ctx->h265 = holder->videoIsH265.load();
   auto params = holder->server.GetVideoParams();
   if (params.ready) {
@@ -914,8 +1485,54 @@ napi_value RtmpStop(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr) holder->StopRtmpOutputs();
+  if (holder) {
+    std::lock_guard<std::mutex> control(holder->mediaControlMu);
+    holder->StopRtmpOutputs();
+  }
   napi_value undef;
+  napi_get_undefined(env, &undef);
+  return undef;
+}
+
+napi_value RtspSetArchiveCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2], name;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc >= 2 ? HolderFromArg(env, argv[0]) : nullptr;
+  napi_valuetype type;
+  if (!holder || napi_typeof(env, argv[1], &type) != napi_ok || type != napi_function) return InvalidArgs(env);
+  napi_threadsafe_function fn = nullptr;
+  // One outstanding nonblocking wakeup for this registration's bounded inbox.
+  if (napi_create_string_utf8(env, "local_archive_closed", NAPI_AUTO_LENGTH, &name) != napi_ok ||
+      napi_create_threadsafe_function(env, argv[1], nullptr, name, 1, 1, nullptr, nullptr, nullptr,
+                                      ArchiveChannel::Deliver, &fn) != napi_ok) return MediaBool(env, false);
+  return MediaBool(env, holder->archives.Replace(fn, env));
+}
+
+napi_value RtspTakePendingArchives(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], array;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  auto pending = holder->archives.Take();
+  if (napi_create_array_with_length(env, pending.size(), &array) != napi_ok) return nullptr;
+  uint32_t index = 0;
+  for (const auto& path : pending) {
+    napi_value value;
+    if (napi_create_string_utf8(env, path.data(), path.size(), &value) != napi_ok ||
+        napi_set_element(env, array, index++, value) != napi_ok) return nullptr;
+  }
+  return array;
+}
+
+napi_value RtspClearArchiveCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], undef;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  auto* holder = argc ? HolderFromArg(env, argv[0]) : nullptr;
+  if (!holder) return InvalidArgs(env);
+  holder->archives.Replace(nullptr);
   napi_get_undefined(env, &undef);
   return undef;
 }
@@ -927,13 +1544,11 @@ napi_value RtspStartRecord(napi_env env, napi_callback_info info) {
   if (argc < 2) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
   if (holder == nullptr) return InvalidArgs(env);
-  char path[512];
-  size_t len = 0;
-  if (napi_get_value_string_utf8(env, argv[1], path, sizeof(path), &len) != napi_ok) {
-    napi_throw_type_error(env, nullptr, "expect path string");
-    return nullptr;
-  }
+  std::string path;
+  if (!MediaString(env, argv[1], path) || path.empty()) return InvalidArgs(env);
   ipcam::StreamRecorder::Options recordOptions;  // four_gb_limit / segment defaults
+  std::string videoMime;
+  ipcam::RecordVideoEncoder::Options videoOptions{false, 4000000, 2000};
   if (argc >= 3 && argv[2] != nullptr) {
     napi_valuetype optType = napi_undefined;
     napi_typeof(env, argv[2], &optType);
@@ -943,34 +1558,57 @@ napi_value RtspStartRecord(napi_env env, napi_callback_info info) {
           v != nullptr) {
         napi_get_value_bool(env, v, &recordOptions.fourGbLimit);
       }
-      double minutes = 10;
-      if (napi_get_named_property(env, argv[2], "segmentMinutes", &v) == napi_ok &&
-          v != nullptr) {
-        napi_get_value_double(env, v, &minutes);
-        recordOptions.segmentMinutes = static_cast<int>(minutes);
+      if (napi_get_named_property(env, argv[2], "segmentMinutes", &v) != napi_ok ||
+          (MediaArgPresent(env, v) && !MediaInt(env, v, 0, INT32_MAX, recordOptions.segmentMinutes))) return InvalidArgs(env);
+      if (napi_get_named_property(env, argv[2], "includeAudio", &v) != napi_ok ||
+          (MediaArgPresent(env, v) && napi_get_value_bool(env, v, &recordOptions.includeAudio) != napi_ok)) return InvalidArgs(env);
+      if (napi_get_named_property(env, argv[2], "videoMime", &v) != napi_ok ||
+          (MediaArgPresent(env, v) && !MediaString(env, v, videoMime))) return InvalidArgs(env);
+      if (!videoMime.empty()) {
+        if (videoMime != "video/avc" && videoMime != "video/hevc") return MediaBool(env, false);
+        videoOptions.h265 = videoMime == "video/hevc";
+        if (napi_get_named_property(env, argv[2], "videoBitrate", &v) != napi_ok ||
+            (MediaArgPresent(env, v) && !MediaInt(env, v, 250000, 20000000, videoOptions.bitrate)) ||
+            napi_get_named_property(env, argv[2], "gopMs", &v) != napi_ok ||
+            (MediaArgPresent(env, v) && !MediaInt(env, v, 500, 10000, videoOptions.gopMs))) return MediaBool(env, false);
       }
     }
   }
-  holder->StopRecorderOutput();
-  auto rec = std::make_shared<ipcam::StreamRecorder>();
-  rec->SetOptions(recordOptions);
-  int rotation = holder->CameraOrientation();
-  auto vp = holder->server.GetVideoParams();
-  if (vp.ready) {
-    rec->SetVideoParams(vp.h265, vp.vps, vp.sps, vp.pps, holder->streamWidth.load(),
-                        holder->streamHeight.load());
+  return MediaBool(env, holder->StartRecording(path, recordOptions, videoMime.empty() ? nullptr : &videoOptions));
+}
+
+napi_value RecordingFileBusy(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1], result;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  std::string path;
+  if (!argc || !MediaString(env, argv[0], path)) return InvalidArgs(env);
+  bool busy = false;
+  {
+    std::lock_guard<std::mutex> lk(g_holderMu);
+    if (g_holder) {
+      std::lock_guard<std::mutex> output(g_holder->outputsMu);
+      busy = g_holder->recorder && g_holder->recorder->IsWritingPath(path);
+    }
   }
-  bool ok = rec->Start(std::string(path, len), rotation,
-                       [holder](const std::string& err) {
-                         PostEvent(holder, ipcam::RtspEvent::kServerError,
-                                   holder->server.ClientCount(), "record: " + err);
-                       });
-  if (ok) {
+  napi_get_boolean(env, busy, &result);
+  return result;
+}
+
+napi_value RtspIsRecording(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1) return InvalidArgs(env);
+  ServerHolder* holder = HolderFromArg(env, argv[0]);
+  if (holder == nullptr) return InvalidArgs(env);
+  bool recording;
+  {
     std::lock_guard<std::mutex> lk(holder->outputsMu);
-    holder->recorder = std::move(rec);
+    recording = holder->recorder && holder->recorder->IsRecording();
   }
   napi_value result;
-  napi_get_boolean(env, ok, &result);
+  napi_get_boolean(env, recording, &result);
   return result;
 }
 
@@ -980,7 +1618,10 @@ napi_value RtspStopRecord(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
-  if (holder != nullptr) holder->StopRecorderOutput();
+  if (holder) {
+    std::lock_guard<std::mutex> control(holder->mediaControlMu);
+    holder->StopRecorderOutput();
+  }
   napi_value undef;
   napi_get_undefined(env, &undef);
   return undef;
@@ -999,8 +1640,9 @@ napi_value RtspTakeSnapshot(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, nullptr, "expect path string");
     return nullptr;
   }
-  int w = holder->streamWidth.load();
-  int h = holder->streamHeight.load();
+  std::lock_guard<std::mutex> control(holder->mediaControlMu);
+  const auto size = holder->encodedSize.load();
+  int w = size.width, h = size.height;
   auto vp = holder->server.GetVideoParams();
   if (vp.ready) {
     std::vector<uint8_t> annexB;
@@ -1065,20 +1707,16 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
   if (!holder->http) holder->http = std::make_unique<ipcam::HttpServer>();
   std::string userStr = user;
   std::string passStr = pass;
+  bool allowLegacyVideoPassword = false;
+  if (napi_get_named_property(env, opts, "allowLegacyVideoPassword", &v) == napi_ok && v) {
+    napi_get_value_bool(env, v, &allowLegacyVideoPassword);
+  }
   auto weakHolder = holder;
+  holder->http->SetFreshJpegSource([weakHolder](const std::atomic<bool>& running) {
+    return weakHolder->webStream->WaitForFreshJpeg(running);
+  });
   holder->http->SetJpegSource([weakHolder]() {
-    if (weakHolder->webStream == nullptr) return std::vector<uint8_t>();
-    // One-shot snapshot may arrive before the web decoder has produced a
-    // frame: hold a client reference and wait up to 3 s for the first JPEG.
-    // The web console holds a client reference for its whole lifetime, so
-    // the decoder stays warm for snapshot/MJPEG.
-    std::vector<uint8_t> jpg;
-    for (int i = 0; i < 30; ++i) {
-      jpg = weakHolder->webStream->LatestJpeg();
-      if (!jpg.empty()) break;
-      usleep(100 * 1000);
-    }
-    return jpg;
+    return weakHolder->webStream->LatestJpeg();
   });
   holder->http->SetInfoSource([weakHolder]() {
     if (weakHolder->webStream == nullptr) return std::string("no stream");
@@ -1086,8 +1724,8 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
                     std::chrono::steady_clock::now() - weakHolder->startWall)
                     .count();
     std::string s = "uptime_s=" + std::to_string(secs);
-    s += "\nresolution=" + std::to_string(weakHolder->streamWidth.load()) + "x" +
-         std::to_string(weakHolder->streamHeight.load());
+    const auto size = weakHolder->encodedSize.load();
+    s += "\nresolution=" + std::to_string(size.width) + "x" + std::to_string(size.height);
     s += "\ncodec=" +
          std::string(weakHolder->videoIsH265.load() ? "h265" : "h264");
     s += "\nrtsp_clients=" + std::to_string(weakHolder->server.ClientCount());
@@ -1097,11 +1735,14 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
     s += "\nencoder=rear";
     return s;
   });
+  holder->http->SetSizeCallbacks(
+      [weakHolder](ipcam::HttpServer::SizeList& list) { return weakHolder->RemoteSizeList(list); },
+      [weakHolder](int index) { return weakHolder->SelectRemoteSize(index); });
   holder->http->SetCommandSink([weakHolder](const std::string& cmd) {
-    weakHolder->HandleCameraCommand(cmd);
+    return weakHolder->HandleCameraCommand(cmd);
   });
   holder->http->SetVoiceSink([weakHolder](const std::vector<uint8_t>& body) {
-    switch (weakHolder->voice.Feed(body.data(), body.size())) {
+    switch (weakHolder->voice.FeedUpload(body.data(), body.size())) {
       case ipcam::VoicePlayer::FeedResult::Accepted:
         return ipcam::HttpServer::VoiceResult::Accepted;
       case ipcam::VoicePlayer::FeedResult::Invalid:
@@ -1114,55 +1755,12 @@ napi_value RtspStartHttp(napi_env env, napi_callback_info info) {
     return ipcam::HttpServer::VoiceResult::Unavailable;
   });
   holder->http->SetOpusStream(holder->opus.get());
-  holder->http->SetArchiveSource([weakHolder]() {
-    // Motion-detection clips go to filesDir/MD under their Android names
-    // (IPS_<date>.mp4, Android stores them in DCIM/IPCamera/MD) and are
-    // listed as MD/<name> so they stay distinguishable from manual records.
-    std::string out;
-    const struct {
-      const char* sub;
-      const char* prefix;
-      const char* listed;
-    } dirs[] = {{"", "ipc_", ""}, {"/MD", "IPS_", "MD/"}};
-    for (const auto& dir : dirs) {
-      std::string base = weakHolder->filesDir + dir.sub;
-      DIR* d = opendir(base.c_str());
-      if (d == nullptr) continue;
-      struct dirent* e = nullptr;
-      while ((e = readdir(d)) != nullptr) {
-        std::string name = e->d_name;
-        if (name.rfind(dir.prefix, 0) != 0 || name.find(".mp4") == std::string::npos) {
-          continue;
-        }
-        struct stat st{};
-        if (stat((base + "/" + name).c_str(), &st) == 0) {
-          out += std::string(dir.listed) + name + " " + std::to_string(st.st_size) + "\n";
-        }
-      }
-      closedir(d);
-    }
-    return out;
-  });
-  holder->http->SetArchiveFile([weakHolder](const std::string& name) -> int {
-    // Only filesDir and its MD subdirectory are reachable, and only with the
-    // two recording prefixes the recorder writes. HTTP paths arrive lowercased,
-    // so restore the canonical casing the recorder used on disk.
-    std::string dir = "/";
-    std::string file = name;
-    if (name.rfind("md/ips_", 0) == 0) {
-      dir = "/MD/";
-      file = "IPS_" + name.substr(7);  // the rest is digits, dots and dashes
-    }
-    if (name.find("..") != std::string::npos || file.find('/') != std::string::npos ||
-        (file.rfind("ipc_", 0) != 0 && file.rfind("IPS_", 0) != 0) ||
-        file.size() < 4 || file.compare(file.size() - 4, 4, ".mp4") != 0) {
-      return -1;
-    }
-    std::string full = weakHolder->filesDir + dir + file;
-    return ::open(full.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-  });
+  holder->http->SetFlvStream(holder->flv);
+  const auto archives = std::make_shared<ipcam::SafeArchiveDir>(holder->filesDir);
+  holder->http->SetArchiveSource([archives]() { return archives->List(); });
+  holder->http->SetArchiveFile([archives](const std::string& key) { return archives->OpenFile(key); });
   bool ok = holder->http->Start(static_cast<int>(port), userStr, passStr,
-                                holder->filesDir);
+                                holder->filesDir, allowLegacyVideoPassword);
   if (ok) {
     holder->webStream->IncClients();  // keep the web decoder warm
     holder->httpWebStreamActive = true;
@@ -1202,6 +1800,7 @@ napi_value RtspSetMotion(napi_env env, napi_callback_info info) {
   if (argc < 2) return InvalidArgs(env);
   ServerHolder* holder = HolderFromArg(env, argv[0]);
   if (holder == nullptr) return InvalidArgs(env);
+  std::lock_guard<std::mutex> control(holder->mediaControlMu);
   bool enabled = false;
   napi_get_value_bool(env, argv[1], &enabled);
   if (argc >= 3) {
@@ -1247,6 +1846,24 @@ napi_value RtspSetMotionTimeout(napi_env env, napi_callback_info info) {
   return result;
 }
 
+bool IsPrivateFontImport(const std::string& path) {
+  if (path.empty()) return true;  // explicit reset / legacy configuration
+  const auto split = path.rfind('/');
+  if (split == std::string::npos) return false;
+  const auto dir = path.substr(0, split), name = path.substr(split + 1);
+  // UIAbilityContext.filesDir in the entry module's default sandbox. Do not
+  // use caller-supplied HTTP filesDir, prefix matching, or arbitrary picker URIs.
+  if (dir != "/data/storage/el2/base/haps/entry/files" && dir != "/data/storage/el2/base/files") return false;
+  if (name.size() != 9 + 36 + 5 || name.compare(0, 9, "osd-font-") || name.compare(45, 5, ".font")) return false;
+  for (size_t i = 0; i < 36; ++i) {
+    const char c = name[9 + i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) { if (c != '-') return false; }
+    else if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F')) return false;
+  }
+  struct stat st{};
+  return lstat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 12 && st.st_size <= 32 * 1024 * 1024;
+}
+
 napi_value OsdSetConfig(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
@@ -1264,11 +1881,11 @@ napi_value OsdSetConfig(napi_env env, napi_callback_info info) {
     return out;
   };
   auto getInt = [&](const char* key, int def) {
-    double out = def;
+    int out = def;
     if (napi_get_named_property(env, argv[1], key, &v) == napi_ok && v != nullptr) {
-      napi_get_value_double(env, v, &out);
+      MediaInt(env, v, INT32_MIN, INT32_MAX, out);
     }
-    return static_cast<int>(out);
+    return out;
   };
   auto getStr = [&](const char* key) {
     char buf[512] = {0};
@@ -1299,6 +1916,9 @@ napi_value OsdSetConfig(napi_env env, napi_callback_info info) {
     return a << 24 | r << 16 | g << 8 | b;
   };
 
+  const auto fontPath = getStr("fontPath");
+  if (!IsPrivateFontImport(fontPath)) return MediaBool(env, false);
+  ipcam::SetOsdFontConfig(getInt("fontSize", 0), getStr("fontFamily"), fontPath);
   ipcam::SetOsdTextConfig(
       getBool("enabled", false), getInt("padding", 1), getInt("position", 0),
       getInt("fontStyle", 0), getHex("color", 0xFFFFFFFF), getBool("showTimestamp", true),
@@ -1393,17 +2013,22 @@ napi_value OsdSetWatermark(napi_env env, napi_callback_info info) {
   }
   OH_Pixelmap_ImageInfo* info2 = nullptr;
   uint32_t w = 0, h = 0;
+  int32_t alphaType = 0, pixelFormat = 0;
   bool ok = false;
   if (OH_PixelmapImageInfo_Create(&info2) == IMAGE_SUCCESS &&
       OH_PixelmapNative_GetImageInfo(pm, info2) == IMAGE_SUCCESS &&
       OH_PixelmapImageInfo_GetWidth(info2, &w) == IMAGE_SUCCESS &&
-      OH_PixelmapImageInfo_GetHeight(info2, &h) == IMAGE_SUCCESS && w > 0 && h > 0) {
+      OH_PixelmapImageInfo_GetHeight(info2, &h) == IMAGE_SUCCESS && w && h &&
+      static_cast<uint64_t>(w) * h <= 16 * 1024 * 1024 &&
+      OH_PixelmapImageInfo_GetPixelFormat(info2, &pixelFormat) == IMAGE_SUCCESS && pixelFormat == PIXEL_FORMAT_RGBA_8888 &&
+      OH_PixelmapImageInfo_GetAlphaType(info2, &alphaType) == IMAGE_SUCCESS) {
     size_t bytes = static_cast<size_t>(w) * h * 4;
     std::vector<uint8_t> buf(bytes);
     size_t got = bytes;
     if (OH_PixelmapNative_ReadPixels(pm, buf.data(), &got) == IMAGE_SUCCESS &&
         got == bytes) {
-      ipcam::SetOsdWatermarkPixels(buf.data(), static_cast<int>(w), static_cast<int>(h));
+      ipcam::SetOsdWatermarkPixels(buf.data(), static_cast<int>(w), static_cast<int>(h),
+                                   alphaType == PIXELMAP_ALPHA_TYPE_PREMULTIPLIED);
       ok = true;
     }
   }
@@ -1521,7 +2146,29 @@ napi_value OnvifScan(napi_env env, napi_callback_info info) {
 }
 
 napi_value Init(napi_env env, napi_value exports) {
+  RegisterRtspClient(env, exports);
+  RegisterRtmpViewer(env, exports);
+  if (RegisterRtmpTls(env, exports) != napi_ok) return nullptr;
+  if (cloud_archive_napi::Register(env, exports) != napi_ok) return nullptr;
   napi_property_descriptor props[] = {
+      {"serviceBoundV4Port", nullptr, ServiceBoundV4Port, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"serviceViewerCounts", nullptr, ServiceViewerCounts, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraToggleTorch", nullptr, CameraToggleTorch, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraDevices", nullptr, CameraDevices, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"encoderOptions", nullptr, EncoderOptions, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraFocusInfo", nullptr, CameraFocusInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraSetFocusMode", nullptr, CameraSetFocusMode, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraFocusAt", nullptr, CameraFocusAt, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraSetDualLayout", nullptr, CameraSetDualLayout, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraDualLayout", nullptr, CameraDualLayout, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"rtspMicFormat", nullptr, RtspMicFormat, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"rtspSetArchiveCallback", nullptr, RtspSetArchiveCallback, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"rtspTakePendingArchives", nullptr, RtspTakePendingArchives, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"rtspClearArchiveCallback", nullptr, RtspClearArchiveCallback, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraResolutions", nullptr, CameraResolutions, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraRemoteSizeState", nullptr, CameraRemoteSizeState, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraCaptureFps", nullptr, CameraCaptureFps, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cameraSetCaptureFps", nullptr, CameraSetCaptureFps, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"createRtspServer", nullptr, CreateServer, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"rtspStart", nullptr, RtspStart, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1552,6 +2199,9 @@ napi_value Init(napi_env env, napi_value exports) {
        napi_default, nullptr},
       {"rtspStartRecord", nullptr, RtspStartRecord, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"recordingFileBusy", nullptr, RecordingFileBusy, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"rtspIsRecording", nullptr, RtspIsRecording, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
       {"rtspStopRecord", nullptr, RtspStopRecord, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"rtspTakeSnapshot", nullptr, RtspTakeSnapshot, nullptr, nullptr, nullptr,
@@ -1566,6 +2216,7 @@ napi_value Init(napi_env env, napi_value exports) {
        napi_default, nullptr},
       {"rtspSetMotionTimeout", nullptr, RtspSetMotionTimeout, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"rtmpFailure", nullptr, RtmpFailure, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"rtmpStop", nullptr, RtmpStop, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"rtspStopMic", nullptr, RtspStopMic, nullptr, nullptr, nullptr,
@@ -1592,15 +2243,27 @@ napi_value Init(napi_env env, napi_value exports) {
     OH_NativeXComponent* xc = nullptr;
     if (napi_unwrap(env, exportInstance, reinterpret_cast<void**>(&xc)) == napi_ok &&
         xc != nullptr) {
+      char id[OH_XCOMPONENT_ID_LEN_MAX + 1]{};
+      uint64_t len = sizeof(id);
+      if (OH_NativeXComponent_GetXComponentId(xc, id, &len) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS ||
+          std::string(id) != "cameraPreview") return exports;
       static OH_NativeXComponent_Callback cb{};
-      cb.OnSurfaceCreated = [](OH_NativeXComponent* component, void* window) {
+      cb.OnSurfaceCreated = [](OH_NativeXComponent*, void* window) {
         uint64_t sid = 0;
         if (window != nullptr &&
             OH_NativeWindow_GetSurfaceId(reinterpret_cast<OHNativeWindow*>(window), &sid) ==
                 0) {
-          g_pendingPreviewId.store(sid);
           std::lock_guard<std::mutex> lk(g_holderMu);
+          g_pendingPreviewId.store(sid);
           if (g_holder != nullptr) g_holder->AttachCameraPreview(sid);
+        }
+      };
+      cb.OnSurfaceDestroyed = [](OH_NativeXComponent*, void* window) {
+        uint64_t sid = 0;
+        if (!window || OH_NativeWindow_GetSurfaceId(static_cast<OHNativeWindow*>(window), &sid) != 0) return;
+        std::lock_guard<std::mutex> lk(g_holderMu);
+        if (sid != 0 && g_pendingPreviewId.compare_exchange_strong(sid, 0) && g_holder) {
+          g_holder->AttachCameraPreview(0);
         }
       };
       OH_NativeXComponent_RegisterCallback(xc, &cb);

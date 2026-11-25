@@ -1,7 +1,11 @@
 # harmony-IPCamera
 
 Android 项目 `IPCameraJavaRestored`(com.shenyaocn.android.WebCam)的 HarmonyOS 移植工程。
-当前阶段:**RTSP 流媒体核心 POC**(路线 B:系统 Kit 替代 + 按 JNI 契约重新实现)。
+应用包含两条主要路径：在设备列表观看远端摄像头，或进入服务端将本机作为摄像头使用。当前支持范围、验证方式和平台差异以 [Android / Harmony 功能对照表](docs/compare.md) 为准；下文各阶段的设备记录是对应日期的历史结果，不代表新功能都已经过真机验收。
+
+- **本机服务端 → 服务端设置**：选择设备实际支持的镜头、采集和编码参数；具备并发能力的机型可用双摄合成。HTTP-FLV 的 `/live.flv` 提供标准 H.264 和可选 AAC；服务、广播及带凭据的兼容链接并非默认开启。
+- **设备列表 → 实时观看**：支持 RTSP、MJPEG，以及特定格式的 RTMP、HTTP-FLV 和 HLS；远端归档只访问用户选定的 HTTP(S) 服务器。对讲要分别确认录音和发送。
+- **服务端设置 → 交付与归档**：SMTP、FTP 默认关闭，OneDrive 需用户自行提供客户端 ID 并逐文件确认。真实外部端点及账号不能用回环测试代替。上传成功不会自动删除本地原件。OneDrive 只有在云端提供匹配的 SHA-256、文件仍是同一已封口分段，并且用户再确认这一个文件时，才允许手动清理。
 
 ## 关键背景
 
@@ -40,7 +44,7 @@ Android 项目 `IPCameraJavaRestored`(com.shenyaocn.android.WebCam)的 HarmonyOS
 ## 构建与运行
 
 ```bash
-# 命令行构建(未签名 HAP)
+# 命令行构建调试 HAP；是否产出签名包取决于本机签名配置
 export DEVECO_SDK_HOME="C:/Program Files/Huawei/DevEco Studio/sdk"
 "C:/Program Files/Huawei/DevEco Studio/tools/node/node.exe" \
   "C:/Program Files/Huawei/DevEco Studio/tools/hvigor/bin/hvigorw.js" \
@@ -48,14 +52,26 @@ export DEVECO_SDK_HOME="C:/Program Files/Huawei/DevEco Studio/sdk"
 ```
 
 1. DevEco Studio 打开工程,File → Project Structure → Signing Configs 勾选
-   **Automatically generate signature**(当前构建产物为未签名 HAP)。
+   **Automatically generate signature**，或使用已配置且获该设备授权的调试签名。安装 `entry/build/default/outputs/default/entry-default-signed.hap`，不要把 `-unsigned.hap` 当作可直接安装的包。
 2. 运行到真机/模拟器(需与 PC 同一 WLAN)。
-3. 点 **启动服务** → **开启测试流**。
+3. 默认首页是摄像头列表。要观看远端设备，添加地址后点设备进入播放器；要把本机当作摄像头，先进入**本机服务端**，再启动服务和相机。只验证 RTSP 协议时，也可以用测试图案代替相机。
 4. PC 验证:
    ```bash
    ffplay -fflags nobuffer rtsp://<设备IP>:8554/live
    # 或 VLC: rtsp://admin:admin@<设备IP>:8554/live
    ```
+
+### 验收「本机采集 → 移动录像 → 回放」
+
+在目标手机上手动启动服务和相机，选择要验收的编码，开启移动侦测。等布防结束后在镜头前移动，再等活动超时停录。在手机的**录像回放**中打开本次新增的 `MD` 条目，核对画面，拖动进度并返回服务页，确认实时预览仍在更新。
+
+主机可独立验证网络输出。将 SDK 的 `hdc` 加入 PATH，选定 `hdc list targets` 显示的真机 ID。以下假设已有仅在主机回环监听的转发：`18554 → 设备 RTSP 端口`、`18081 → 设备 HTTP 端口`。用 `hdc -t <设备ID> fport ls` 核对归属与方向，并用系统工具确认监听地址为回环；不要为测试开放局域网端口。要验收归档，请在手机上另外开启网页控制台和 Basic 认证。
+
+```bash
+python tests/device_stream_smoke.py --device "<设备ID>" --rtsp-port 18554 --http-port 18081 --prompt
+```
+
+不测归档时可省略 `--http-port`。脚本不会安装应用、启动相机、触发录像或创建转发；它检查实际 RTP 视频包、移动录像列表和 MP4 文件头，不保存画面。**脚本通过不证明本次移动触发了录像，也不证明解码出画**，仍需完成上面的手机回放和观看端实播。
 
 ## 真机验证记录(2026-09-27,华为畅享 90 Plus / HarmonyOS 7.0)
 
@@ -154,7 +170,8 @@ MP4 录像 24MB(hvc1+hvcC+mp4a 结构校验通过);抓拍 BMP 1280x720 画面经
 | 功能 | 实现 |
 |---|---|
 | HTTP 服务器 | http_server.cpp:Basic 认证、Keep-Alive、多端点路由 |
-| /serverinfo /size | 运行时间/分辨率/编码/客户端数/移动侦测/手电筒状态 |
+| `/serverinfo` | 运行时间、编码输出尺寸、编码格式、客户端数、移动侦测及手电筒状态 |
+| `GET /size`、`GET /sizeN` | 枚举已开启镜头的采集尺寸，或切换至该列表的第 N 项（从 0 开始）。网页控制台提供选择按钮。默认列表兼容 Android 的文本菜单；`/size?format=json` 返回 `currentIndex` 和 `sizes`。 |
 | /snapshot.jpg /getsnapshot | WebStream 冷解码缓存关键帧→NV12→自研 JPEG 编码器(自建合法 Huffman 表) |
 | /video | multipart/x-mixed-replace MJPEG(相同 JPEG 管线) |
 | /light | 原生手电筒开关(OH_CameraManager_SetTorchMode) |
@@ -163,6 +180,10 @@ MP4 录像 24MB(hvc1+hvcC+mp4a 结构校验通过);抓拍 BMP 1280x720 画面经
 | /put_voice | AAC ADTS 语音上传 → OH_AudioDecoder 解码 → OH_AudioRenderer 播放(对讲) |
 | 移动侦测 | WebStream 帧差分(32×18 亮度网格 3×3 均值采样,阈值 25),事件走 TSFN 回调;开关/自动录像见下节 |
 | UI | 网页端口设置、启动/停止网页、移动侦测开关、HTTP URL 显示 |
+
+**远程换分辨率（#30）**：打开本机相机和网页控制台，用 Basic 认证访问控制台，或先读 `GET /size?format=json`，再按返回的零基索引请求 `GET /sizeN`。索引只对应当前镜头，换镜头后重新读取，不能把 `/size0` 当作固定分辨率。成功返回 `200` 空正文；再读列表即可核对 `currentIndex`。采集尺寸可能与旋转后的编码输出宽高不同。
+
+无此档位返回 `404`，相机未开启返回 `503`。录像、移动侦测、RTMP 发布中或连接中、已有 RTSP 会话、快照处理中或多个 MJPEG 观看者会阻止重配，返回 `409`。目标档启动失败返回 `500`，程序尝试恢复旧配置；如恢复也失败，服务页会显示相机已停。远端选择不覆盖手机上保存的偏好。本项仅做了 HTTP 回环、主机相机替身与打包验证，未实测真机换档。
 
 **验证**:serverinfo(401→auth→正确 JSON 文本)、camswitch 原生切换成功、
 snapshot.bmp 1280×720 目检正确(USB 线+织物纹理)、MP4 录像 24MB(hvc1 结构正确)。
@@ -224,8 +245,7 @@ Typography 每秒栅格化一次文字层(系统全局 FontCollection)→ 文字
 样式热调、水印选图链路可用。
 
 **已知限制**:GPS 行需授权(未授权时显示 "GPS Waiting");水印缩放为最近邻;编码器 buffer
-模式下 pts 由本机单调钟生成;测试机存在微信浮窗抢前台导致后台被杀(与 OSD 无关,开麦克风
-连续任务保活可规避)。
+模式下 pts 由本机单调钟生成;系统可能在应用退入后台后回收资源。录音连续任务只适用于实际录音，不授予后台摄像权限，也不保证推流常驻。
 
 ## P2 自动启动系列(已完成,真机验证通过 2026-09-28)
 
@@ -236,7 +256,7 @@ Typography 每秒栅格化一次文字层(系统全局 FontCollection)→ 文字
 | 启动即开服务 | `auto_rtsp_after_turn_on` | 页面加载后自动 `rtspStart`(Index.aboutToAppear) |
 | 启动即推 RTMP | `auto_rtmp_after_turn_on` | 服务起来后自动 `rtmpStart`(连接异步化,失败走错误回调) |
 | 客户端连入自动开摄 | `start_camera_on_connect`(默认开) | 状态回调 Connected 事件 → `startCameraNow()` |
-| 开机自启 | `Start_on_boot` | **平台受限**:HarmonyOS 第三方应用无法编程式授权自启,`autoStartupManager` 仅提供 `getAutoStartupStatusForSelf()` 查询(API 21)。UI 保留开关并持久化,开启时提示用户到 系统设置>应用>IPCamera>启动管理 手动放行,并回读系统状态输出到日志 |
+| 开机自启 | `Start_on_boot` | **平台受限**:HarmonyOS 第三方应用无法编程式授权自启,`autoStartupManager` 仅提供 `getAutoStartupStatusForSelf()` 查询(API 21)。页面仅查询系统授权状态，不提供能改变系统授权的应用内开关；是否有系统设置入口取决于设备 |
 
 **真机验证**(华为畅享 90 Plus):拉起应用零点击即 "● RUNNING"(自启服务);PC 端
 Python RTMP 测试服务器收到完整 handshake→connect→createStream→publish→onMetaData(自启
@@ -281,7 +301,9 @@ Android Web 控制台的听声端点,鸿蒙补齐:
 
 ## 阶段 8:ONVIF/播放器侧(已完成,真机验证通过 2026-09-28)
 
-对照 Android 播放器侧四大 Activity 的鸿蒙实现:
+以下是 2026-09-28 版本的历史记录，不代表当前实现。当前版本从设备列表进入观看端，HTTP(S) MJPEG 直接分帧显示，RTSP/TCP 的 H.264 和 H.265 Main（8 位 4:2:0）视频使用原生播放器，不再复制地址代替播放；本机回放包含手动和移动侦测录像。支持范围与剩余差距见 [Android 功能对照表](docs/compare.md)。
+
+当时对照 Android 播放器侧四大 Activity 的实现：
 
 | Android | 鸿蒙 | 说明 |
 |---|---|---|
@@ -386,6 +408,20 @@ python tests/preview_lifetime_test.py
 python tests/motion_state_test.py
 python tests/recorder_archive_test.py
 python tests/aac_framing_test.py
+python tests/protocol_units_test.py
+```
+
+设备管理、冷启动、直播分帧与回放、RTMP 地址和重试控制可在 Node.js 22.18+ 上运行：
+
+```bash
+node --test tests/*.cjs
+```
+
+浏览器录像归档与 RTSP 会话互通测试使用本机套接字，不需要真实摄像头。在有 Python 3 和 C++17 编译器的 Linux / WSL 环境运行：
+
+```bash
+python3 tests/http_recordings_test.py
+python3 tests/rtsp_interop_test.py
 ```
 
 ## 阶段 7(远期,未排期)

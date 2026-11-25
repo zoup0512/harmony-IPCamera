@@ -35,17 +35,21 @@ class MicStreamer {
   MicStreamer& operator=(const MicStreamer&) = delete;
 
   bool Start(int sampleRate, int channels, int bitrate, FrameSink sink, ErrorSink onError);
+  // Control-thread API: read only after Start succeeds, before Stop.
+  int SampleRate() const { return IsRunning() ? sampleRate_ : 0; }
+  int Channels() const { return IsRunning() ? channels_ : 0; }
   void Stop();
   bool IsRunning() const { return running_.load(); }
   // Raw PCM tap for side consumers (e.g. the /audio.opus Opus encoder). The
   // handler runs on the capturer callback thread and must not block.
   void SetPcmTap(
       std::function<void(const uint8_t*, size_t, int sampleRate, int channels)> tap) {
+    std::lock_guard<std::mutex> lk(stateMu_);
     pcmTap_ = std::move(tap);
   }
 
  private:
-  void Fail(const std::string& what, int err);
+  bool TryFormat(int rate, int channels, int bitrate, std::string& error);
 
   static int32_t OnReadData(OH_AudioCapturer* capturer, void* userData, void* buffer,
                             int32_t bufferLen);
@@ -80,6 +84,9 @@ class MicStreamer {
   std::deque<PendingInput> pendingInputs_;
   FrameSink sink_;
   ErrorSink onError_;
+  // A codec can invoke onError synchronously during Prepare/Start even when
+  // the SDK call itself returns success. Latch it while negotiating.
+  int codecError_ = 0;
   std::mutex stateMu_;
   std::function<void(const uint8_t*, size_t, int, int)> pcmTap_;
 };

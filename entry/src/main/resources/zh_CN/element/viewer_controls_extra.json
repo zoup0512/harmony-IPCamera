@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "viewer_tcp_transport", "value": "传输：TCP（默认）" },
+    { "name": "viewer_udp_only", "value": "UDP 单播 · 仅视频（无 AAC）" },
+    { "name": "viewer_udp_hint", "value": "点击传输方式可切换。UDP 单播只传视频，不含 AAC；不可用时不会回退到 TCP。" },
+    { "name": "viewer_udp_unavailable", "value": "RTSP UDP 单播不可用，不会回退到 TCP。" },
+    { "name": "viewer_pip_busy", "value": "请先退出画中画，再播放其他视频。" }
+  ]
+}

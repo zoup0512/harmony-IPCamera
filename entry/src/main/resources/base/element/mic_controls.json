@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "mic_preferred_format",
+      "value": "Preferred microphone format"
+    },
+    {
+      "name": "mic_actual_format",
+      "value": "Capturing at"
+    },
+    {
+      "name": "mic_rate_auto",
+      "value": "Auto"
+    },
+    {
+      "name": "mic_mono",
+      "value": "Mono"
+    },
+    {
+      "name": "mic_stereo",
+      "value": "Stereo"
+    }
+  ]
+}

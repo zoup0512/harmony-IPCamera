@@ -1,0 +1,368 @@
+{
+  "string": [
+    {
+      "name": "viewer_choose_auth",
+      "value": "Select Basic or Digest for RTSP, then press Play."
+    },
+    {
+      "name": "viewer_limits",
+      "value": "Unsupported {0} stream parameters"
+    },
+    {
+      "name": "viewer_codec",
+      "value": "This device cannot decode {0} video"
+    },
+    {
+      "name": "viewer_initial",
+      "value": "Select Play to connect"
+    },
+    {
+      "name": "viewer_system_error",
+      "value": "{0} playback failed. Check the stream, network and device codec support."
+    },
+    {
+      "name": "viewer_http_auth",
+      "value": "HTTP {0}: check the username, password or stream token."
+    },
+    {
+      "name": "viewer_http_error",
+      "value": "HTTP request failed ({0})"
+    },
+    {
+      "name": "viewer_video",
+      "value": "video"
+    },
+    {
+      "name": "viewer_rtsp_auth",
+      "value": "RTSP authentication or permission denied. Check the credentials and access rights."
+    },
+    {
+      "name": "viewer_tracks",
+      "value": "No compatible H.264 or H.265 video track"
+    },
+    {
+      "name": "viewer_rtp_tcp",
+      "value": "This camera does not support RTP over TCP"
+    },
+    {
+      "name": "viewer_rtsp_session",
+      "value": "Invalid RTSP session or request rejected by camera"
+    },
+    {
+      "name": "viewer_frame_timeout",
+      "value": "Timed out waiting for video"
+    },
+    {
+      "name": "viewer_rtsp_digest",
+      "value": "Authentication challenge incompatible with the selected RTSP mode. No fallback."
+    },
+    {
+      "name": "viewer_rtsp_error",
+      "value": "RTSP connection failed or was closed"
+    },
+    {
+      "name": "viewer_enter",
+      "value": "Enter a stream address"
+    },
+    {
+      "name": "viewer_stopped",
+      "value": "Stopped"
+    },
+    {
+      "name": "viewer_rtmp",
+      "value": "Use rtmp://host/app/stream without a username, password or Digest."
+    },
+    {
+      "name": "viewer_connecting",
+      "value": "Connecting…"
+    },
+    {
+      "name": "viewer_rtsps",
+      "value": "RTSPS is not supported. The connection will not be downgraded."
+    },
+    {
+      "name": "viewer_public_url",
+      "value": "HLS requires a public URL without credentials. HLS and FLV URLs cannot contain query parameters."
+    },
+    {
+      "name": "viewer_invalid",
+      "value": "Invalid address or credentials"
+    },
+    {
+      "name": "viewer_archives_error",
+      "value": "Could not open remote recordings"
+    },
+    {
+      "name": "viewer_playing",
+      "value": "Playing · "
+    },
+    {
+      "name": "viewer_completed",
+      "value": "Playback finished"
+    },
+    {
+      "name": "viewer_rtsp_start",
+      "value": "Could not start the RTSP player"
+    },
+    {
+      "name": "viewer_audio_unavailable",
+      "value": "Audio output unavailable"
+    },
+    {
+      "name": "viewer_no_audio",
+      "value": "No compatible audio track"
+    },
+    {
+      "name": "viewer_muted",
+      "value": "Muted"
+    },
+    {
+      "name": "viewer_waiting_audio",
+      "value": "Waiting for AAC audio"
+    },
+    {
+      "name": "viewer_listening",
+      "value": "Listening to AAC"
+    },
+    {
+      "name": "viewer_timeout",
+      "value": "Timed out waiting for playable video"
+    },
+    {
+      "name": "viewer_mjpeg_invalid",
+      "value": "Invalid MJPEG framing or oversized image"
+    },
+    {
+      "name": "viewer_mjpeg_end",
+      "value": "MJPEG stream ended"
+    },
+    {
+      "name": "viewer_not_mjpeg",
+      "value": "Not an MJPEG stream; no web page was opened"
+    },
+    {
+      "name": "viewer_redirect",
+      "value": "HTTP redirect blocked to protect credentials"
+    },
+    {
+      "name": "viewer_http_network",
+      "value": "HTTP connection failed. Check the address, network or TLS certificate."
+    },
+    {
+      "name": "viewer_mjpeg_playing",
+      "value": "Playing · MJPEG"
+    },
+    {
+      "name": "viewer_jpeg_decode",
+      "value": "JPEG is oversized or could not be decoded"
+    },
+    {
+      "name": "viewer_title",
+      "value": "Live view"
+    },
+    {
+      "name": "viewer_address",
+      "value": "HTTP(S) MJPEG / .m3u8 / .flv, RTSP or RTMP"
+    },
+    {
+      "name": "viewer_user",
+      "value": "Username (optional)"
+    },
+    {
+      "name": "viewer_password",
+      "value": "Password (optional)"
+    },
+    {
+      "name": "viewer_retry",
+      "value": "Retry"
+    },
+    {
+      "name": "viewer_play",
+      "value": "Play"
+    },
+    {
+      "name": "viewer_stop",
+      "value": "Stop"
+    },
+    {
+      "name": "viewer_fullscreen",
+      "value": "Full screen"
+    },
+    {
+      "name": "viewer_archives",
+      "value": "Remote recordings"
+    },
+    {
+      "name": "viewer_adts",
+      "value": "Format: Harmony ADTS"
+    },
+    {
+      "name": "viewer_m4a",
+      "value": "Format: Android M4A"
+    },
+    {
+      "name": "viewer_record_voice",
+      "value": "Record voice"
+    },
+    {
+      "name": "viewer_send_voice",
+      "value": "Send to device"
+    },
+    {
+      "name": "viewer_cancel",
+      "value": "Cancel"
+    },
+    {
+      "name": "viewer_unmute",
+      "value": "Unmute"
+    },
+    {
+      "name": "viewer_mute",
+      "value": "Mute"
+    },
+    {
+      "name": "viewer_exit_full",
+      "value": "Exit full screen"
+    },
+    {
+      "name": "viewer_help",
+      "value": "RTSP/TCP: H.264 and H.265 (8-bit, up to 1080p), select Basic or Digest explicitly. RTMP supports AVC video and AAC-LC audio only; no RTMPS, HEVC or account authentication. Audio starts muted. Public HLS (.m3u8) and HTTP-FLV (.flv) use the system player; codec support varies. For protected FLV, Basic is sent only on the selected URL; redirects are blocked. Use cleartext HTTP/RTSP/RTMP only on trusted networks. Voice goes only to the selected HTTP(S) device; choose ADTS for older Harmony receivers."
+    },
+    {
+      "name": "viewer_voice_recording",
+      "value": "Recording (up to {0} seconds). Nothing is sent automatically."
+    },
+    {
+      "name": "viewer_voice_rejected",
+      "value": "Device rejected the clip (HTTP {0}). Check the receiving format."
+    },
+    {
+      "name": "viewer_voice_permission",
+      "value": "Waiting for microphone permission…"
+    },
+    {
+      "name": "viewer_voice_denied",
+      "value": "Permission not granted. Nothing was recorded or sent."
+    },
+    {
+      "name": "viewer_voice_error",
+      "value": "Recording error"
+    },
+    {
+      "name": "viewer_voice_ready",
+      "value": "Time limit reached. Send or discard the clip."
+    },
+    {
+      "name": "viewer_voice_start_error",
+      "value": "Could not start recording. Check permissions and format support."
+    },
+    {
+      "name": "viewer_voice_sending",
+      "value": "Sending voice…"
+    },
+    {
+      "name": "viewer_voice_ok",
+      "value": "Device accepted the clip"
+    },
+    {
+      "name": "viewer_voice_auth",
+      "value": "Voice upload authentication failed"
+    },
+    {
+      "name": "viewer_voice_redirect",
+      "value": "Voice upload redirect blocked"
+    },
+    {
+      "name": "viewer_voice_failed",
+      "value": "Could not send the clip. No automatic retry."
+    },
+    {
+      "name": "viewer_device_url_hint",
+      "value": "http://, rtsp:// or rtmp://…"
+    },
+    {
+      "name": "viewer_device_invalid_url",
+      "value": "Enter an HTTP(S), RTSP(S), or rtmp://host/app/stream URL. RTMP does not accept sign-in credentials."
+    },
+    {
+      "name": "viewer_rtmps",
+      "value": "RTMPS is not supported. No cleartext fallback."
+    },
+    {
+      "name": "viewer_digest_login",
+      "value": "Digest requires an RTSP address, username and password."
+    },
+    {
+      "name": "viewer_rtsp_basic_mode",
+      "value": "RTSP authentication: Basic"
+    },
+    {
+      "name": "viewer_rtsp_digest_mode",
+      "value": "RTSP authentication: Digest"
+    },
+    {
+      "name": "viewer_retry_option",
+      "value": "Reconnect MJPEG/RTSP after a disconnect (up to 3 times)"
+    },
+    {
+      "name": "viewer_reconnecting",
+      "value": "Reconnecting in {0} s"
+    },
+    {
+      "name": "viewer_rtmp_network",
+      "value": "RTMP connection failed or was lost"
+    },
+    {
+      "name": "viewer_rtmp_denied",
+      "value": "RTMP server rejected playback"
+    },
+    {
+      "name": "viewer_rtmp_codec",
+      "value": "Unsupported RTMP video codec or AVC parameters"
+    },
+    {
+      "name": "viewer_rtmp_transport",
+      "value": "Unsupported RTMP transport or handshake"
+    },
+    {
+      "name": "viewer_rtmp_protocol",
+      "value": "Invalid RTMP address or protocol"
+    },
+    {
+      "name": "viewer_rtmp_decode",
+      "value": "RTMP decoder or surface failed"
+    },
+    {
+      "name": "viewer_rtmp_enhanced",
+      "value": "Enhanced RTMP video is not supported"
+    },
+    {
+      "name": "viewer_rtmp_end",
+      "value": "RTMP stream ended"
+    },
+    {
+      "name": "viewer_rtmp_busy",
+      "value": "RTMP player is busy"
+    },
+    {
+      "name": "viewer_rtmp_hevc",
+      "value": "RTMP HEVC is not supported; use AVC"
+    },
+    {
+      "name": "viewer_rtmp_missing",
+      "value": "RTMP stream not found"
+    },
+    {
+      "name": "viewer_rtmp_aggregate",
+      "value": "RTMP aggregate messages are not supported"
+    },
+    {
+      "name": "viewer_rtmp_start",
+      "value": "Could not start the RTMP viewer"
+    },
+    {
+      "name": "viewer_rtmp_audio",
+      "value": "Unsupported audio (AAC-LC only)"
+    }
+  ]
+}

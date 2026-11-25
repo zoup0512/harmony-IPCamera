@@ -1,0 +1,12 @@
+{
+  "string": [
+    { "name": "pip_enter", "value": "Picture-in-picture" },
+    { "name": "pip_exit", "value": "Exit picture-in-picture" },
+    { "name": "pip_external", "value": "Video is in the system picture-in-picture window." },
+    { "name": "pip_transition", "value": "Switching video window…" },
+    { "name": "pip_stop_failed", "value": "The system did not confirm closing picture-in-picture. Try exiting again." },
+    { "name": "pip_unavailable", "value": "System picture-in-picture is unavailable. Use fullscreen instead." },
+    { "name": "pip_surface_lost", "value": "The video surface is no longer available for picture-in-picture." },
+    { "name": "pip_interrupted", "value": "System picture-in-picture was interrupted." }
+  ]
+}

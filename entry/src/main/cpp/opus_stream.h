@@ -13,6 +13,8 @@
 
 #include <multimedia/player_framework/native_avcodec_base.h>
 
+#include "opus_pcm.h"
+
 namespace ipcam {
 
 // Live Opus audio stream for the web console (/audio.opus), mirroring the
@@ -33,8 +35,14 @@ class OpusStream {
   // MicStreamer taps raw S16LE interleaved PCM through here.
   void FeedPcm(const uint8_t* pcm, size_t bytes, int sampleRate, int channels);
   // Reflects whether the microphone capture is running (HTTP 503 otherwise).
-  void SetSourceActive(bool active) { sourceActive_.store(active); }
+  void SetSourceActive(bool active, int sampleRate = 48000, int channels = 1);
   bool SourceActive() const { return sourceActive_.load(); }
+  unsigned ViewerCount() {
+    std::lock_guard<std::mutex> lk(clientsMu_);
+    unsigned count = 0;
+    for (const auto& client : clients_) if (!client->closed.load()) ++count;
+    return count;
+  }
 
   // Encoder availability probe/creation. Returns false when the system has
   // no Opus encoder (route answers 501 "not supported").
@@ -51,7 +59,9 @@ class OpusStream {
   struct Client {
     int fd = -1;
     std::deque<std::vector<uint8_t>> pages;
-    bool closed = false;
+    std::atomic<bool> closed{false};
+    uint32_t sequence = 2;  // OpusHead and OpusTags precede the first audio page.
+    uint64_t granule = 0;
   };
 
   static void OnError(OH_AVCodec* codec, int32_t errorCode, void* userData);
@@ -62,22 +72,27 @@ class OpusStream {
                               OH_AVCodecBufferAttr* attr, void* userData);
 
   bool CreateEncoderLocked();
-  void DestroyEncoderLocked(std::unique_lock<std::mutex>& lk);
+  void DestroyEncoderLocked();
+  void CloseClientsLocked();
   void DrainPendingInputs();
-  void BroadcastPage(const std::vector<uint8_t>& page);
+  void BroadcastPacket(const std::vector<uint8_t>& packet, unsigned ticks);
   static std::vector<uint8_t> BuildOggPage(uint8_t headerType, uint64_t granule,
                                            uint32_t serial, uint32_t sequence,
                                            const std::vector<uint8_t>& packet);
-  static std::vector<uint8_t> BuildOpusHead();
+  static std::vector<uint8_t> BuildOpusHead(int inputRate, int encodedChannels);
   static std::vector<uint8_t> BuildOpusTags();
 
-  // encoder state (guarded by pcmMu_)
+  // Serialize lifecycle operations, never acquire this from a codec callback.
+  std::mutex controlMu_;
+  // PCM queue, input slots and published encoder handle.
   std::mutex pcmMu_;
   OH_AVCodec* encoder_ = nullptr;
   std::atomic<bool> encoderFailed_{false};
   bool readyChecked_ = false;
   bool encoderAvailable_ = false;
   bool inputFloat_ = false;  // encoder configured for F32LE input (else S16LE)
+  OpusPcmConverter converter_;
+  int encRate_ = 48000;
   int encChannels_ = 1;      // encoder channel count (stereo fallback = 2)
   int sampleRate_ = 48000;
   int channels_ = 1;
@@ -98,7 +113,7 @@ class OpusStream {
   std::condition_variable clientsCv_;
   std::vector<std::shared_ptr<Client>> clients_;
   uint32_t pageSerial_ = 0x4950434DU;  // 'IPCM'
-  uint32_t pageSequence_ = 0;
+
 
   std::atomic<bool> sourceActive_{false};
 };

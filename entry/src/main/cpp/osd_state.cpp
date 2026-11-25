@@ -1,5 +1,6 @@
 #include "osd_state.h"
 
+#include <algorithm>
 #include <mutex>
 
 namespace ipcam {
@@ -18,7 +19,8 @@ OsdSnapshot GetOsd() {
 
 bool OsdEnabled() {
   std::lock_guard<std::mutex> lk(g_mu);
-  return g_osd.enabled;
+  // Select buffer mode even before asynchronous watermark decoding completes.
+  return g_osd.enabled || g_osd.wmEnabled;
 }
 
 void SetOsdEnabled(bool enabled) {
@@ -45,6 +47,13 @@ void SetOsdTextConfig(bool enabled, int padding, int position, int fontStyle,
   g_osd.showGps = showGps;
   g_osd.speedMph = speedMph;
   g_osd.customText = customText;
+}
+
+void SetOsdFontConfig(int size, const std::string& family, const std::string& path) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_osd.fontSize = size < 0 ? 0 : (size > 128 ? 128 : size);
+  g_osd.fontFamily = family;
+  g_osd.fontPath = path;
 }
 
 void SetOsdDeviceName(const std::string& name) {
@@ -79,10 +88,21 @@ void SetOsdWatermarkConfig(bool enabled, int padding, int maxAreaPercent,
   g_osd.wmPosition = position & 0x3;
 }
 
-void SetOsdWatermarkPixels(const uint8_t* rgba, int width, int height) {
+void SetOsdWatermarkPixels(const uint8_t* rgba, int width, int height, bool premultiplied) {
   if (rgba == nullptr || width <= 0 || height <= 0) return;
   size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
-  auto pixels = std::make_shared<const std::vector<uint8_t>>(rgba, rgba + bytes);
+  auto pixels = std::make_shared<std::vector<uint8_t>>(rgba, rgba + bytes);
+  // PixelMap may store premultiplied channels. Normalize once on import; the
+  // watermark scaler/blender consumes straight alpha even across restarts.
+  if (premultiplied) {
+    for (size_t i = 0; i < bytes; i += 4) {
+      const int a = (*pixels)[i + 3];
+      if (a == 0 || a == 255) continue;
+      for (size_t c = i; c < i + 3; ++c) {
+        (*pixels)[c] = static_cast<uint8_t>(std::min(255, ((*pixels)[c] * 255 + a / 2) / a));
+      }
+    }
+  }
   std::lock_guard<std::mutex> lk(g_mu);
   g_osd.wmPixels = std::move(pixels);
   g_osd.wmWidth = width;

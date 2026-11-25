@@ -1,0 +1,23 @@
+{
+  "string": [
+    {"name": "addon_lan_http", "value": "HTTP 网页服务"},
+    {"name": "addon_lan_rtsp", "value": "RTSP 视频服务"},
+    {"name": "addon_lan_announce_http", "value": "广播 HTTP 网页服务"},
+    {"name": "addon_lan_announce_rtsp", "value": "广播 RTSP 视频服务"},
+    {"name": "addon_lan_unsupported", "value": "此设备不支持 mDNS"},
+    {"name": "addon_lan_retry", "value": "重试广播操作"},
+    {"name": "addon_lan_title", "value": "局域网服务广播"},
+    {"name": "addon_lan_trust", "value": "开启后，同一局域网的设备可发现对应的本机服务和监听端口。请仅在可信网络使用，并为服务设置登录凭据。"},
+    {"name": "addon_lan_lifetime", "value": "开关仅在本次应用进程内有效，默认关闭。广播不会启动服务；服务停止时撤销广播。"},
+    {"name": "addon_lan_public", "value": "公网访问"},
+    {"name": "addon_lan_exposure", "value": "局域网广播不会开放公网端口。远程访问建议使用 VPN。"},
+    {"name": "addon_lan_lease", "value": "可选 IGDv2 网关租约"},
+    {"name": "addon_lan_withdrawing", "value": "正在撤销端口 %d 的广播"},
+    {"name": "addon_lan_published", "value": "已广播 · TCP %d"},
+    {"name": "addon_lan_off", "value": "未广播"},
+    {"name": "addon_lan_waiting", "value": "等待本机服务启动"},
+    {"name": "addon_lan_publishing", "value": "正在广播 · TCP %d"},
+    {"name": "addon_lan_withdraw_failed", "value": "端口 %d 的广播未确认撤销，请重试"},
+    {"name": "addon_lan_registration_failed", "value": "局域网广播注册失败，请重试"}
+  ]
+}

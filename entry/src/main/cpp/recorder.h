@@ -28,9 +28,19 @@ class StreamRecorder {
  public:
   using ErrorSink = std::function<void(const std::string&)>;
 
+  enum class CloseReason { Rotation, Stop };
+  struct CompletedFile {
+    std::string path;
+    int segmentIndex;  // 1-based; the first file uses the original path
+    uint64_t sizeBytes;  // finalized file size, not encoded payload size
+    CloseReason reason;
+  };
+  using CompletedSink = std::function<void(const CompletedFile&)>;
+
   struct Options {
     bool fourGbLimit = true;    // four_gb_limit
     int segmentMinutes = 10;    // each_segment_length, 0 disables time rotation
+    bool includeAudio = true;   // accept shared AAC; never change the stream encoder
   };
 
   StreamRecorder() = default;
@@ -39,9 +49,21 @@ class StreamRecorder {
   StreamRecorder& operator=(const StreamRecorder&) = delete;
 
   // rotation: camera orientation in degrees (written as MP4 rotation matrix).
-  bool Start(const std::string& filePath, int rotation, ErrorSink onError);
+  // Serialize Start/Stop on the control thread. Paths must be new (no overwrite).
+  // Completion sinks run on the writer after close: copy/queue the event and
+  // return; never block on uploads, call Start/Stop, or destroy the recorder here.
+  bool Start(const std::string& filePath, int rotation, ErrorSink onError,
+             CompletedSink onCompleted = {});
+  // Path-only alternative to onCompleted. Configure before Start. An explicit
+  // onCompleted argument overrides this default for that session.
+  void SetArchiveSink(std::function<void(const std::string&)> sink);
   void Stop();
   bool IsRecording() const { return running_.load(); }
+  bool IsWritingPath(const std::string& path) const {
+    std::lock_guard<std::mutex> lock(pathMu_);
+    const int index = writingSegment_.load();
+    return index > 0 && path == SegmentPath(filePath_, index);
+  }
   void SetOptions(const Options& options);
 
   // tsUs is an absolute monotonic timestamp in microseconds; -1 means missing.
@@ -83,7 +105,7 @@ class StreamRecorder {
   bool WriteItem(const Item& item, bool videoIsH265);
   bool Enqueue(Item item);
   void ReportFatalError(const std::string& message);
-  void DestroyMuxerAndClose();
+  bool CloseSegment(CloseReason reason, bool publish);
   // Closes the current file and opens the next numbered segment reusing the
   // active codec params; the timestamp base resets on the incoming random-access frame.
   bool RotateSegment(const VideoParams& videoParams, bool audioSeen,
@@ -99,7 +121,11 @@ class StreamRecorder {
   ErrorSink onError_;
   std::mutex errMu_;
   bool errorReported_ = false;
-  Options options_;
+  mutable std::mutex pathMu_;
+  Options options_;  // defaults for the next Start, under queueMu_
+  Options activeOptions_;  // immutable for the lifetime of the writer
+  CompletedSink defaultSink_;
+  CompletedSink onCompleted_;
 
   std::mutex queueMu_;
   std::condition_variable queueCv_;
@@ -120,6 +146,7 @@ class StreamRecorder {
   bool pendingBaseReset_ = false;
   bool discardLeadingPictures_ = false;
   // segmentation state, owned by the writer thread
+  std::atomic<int> writingSegment_{0};  // published until the MP4 is finalized and closed
   int segmentIndex_ = 0;
   uint64_t segmentBytes_ = 0;
   std::chrono::steady_clock::time_point segmentStart_;

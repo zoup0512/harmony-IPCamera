@@ -7,7 +7,7 @@ Covers production code compiled as-is:
   * RtmpChunkParser (rtmp_chunk_parser.h): fmt 0-3 headers, fmt-3 messages that
     reuse the previous header, extended timestamps on fmt-3 chunks,
     SetChunkSize, interleaved chunk streams, byte-by-byte delivery, and
-    connect/publish rejection detection.
+    exact delivery of reassembled commands.
   * MergeParamSets (param_sets.h): per-NAL-type replacement, bounded size,
     VPS/SPS/PPS ordering, codec switches.
   * RtspPathMatches (extracted from rtsp_server.cpp on every run).
@@ -113,12 +113,16 @@ struct Feed {
   RtmpChunkParser parser{4u * 1024u * 1024u};
   Bytes buf;
   Status status = Status::kOk;
-  std::string detail;
+  std::vector<Bytes> commands;
   Status Push(const Bytes& stream, size_t step) {
     for (size_t off = 0; off < stream.size(); off += step) {
       const size_t n = std::min(step, stream.size() - off);
       buf.insert(buf.end(), stream.begin() + off, stream.begin() + off + n);
-      const size_t used = parser.Consume(buf.data(), buf.size(), &status, &detail);
+      const size_t used = parser.Consume(buf.data(), buf.size(), &status,
+          [&](uint8_t type, uint32_t, const Bytes& bytes) {
+            if (type == 20) commands.push_back(bytes);
+            return true;
+          });
       CHECK(used <= buf.size());
       buf.erase(buf.begin(), buf.begin() + used);
       if (status != Status::kOk) return status;
@@ -149,8 +153,8 @@ void TestRtmpParser() {
       Bytes s = Message(3, 20, first, 128);
       Bytes again = Message(3, 20, second, 128, 0, 3);
       s.insert(s.end(), again.begin(), again.end());
-      CHECK(f.Push(s, step) == Status::kRejected);
-      CHECK(f.detail == "NetStream.Publish.BadName");
+      CHECK(f.Push(s, step) == Status::kOk);
+      CHECK(f.commands == (std::vector<Bytes>{first, second}));
       CHECK(f.buf.empty());
     }
     // fmt-2 starts a new message inheriting length/type.
@@ -159,8 +163,8 @@ void TestRtmpParser() {
       Bytes s = Message(3, 20, Text("_result", 93), 128);
       Bytes next = Message(3, 20, Text("_error", 94), 128, 5, 2);
       s.insert(s.end(), next.begin(), next.end());
-      CHECK(f.Push(s, step) == Status::kRejected);
-      CHECK(f.detail == "_error");
+      CHECK(f.Push(s, step) == Status::kOk);
+      CHECK(f.commands == (std::vector<Bytes>{Text("_result", 93), Text("_error", 94)}));
     }
     // Extended timestamp: every fmt-3 continuation carries 4 extra bytes. If
     // they are not skipped the following SetChunkSize is misparsed.
@@ -205,11 +209,13 @@ void TestRtmpParser() {
       Feed g;
       CHECK(g.Push(ChunkSizeMsg(5u * 1024u * 1024u), step) == Status::kInvalidChunkSize);
     }
-    // Rejection on connect.
+    // Deliver the exact peer command to the session layer; AMF semantics are
+    // exercised with real replies in rtmp_publisher_loopback_test.py.
     {
       Feed f;
       CHECK(f.Push(Message(3, 20, Text("_error NetConnection.Connect.Rejected", 10), 128),
-                   step) == Status::kRejected);
+                   step) == Status::kOk);
+      CHECK(f.commands == (std::vector<Bytes>{Text("_error NetConnection.Connect.Rejected", 10)}));
     }
   }
   // Truncated input never over-consumes.
@@ -217,16 +223,15 @@ void TestRtmpParser() {
     RtmpChunkParser p(1u << 20);
     Bytes s = Message(3, 20, Text("_result", 200), 128);
     Status st;
-    std::string d;
     for (size_t n = 0; n < s.size(); ++n) {
       RtmpChunkParser fresh(1u << 20);
-      const size_t used = fresh.Consume(s.data(), n, &st, &d);
+      const size_t used = fresh.Consume(s.data(), n, &st, [](uint8_t, uint32_t, const Bytes&) { return true; });
       CHECK(used <= n);
       CHECK(st == Status::kOk);
     }
   }
   std::cout << "PASS RTMP chunk parser: fmt0-3, fmt-3 new message, extended ts, "
-               "interleave, chunk size, rejection, partial delivery\n";
+               "interleave, chunk size, command reassembly, partial delivery\n";
 }
 
 // ---- Parameter sets ----------------------------------------------------------

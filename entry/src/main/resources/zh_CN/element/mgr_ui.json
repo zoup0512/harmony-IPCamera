@@ -1,0 +1,13 @@
+{
+  "string": [
+    {"name":"mgr_ui_back","value":"返回"},
+    {"name":"mgr_ui_search","value":"搜索名称或主机"},
+    {"name":"mgr_ui_options","value":"更多操作"},
+    {"name":"mgr_ui_no_matches","value":"没有匹配的地址"},
+    {"name":"mgr_ui_rename","value":"重命名"},
+    {"name":"mgr_ui_choose_recording","value":"选择录像"},
+    {"name":"mgr_ui_server_ext","value":"服务器连接 · HarmonyOS"},
+    {"name":"mgr_ui_confirm_device","value":"媒体端点：%s\n只添加此摄像机，或将完整流地址复制到本机剪贴板。复制的地址可能含有凭据。"},
+    {"name":"mgr_ui_confirm_origin","value":"只从 %s 加载录像？填写的凭据将发送给这台服务器。HTTP 不会加密凭据。"}
+  ]
+}

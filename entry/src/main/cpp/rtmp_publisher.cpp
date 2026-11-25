@@ -1,5 +1,7 @@
 #include "rtmp_publisher.h"
+#include "rtmp_tls_pipe.h"
 #include "rtmp_chunk_parser.h"
+#include "rtmp_command.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -100,7 +102,7 @@ bool ResolveWithDeadline(const std::string& host, const std::string& port,
   try {
     std::thread([state, host, port]() {
       addrinfo hints {};
-      hints.ai_family = AF_INET;
+      hints.ai_family = AF_UNSPEC;
       hints.ai_socktype = SOCK_STREAM;
       addrinfo* resolved = nullptr;
       const int resolveError = getaddrinfo(host.c_str(), port.c_str(), &hints, &resolved);
@@ -354,7 +356,7 @@ std::vector<uint8_t> CreateStreamCommand() {
 std::vector<uint8_t> PublishCommand(const std::string& stream) {
   std::vector<uint8_t> v;
   AmfString(v, "publish");
-  AmfNumber(v, 3);
+  AmfNumber(v, 0);  // publish is acknowledged via onStatus, not _result
   AmfNull(v);
   AmfString(v, stream);
   AmfString(v, "live");
@@ -523,6 +525,15 @@ std::vector<uint8_t> HevcSequenceTag(const std::vector<uint8_t>& vps,
 
 }  // namespace
 
+struct RtmpPublisher::PeerSession {
+  enum Stage { Connect, Create, Publish, Live } stage = Connect;
+  bool confirmed = false;
+  uint32_t streamId = 0, window = 0;
+  uint64_t received = 0, lastAck = 0;
+  RtmpChunkParser parser{static_cast<uint32_t>(kMaxInboundBufferBytes)};
+  std::vector<uint8_t> buffer;
+};
+
 RtmpPublisher::~RtmpPublisher() { Stop(); }
 
 std::string RtmpPublisher::LastError() const {
@@ -544,7 +555,10 @@ std::vector<uint8_t> RtmpPublisher::BuildWireMessage(const OutMsg& msg) {
   while (first || off < msg.payload.size()) {
     const size_t n =
         std::min<size_t>(kOutChunkSize, msg.payload.size() - off);
-    if (!first) wire.push_back(0xC0 | (msg.csid & 0x3F));
+    if (!first) {
+      wire.push_back(0xC0 | (msg.csid & 0x3F));
+      if (ext) Put4(wire, msg.tsMs);
+    }
     wire.insert(wire.end(), msg.payload.begin() + off,
                 msg.payload.begin() + off + n);
     off += n;
@@ -658,7 +672,7 @@ void RtmpPublisher::SetVideoParams(bool h265,
 }
 
 bool RtmpPublisher::Start(const std::string& url, int width, int height,
-                          bool h265Hint, ErrorSink onError) {
+                          bool h265Hint, ErrorSink onError, uint32_t authenticatedTlsToken) {
   {
     std::lock_guard<std::mutex> stopLock(stopMu_);
     std::unique_lock<std::mutex> lk(lifecycleMu_);
@@ -714,80 +728,81 @@ bool RtmpPublisher::Start(const std::string& url, int width, int height,
     return false;
   };
 
-  // rtmp://host[:port]/app/stream[?query]
-  std::string rest = url;
-  const std::string scheme = "rtmp://";
-  if (rest.rfind(scheme, 0) != 0) {
-    return finishFailedStart("url must start with rtmp://", -1);
-  }
-  rest = rest.substr(scheme.size());
-  const size_t slash = rest.find('/');
-  if (slash == std::string::npos) {
-    return finishFailedStart("url missing /app/stream", -1);
-  }
-  const std::string hostPort = rest.substr(0, slash);
-  const std::string path = rest.substr(slash + 1);
-  int port = 1935;
-  std::string host = hostPort;
-  const size_t colon = hostPort.rfind(':');
-  if (colon != std::string::npos) {
-    host = hostPort.substr(0, colon);
-    char* end = nullptr;
-    const long parsed = std::strtol(hostPort.c_str() + colon + 1, &end, 10);
-    if (end == hostPort.c_str() + colon + 1 || *end != '\0' || parsed <= 0 ||
-        parsed > 65535) {
-      return finishFailedStart("invalid RTMP port", -1);
-    }
-    port = static_cast<int>(parsed);
-  }
-  if (host.empty() || path.empty()) {
-    return finishFailedStart("url missing host/app/stream", -1);
-  }
-  std::string app = path;
-  std::string stream;
-  const size_t appEnd = path.find('/');
-  if (appEnd != std::string::npos) {
-    app = path.substr(0, appEnd);
-    stream = path.substr(appEnd + 1);
-  }
-  if (app.empty() || stream.empty()) {
+  const bool secure = url.rfind("rtmps://", 0) == 0;
+  if (secure && !authenticatedTlsToken) return finishFailedStart("RTMPS transport unavailable", -1);
+  if ((!secure && (authenticatedTlsToken || url.rfind("rtmp://", 0) != 0)) || url.size() > 65535 ||
+      std::any_of(url.begin(), url.end(), [](unsigned char c) {
+        return c <= 32 || c == 127 || c == '#' || c == '\\';
+      })) return finishFailedStart("invalid RTMP URL", -1);
+  const size_t schemeEnd = secure ? 8 : 7;
+  const size_t slash = url.find('/', schemeEnd);
+  const size_t appEnd = slash == std::string::npos ? slash : url.find('/', slash + 1);
+  if (appEnd == std::string::npos || slash + 1 == appEnd || appEnd + 1 >= url.size() ||
+      url[appEnd + 1] == '/' || url[appEnd + 1] == '?' || url.find('?') < appEnd) {
     return finishFailedStart("url missing app or stream key", -1);
   }
-
-  char portStr[8];
-  snprintf(portStr, sizeof(portStr), "%d", port);
+  const std::string authority = url.substr(schemeEnd, slash - schemeEnd);
+  std::string host;
+  size_t endHost = 0;
+  if (!authority.empty() && authority.front() == '[') {
+    endHost = authority.find(']');
+    if (endHost == std::string::npos) return finishFailedStart("invalid IPv6 host", -1);
+    host = authority.substr(1, endHost - 1);
+    in6_addr numeric{};
+    if (inet_pton(AF_INET6, host.c_str(), &numeric) != 1) return finishFailedStart("invalid IPv6 host", -1);
+    ++endHost;
+  } else {
+    endHost = authority.find(':');
+    if (endHost == std::string::npos) endHost = authority.size();
+    host = authority.substr(0, endHost);
+    if (host.empty() || host.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-") !=
+        std::string::npos) return finishFailedStart("invalid RTMP host", -1);
+  }
+  std::string port = secure ? "443" : "1935";
+  if (endHost != authority.size()) {
+    port = authority.substr(endHost + 1);
+    if (authority[endHost] != ':' || port.empty() || port.find_first_not_of("0123456789") != std::string::npos ||
+        std::strtol(port.c_str(), nullptr, 10) <= 0 || std::strtol(port.c_str(), nullptr, 10) > 65535) {
+      return finishFailedStart("invalid RTMP port", -1);
+    }
+    port = std::to_string(std::strtol(port.c_str(), nullptr, 10));
+  }
+  const std::string app = url.substr(slash + 1, appEnd - slash - 1);
+  const std::string stream = url.substr(appEnd + 1);
   const int64_t deadlineUs = NowUs() + kStartTimeoutUs;
-  addrinfo* res = nullptr;
   std::string error;
-  if (!ResolveWithDeadline(host, portStr, deadlineUs, cancelRequested_, &res, &error)) {
-    return finishFailedStart(error, -1);
-  }
-
-  const int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (fd < 0) {
-    const int err = errno;
-    freeaddrinfo(res);
-    return finishFailedStart(ErrnoDetail("socket failed", err), -1);
-  }
-  {
+  int fd = -1;
+  if (secure) {
+    fd = RtmpTlsPipe::Instance().Take(authenticatedTlsToken, authority);
+    if (fd < 0) return finishFailedStart("RTMPS transport unavailable", -1);
     std::lock_guard<std::mutex> lk(sockMu_);
     sock_ = fd;
-  }
-
-  int one = 1;
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  if (!SetNonBlocking(fd, &error)) {
+  } else {
+    addrinfo* res = nullptr;
+    if (!ResolveWithDeadline(host, port, deadlineUs, cancelRequested_, &res, &error)) {
+      return finishFailedStart(error, -1);
+    }
+    for (addrinfo* ai = res; ai && !cancelRequested_.load() && NowUs() < deadlineUs; ai = ai->ai_next) {
+      fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+      if (fd < 0) { error = ErrnoDetail("socket failed", errno); continue; }
+      {
+        std::lock_guard<std::mutex> lk(sockMu_);
+        sock_ = fd;
+      }
+      int one = 1;
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      // Leave a share of the single startup budget for the next family/address.
+      int64_t attemptEnd = ai->ai_next ? std::min<int64_t>(deadlineUs, NowUs() + 2000000) : deadlineUs;
+      if (SetNonBlocking(fd, &error) && ConnectWithDeadline(fd, ai->ai_addr, ai->ai_addrlen,
+                                                            attemptEnd, cancelRequested_, &error)) break;
+      CloseSocketIf(fd);
+      fd = -1;
+    }
     freeaddrinfo(res);
-    return finishFailedStart(error, fd);
   }
-
-  const bool connected = ConnectWithDeadline(fd, res->ai_addr, res->ai_addrlen,
-                                             deadlineUs, cancelRequested_,
-                                             &error);
-  freeaddrinfo(res);
-  if (!connected) return finishFailedStart(error, fd);
-
-  if (!ConnectAndPublish(host, port, app, stream, fd, deadlineUs, &error)) {
+  if (fd < 0) return finishFailedStart(error.empty() ? "operation timed out" : error, -1);
+  auto peer = std::make_unique<PeerSession>();
+  if (!ConnectAndPublish(url.substr(0, appEnd), app, stream, fd, *peer, deadlineUs, &error)) {
     return finishFailedStart(error, fd);
   }
   if (cancelRequested_.load()) return finishFailedStart("cancelled", fd);
@@ -802,7 +817,7 @@ bool RtmpPublisher::Start(const std::string& url, int width, int height,
     } else {
       running_.store(true);
       try {
-        senderThread_ = std::thread(&RtmpPublisher::SenderLoop, this, fd);
+        senderThread_ = std::thread(&RtmpPublisher::SenderLoop, this, fd, std::move(peer));
       } catch (...) {
         running_.store(false);
         senderCreateFailed = true;
@@ -820,15 +835,13 @@ bool RtmpPublisher::Start(const std::string& url, int width, int height,
     return finishFailedStart("failed to create sender thread", fd);
   }
   lifecycleCv_.notify_all();
-  OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-               "publishing to rtmp://%{public}s:%{public}d/%{public}s",
-               host.c_str(), port, app.c_str());
+  OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "RTMP publishing started");
   return true;
 }
 
-bool RtmpPublisher::ConnectAndPublish(const std::string& host, int port,
+bool RtmpPublisher::ConnectAndPublish(const std::string& tcUrl,
                                       const std::string& app,
-                                      const std::string& stream, int fd,
+                                      const std::string& stream, int fd, PeerSession& peer,
                                       int64_t deadlineUs,
                                       std::string* error) {
   // ---- handshake: C0+C1, read S0+S1+S2, echo C2 ----
@@ -843,7 +856,7 @@ bool RtmpPublisher::ConnectAndPublish(const std::string& host, int port,
     return false;
   }
   uint8_t s0s1s2[1 + 1536 + 1536];
-  if (!ReadAll(fd, s0s1s2, sizeof(s0s1s2), deadlineUs, cancelRequested_,
+  if (!ReadAll(fd, s0s1s2, 1 + 1536, deadlineUs, cancelRequested_,
                error)) {
     return false;
   }
@@ -853,7 +866,8 @@ bool RtmpPublisher::ConnectAndPublish(const std::string& host, int port,
   }
   // C2 echoes S1 (time + random bytes), not S2.
   if (!SendAll(fd, s0s1s2 + 1, 1536, deadlineUs,
-               cancelRequested_, error)) {
+               cancelRequested_, error) ||
+      !ReadAll(fd, s0s1s2 + 1537, 1536, deadlineUs, cancelRequested_, error)) {
     return false;
   }
 
@@ -874,17 +888,18 @@ bool RtmpPublisher::ConnectAndPublish(const std::string& host, int port,
   std::vector<uint8_t> chunkSize;
   Put4(chunkSize, kOutChunkSize);
   if (!sendMsg(MSG_SET_CHUNK_SIZE, 2, 0, 0, chunkSize)) return false;
-  if (!sendMsg(MSG_AMF0_COMMAND, 3, 0, 0,
-               ConnectCommand(app, "rtmp://" + host + ":" +
-                                       std::to_string(port) + "/" + app))) {
+  auto expect = [&](PeerSession::Stage stage) {
+    peer.stage = stage;
+    peer.confirmed = false;
+    while (!peer.confirmed) if (!ReceivePeer(fd, peer, true, deadlineUs, error)) return false;
+    return true;
+  };
+  if (!sendMsg(MSG_AMF0_COMMAND, 3, 0, 0, ConnectCommand(app, tcUrl)) || !expect(PeerSession::Connect) ||
+      !sendMsg(MSG_AMF0_COMMAND, 3, 0, 0, CreateStreamCommand()) || !expect(PeerSession::Create) ||
+      !sendMsg(MSG_AMF0_COMMAND, 8, peer.streamId, 0, PublishCommand(stream)) || !expect(PeerSession::Publish)) {
     return false;
   }
-  if (!sendMsg(MSG_AMF0_COMMAND, 3, 0, 0, CreateStreamCommand())) {
-    return false;
-  }
-  if (!sendMsg(MSG_AMF0_COMMAND, 8, 1, 0, PublishCommand(stream))) {
-    return false;
-  }
+  peer.stage = PeerSession::Live;
 
   int w = 0;
   int h = 0;
@@ -899,17 +914,106 @@ bool RtmpPublisher::ConnectAndPublish(const std::string& host, int port,
     channels = audioChannels_;
     h265 = videoIsH265_;
   }
-  return sendMsg(MSG_AMF0_DATA, 5, 1, 0,
+  return sendMsg(MSG_AMF0_DATA, 5, peer.streamId, 0,
                  MetaDataCommand(w, h, rate, channels, h265));
 }
 
-void RtmpPublisher::SenderLoop(int fd) {
-  uint64_t received = 0;
-  uint64_t lastAck = 0;
-  uint32_t windowAckSize = 2500000;
-  RtmpChunkParser parser(static_cast<uint32_t>(kMaxInboundBufferBytes));
-  std::vector<uint8_t> rbuf;
+// Hand the same decoder (partial chunks, acknowledgement counters and
+// compressed header history) from the startup worker to the sender.
+bool RtmpPublisher::ReceivePeer(int fd, PeerSession& peer, bool wait, int64_t deadlineUs, std::string* error) {
+  if (cancelRequested_.load()) { *error = "cancelled"; return false; }
+  if (NowUs() >= deadlineUs) { *error = "operation timed out"; return false; }
+  if (wait && !WaitForFd(fd, POLLIN, deadlineUs, cancelRequested_, error)) return false;
+  uint8_t tmp[16384];
+  const ssize_t n = ::recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+  if (n == 0) { *error = "server closed connection"; return false; }
+  if (n < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+    *error = ErrnoDetail("server recv failed", errno);
+    return false;
+  }
+  peer.received += static_cast<uint64_t>(n);
+  peer.buffer.insert(peer.buffer.end(), tmp, tmp + n);
+  auto control = [&](uint8_t type, std::vector<uint8_t> payload) {
+    OutMsg msg;
+    msg.type = type;
+    msg.csid = 2;
+    msg.payload = std::move(payload);
+    auto wire = BuildWireMessage(msg);
+    return SendAll(fd, wire.data(), wire.size(), deadlineUs, cancelRequested_, error);
+  };
+  auto reject = [&](const std::string& code) {
+    // Report only allowlisted codes, never free-form text (often includes the key).
+    static const char* const known[] = {"NetConnection.Connect.Rejected", "NetConnection.Connect.InvalidApp",
+        "NetConnection.Connect.Failed", "NetStream.Publish.BadName", "NetStream.Publish.Denied",
+        "NetStream.Publish.Rejected", "NetStream.Publish.Failed", "NetStream.Unpublish.Success"};
+    *error = "server rejected: RTMP request denied";
+    for (const char* safe : known) if (code == safe) { *error = std::string("server rejected: ") + safe; break; }
+    return false;
+  };
+  auto visit = [&](uint8_t type, uint32_t id, const std::vector<uint8_t>& body) {
+    if (type == 5) peer.window = RtmpChunkParser::Be32(body.data());
+    if (type == 4 && body.size() >= 2 && body[0] == 0 && body[1] == 6) {
+      if (body.size() != 6) { *error = "invalid RTMP ping"; return false; }
+      auto pong = body;
+      pong[1] = 7;
+      return control(4, std::move(pong));
+    }
+    if (type != 20 && type != 17) return true;
+    RtmpCommand c;
+    if (!AmfReplyReader(body).Read(c, type == 17)) { *error = "invalid RTMP command"; return false; }
+    const bool connection = id == 0;
+    const bool stream = peer.streamId != 0 && peer.streamId == id;
+    const bool transaction = connection && ((peer.stage == PeerSession::Connect && c.transaction == 1) ||
+        (peer.stage == PeerSession::Create && c.transaction == 2));
+    if (c.name == "_error" && (transaction || ((connection || stream) &&
+        peer.stage >= PeerSession::Publish && c.transaction == 0))) return reject(c.code);
+    if (c.name == "_result" && transaction && !peer.confirmed) {
+      if (c.level == "error") return reject(c.code);
+      if (peer.stage == PeerSession::Create) {
+        if (!c.numericResult || c.result < 1 || c.result > UINT32_MAX || std::floor(c.result) != c.result) {
+          *error = "invalid createStream stream ID";
+          return false;
+        }
+        peer.streamId = static_cast<uint32_t>(c.result);
+      } else if (!c.code.empty() && c.code != "NetConnection.Connect.Success") return reject(c.code);
+      peer.confirmed = true;
+    }
+    if (c.name == "onStatus") {
+      if (connection && c.code.rfind("NetConnection.Connect.", 0) == 0 &&
+          (c.level == "error" || c.code != "NetConnection.Connect.Success")) return reject(c.code);
+      // Some servers report a rejected publish on the connection command channel.
+      // A success on that channel must still never confirm a stream.
+      if (connection && peer.stage >= PeerSession::Publish && c.level == "error" &&
+          c.code.rfind("NetStream.Publish.", 0) == 0) return reject(c.code);
+      if (!stream || peer.stage < PeerSession::Publish) return true;
+      if (c.level == "error" || c.code == "NetStream.Unpublish.Success" ||
+          (c.code.rfind("NetStream.Publish.", 0) == 0 && c.code != "NetStream.Publish.Start" &&
+           c.code != "NetStream.Publish.Idle")) return reject(c.code);
+      if (peer.stage == PeerSession::Publish && c.transaction == 0 && c.code == "NetStream.Publish.Start") {
+        peer.confirmed = true;
+      }
+    }
+    return true;
+  };
+  RtmpChunkParser::Status status;
+  const size_t used = peer.parser.Consume(peer.buffer.data(), peer.buffer.size(), &status, visit);
+  if (status == RtmpChunkParser::Status::kStopped) return false;
+  if (status != RtmpChunkParser::Status::kOk || peer.buffer.size() - used > kMaxInboundBufferBytes + 18) {
+    *error = "invalid RTMP chunk stream";
+    return false;
+  }
+  peer.buffer.erase(peer.buffer.begin(), peer.buffer.begin() + used);
+  if (peer.window && peer.received - peer.lastAck >= peer.window) {
+    std::vector<uint8_t> ack;
+    Put4(ack, static_cast<uint32_t>(peer.received));
+    peer.lastAck = peer.received;
+    return control(MSG_ACK, std::move(ack));
+  }
+  return true;
+}
 
+void RtmpPublisher::SenderLoop(int fd, std::unique_ptr<PeerSession> peer) {
   while (!cancelRequested_.load()) {
     std::deque<OutMsg> local;
     {
@@ -929,7 +1033,8 @@ void RtmpPublisher::SenderLoop(int fd) {
       queuedAudioConfig_ = 0;
     }
 
-    for (const OutMsg& msg : local) {
+    for (OutMsg& msg : local) {
+      msg.streamId = peer->streamId;
       if (cancelRequested_.load()) break;
       const std::vector<uint8_t> wire = RtmpPublisher::BuildWireMessage(msg);
       std::string error;
@@ -951,76 +1056,10 @@ void RtmpPublisher::SenderLoop(int fd) {
     }
     if (cancelRequested_.load()) break;
 
-    // Read server traffic without delaying producers. Queue notification wakes
-    // the loop; this short zero-time poll only handles data already available.
-    for (;;) {
-      uint8_t tmp[16384];
-      pollfd p {fd, static_cast<short>(POLLIN | POLLERR | POLLHUP | POLLNVAL),
-                0};
-      const int pr = ::poll(&p, 1, 0);
-      if (pr < 0) {
-        if (errno == EINTR) continue;
-        AbortRuntime(ErrnoDetail("server poll failed", errno));
-        break;
-      }
-      if (pr == 0) break;
-      if ((p.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 &&
-          (p.revents & POLLIN) == 0) {
-        AbortRuntime("server closed connection");
-        break;
-      }
-
-      const ssize_t n = ::recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
-      if (n == 0) {
-        AbortRuntime("server closed connection");
-        break;
-      }
-      if (n < 0) {
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        AbortRuntime(ErrnoDetail("server recv failed", errno));
-        break;
-      }
-
-      rbuf.insert(rbuf.end(), tmp, tmp + n);
-      received += static_cast<uint64_t>(n);
-      if (rbuf.size() > kMaxInboundBufferBytes) {
-        AbortRuntime("server message buffer exceeded 4 MiB");
-        break;
-      }
-
-      RtmpChunkParser::Status status = RtmpChunkParser::Status::kOk;
-      std::string detail;
-      const size_t pos = parser.Consume(rbuf.data(), rbuf.size(), &status, &detail);
-      if (status == RtmpChunkParser::Status::kInvalidChunkSize) {
-        AbortRuntime("invalid server chunk size");
-        break;
-      }
-      if (status == RtmpChunkParser::Status::kRejected) {
-        AbortRuntime("server rejected: " + detail);
-        break;
-      }
-
-      if (pos > 0) {
-        rbuf.erase(rbuf.begin(),
-                   rbuf.begin() + static_cast<std::ptrdiff_t>(pos));
-      }
-      if (cancelRequested_.load()) break;
-
-      if (received - lastAck > windowAckSize) {
-        lastAck = received;
-        OutMsg ackMsg;
-        ackMsg.type = MSG_ACK;
-        ackMsg.csid = 2;
-        ackMsg.streamId = 0;
-        ackMsg.tsMs = 0;
-        Put4(ackMsg.payload,
-             static_cast<uint32_t>(received & 0xFFFFFFFFULL));
-        if (!EnqueueControl(std::move(ackMsg))) {
-          AbortRuntime("RTMP acknowledgement queue overflow");
-          break;
-        }
-      }
+    std::string detail;
+    if (!ReceivePeer(fd, *peer, false, NowUs() + kSendTimeoutUs, &detail)) {
+      if (!cancelRequested_.load()) AbortRuntime(detail);
+      break;
     }
   }
 
@@ -1096,24 +1135,6 @@ bool RtmpPublisher::EnqueueVideo(OutMsg frame, OutMsg sequenceHeader,
   if (!queued) return false;
   queueCv_.notify_one();
   return true;
-}
-
-bool RtmpPublisher::EnqueueControl(OutMsg msg) {
-  if (!running_.load() || cancelRequested_.load()) return false;
-  bool queued = false;
-  {
-    std::lock_guard<std::mutex> lk(queueMu_);
-    if (!running_.load() || cancelRequested_.load()) return false;
-    const size_t bytes = QueuedBytes(msg);
-    if (bytes <= kMaxQueuedBytes &&
-        inFlightBytes_ + queuedBytes_ + bytes <= kMaxQueuedBytes) {
-      queuedBytes_ += bytes;
-      queue_.push_front(std::move(msg));
-      queued = true;
-    }
-  }
-  if (queued) queueCv_.notify_one();
-  return queued;
 }
 
 bool RtmpPublisher::EnqueueAudio(OutMsg frame, OutMsg sequenceHeader,
@@ -1318,7 +1339,6 @@ void RtmpPublisher::SendH264Packet(const uint8_t* data, size_t size,
   OutMsg sequence;
   sequence.type = MSG_VIDEO;
   sequence.csid = 6;
-  sequence.streamId = 1;
   sequence.tsMs = 0;
   sequence.payload = h265 ? HevcSequenceTag(vps, sps, pps)
                           : AvcSequenceHeader(sps, pps);
@@ -1326,7 +1346,6 @@ void RtmpPublisher::SendH264Packet(const uint8_t* data, size_t size,
   OutMsg frame;
   frame.type = MSG_VIDEO;
   frame.csid = 6;
-  frame.streamId = 1;
   frame.tsMs = timestampMs;
   if (h265) {
     // Enhanced-RTMP ex-header: isExHeader | FrameType | PacketType=CodedFrames.
@@ -1375,14 +1394,12 @@ void RtmpPublisher::SendAdtsPacket(const uint8_t* data, size_t size,
   OutMsg sequence;
   sequence.type = MSG_AUDIO;
   sequence.csid = 4;
-  sequence.streamId = 1;
   sequence.tsMs = 0;
   sequence.payload = AacSequenceHeader(profileBits, sfIndex, channels);
 
   OutMsg frame;
   frame.type = MSG_AUDIO;
   frame.csid = 4;
-  frame.streamId = 1;
   frame.tsMs = timestampMs;
   frame.payload.push_back(0xAF);
   frame.payload.push_back(0x01);

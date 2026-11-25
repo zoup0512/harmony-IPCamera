@@ -1,6 +1,8 @@
 #include "osd_renderer.h"
 
+#include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -9,18 +11,24 @@
 #include <native_drawing/drawing_bitmap.h>
 #include <native_drawing/drawing_canvas.h>
 #include <native_drawing/drawing_font_collection.h>
+#include <native_drawing/drawing_register_font.h>
 #include <native_drawing/drawing_text_typography.h>
 #include <native_drawing/drawing_types.h>
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "OsdRenderer"
 
 namespace {
 
+constexpr char kLocalFamily[] = "IPCamera-Osd-Imported";
+
 // Battery line mirrors the Android osd_battery / osd_battery_charge_* strings.
 std::string ChargeSuffix(int state) {
   if (state == 1) return "\xE2\x9A\xA1" "AC";            // ⚡AC (wired charging)
-  if (state == 2) return "\xE2\x9A\xA1" "Wireless";      // ⚡Wireless
+  if (state == 2) return " \xE2\x9A\xA1" "USB";
+  if (state == 3) return "\xE2\x9A\xA1" "Wireless";
   return "";
 }
 
@@ -43,6 +51,15 @@ std::string GpsLine(const ipcam::OsdSnapshot& snap) {
 namespace ipcam {
 
 bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frameH) {
+  if (!snap.enabled) {
+    if (!hasCached_) return false;
+    // Keep the watermark-only hot path free of clock/typography work. Force a
+    // fresh raster when text is next enabled, even within the same second.
+    text_ = Layer{};
+    cached_ = OsdSnapshot{};
+    hasCached_ = false;
+    return true;
+  }
   time_t now = time(nullptr);
   struct tm lt{};
   localtime_r(&now, &lt);
@@ -50,7 +67,9 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
 
   // The timestamp only changes once per second; re-raster on the second tick
   // or whenever any text-affecting field differs from the cached snapshot.
-  bool dirty = !hasCached_ || second != cachedSecond_ ||
+  bool dirty = !hasCached_ || (snap.showTimestamp && second != cachedSecond_) ||
+               snap.fontSize != cached_.fontSize || snap.fontFamily != cached_.fontFamily ||
+               snap.fontPath != cached_.fontPath ||
                cachedFrameW_ != frameW || cachedFrameH_ != frameH ||
                snap.enabled != cached_.enabled || snap.padding != cached_.padding ||
                snap.position != cached_.position || snap.fontStyle != cached_.fontStyle ||
@@ -66,6 +85,7 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
   if (!dirty) return false;
 
   cached_ = snap;
+  cached_.wmPixels.reset();  // text caching must not pin an old image after a replacement
   cachedSecond_ = second;
   hasCached_ = true;
   cachedFrameW_ = frameW;
@@ -82,13 +102,13 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &lt);
     addLine(ts);
   }
-  if (snap.showDevName && !snap.devName.empty()) addLine(snap.devName);
   if (snap.showBattery && snap.batteryLevel >= 0) {
     char bat[48];
     snprintf(bat, sizeof(bat), "BAT:%d%%%s", snap.batteryLevel,
              ChargeSuffix(snap.batteryState).c_str());
     addLine(bat);
   }
+  if (snap.showDevName) addLine(snap.devName);
   if (snap.showGps) addLine(GpsLine(snap));
   if (!snap.customText.empty()) addLine(snap.customText);
 
@@ -142,9 +162,8 @@ bool OsdRenderer::RefreshIfNeeded(const OsdSnapshot& snap, int frameW, int frame
 
 void OsdRenderer::Rasterize(const std::string& text, const OsdSnapshot& snap, int frameW,
                             int frameH) {
-  int fontPx = frameH / 24;
-  if (fontPx < 16) fontPx = 16;
-  if (fontPx > 96) fontPx = 96;
+  // Android's automatic text size is 16px per 400px of frame height.
+  const int fontPx = snap.fontSize > 0 ? snap.fontSize : std::max(1, frameH / 25);
   int maxW = frameW * 2 / 3;
   if (maxW < 64) maxW = 64;
 
@@ -169,8 +188,29 @@ void OsdRenderer::Rasterize(const std::string& text, const OsdSnapshot& snap, in
   }
   OH_Drawing_SetTextStyleColor(style, snap.argb);
   OH_Drawing_SetTextStyleFontSize(style, static_cast<double>(fontPx));
-  OH_Drawing_SetTextStyleFontWeight(style, snap.fontStyle == 1 || snap.fontStyle == 3 ? 700 : 400);
-  OH_Drawing_SetTextStyleFontStyle(style, snap.fontStyle >= 2 ? 1 : 0);
+  OH_Drawing_SetTextStyleFontWeight(style, snap.fontStyle & 1 ? FONT_WEIGHT_700 : FONT_WEIGHT_400);
+  OH_Drawing_SetTextStyleFontStyle(style, snap.fontStyle & 2 ? FONT_STYLE_ITALIC : FONT_STYLE_NORMAL);
+  // A picker import has a new private path even when the display name is the
+  // same. Register only on change; a bad font falls back, not once per frame.
+  // Keep one alias in the process-global collection, including across camera
+  // restarts. Serialize registration and use if two renderers overlap.
+  static std::mutex fontMu;
+  static std::string attemptedFontPath_;
+  static bool localFontRegistered_ = false;
+  std::lock_guard<std::mutex> fontLock(fontMu);
+  if (snap.fontPath != attemptedFontPath_) {
+    if (localFontRegistered_) OH_Drawing_UnregisterFont(collection, kLocalFamily);
+    localFontRegistered_ = false;
+    attemptedFontPath_ = snap.fontPath;
+    if (!snap.fontPath.empty()) {
+      uint32_t err = OH_Drawing_RegisterFont(collection, kLocalFamily, snap.fontPath.c_str());
+      localFontRegistered_ = err == 0;
+      if (err != 0) OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
+                                 "local OSD font rejected (%{public}u); using fallback", err);
+    }
+  }
+  const char* families[] = {localFontRegistered_ ? kLocalFamily : snap.fontFamily.c_str()};
+  if (families[0][0]) OH_Drawing_SetTextStyleFontFamilies(style, 1, families);
 
   OH_Drawing_TypographyCreate* handler = OH_Drawing_CreateTypographyHandler(tstyle, collection);
   if (handler == nullptr) {

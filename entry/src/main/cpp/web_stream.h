@@ -2,6 +2,8 @@
 #define IPCAMERA_WEB_STREAM_H
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -26,14 +28,25 @@ class WebStream {
 
   void FeedVideo(const uint8_t* data, size_t size);  // Annex-B, both codecs
 
+  // Fence old FeedVideo/SetParams calls before resetting. Clears cached video
+  // and motion history without stopping the worker or changing its consumers,
+  // dimensions, detector settings or arm deadline. No status callback or join.
+  void ResetVideoInput();
   void SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB, int width, int height);
   // Enabling keeps the decode loop alive on its own (no web client needed) and
   // arms the detector kArmDelayUs later, so the user can leave the frame first.
   void SetMotionEnabled(bool enabled);
   void SetMotionTimeout(int seconds);
+  bool MotionEnabled() const { return motionEnabled_.load(); }
   bool MotionActive() const;
   void SetMotionSink(MotionSink sink);
   std::vector<uint8_t> LatestJpeg() const;
+  // Requires a live JPEG client (HTTP owns one). Wait only for a JPEG whose
+  // encoded AU entered FeedVideo after this call's fence, in the same session.
+  // Empty on timeout, format/reset, decoder worker stop, or running == false.
+  // Caller keeps WebStream and running alive until all calls return.
+  std::vector<uint8_t> WaitForFreshJpeg(const std::atomic<bool>& running,
+      std::chrono::milliseconds timeout = std::chrono::seconds(3));
 
   void IncClients();
   void DecClients();
@@ -62,6 +75,13 @@ class WebStream {
   std::atomic<bool> paramsSet_{false};
 
   mutable std::mutex stateMu_;
+  void InvalidateVideoLocked();
+  std::condition_variable freshCv_;
+  uint64_t inputGeneration_ = 0;  // reset/format epoch for in-flight work
+  uint64_t jpegSession_ = 0;      // invalidates waits on loss of JPEG demand or worker stop
+  std::atomic<uint64_t> arrival_{0};  // stamped at FeedVideo entry, before parsing
+  uint64_t processedArrival_ = 0;
+  uint64_t jpegArrival_ = 0;     // originating IDR, not JPEG completion order
   std::vector<uint8_t> params_;   // Annex-B VPS/SPS/PPS or SPS/PPS
   std::vector<uint8_t> lastIdr_;  // Annex-B IDR frame
   std::vector<uint8_t> lastJpeg_;

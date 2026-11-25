@@ -1,0 +1,23 @@
+{
+  "string": [
+    {"name": "addon_lan_http", "value": "HTTP web service"},
+    {"name": "addon_lan_rtsp", "value": "RTSP video service"},
+    {"name": "addon_lan_announce_http", "value": "Advertise the HTTP web service"},
+    {"name": "addon_lan_announce_rtsp", "value": "Advertise the RTSP video service"},
+    {"name": "addon_lan_unsupported", "value": "This device does not support mDNS."},
+    {"name": "addon_lan_retry", "value": "Retry announcement"},
+    {"name": "addon_lan_title", "value": "LAN service announcements"},
+    {"name": "addon_lan_trust", "value": "When enabled, devices on the same LAN can discover this service and its listening port. Use only on a trusted network and set login credentials for the service."},
+    {"name": "addon_lan_lifetime", "value": "Announcements are off by default and apply only while the app process is running. Advertising does not start the service. Stopping the service withdraws its announcement."},
+    {"name": "addon_lan_public", "value": "Internet access"},
+    {"name": "addon_lan_exposure", "value": "LAN announcements never open a public port. Prefer a VPN for remote access."},
+    {"name": "addon_lan_lease", "value": "Optional IGDv2 gateway lease"},
+    {"name": "addon_lan_withdrawing", "value": "Withdrawing the announcement for port %d…"},
+    {"name": "addon_lan_published", "value": "Advertised · TCP %d"},
+    {"name": "addon_lan_off", "value": "Not advertised"},
+    {"name": "addon_lan_waiting", "value": "Waiting for the local service to start"},
+    {"name": "addon_lan_publishing", "value": "Advertising · TCP %d"},
+    {"name": "addon_lan_withdraw_failed", "value": "Withdrawal of the announcement for port %d was not confirmed. Try again."},
+    {"name": "addon_lan_registration_failed", "value": "Could not register the LAN announcement. Try again."}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "ui_capture_rate",
+      "value": "麦克风采样率"
+    },
+    {
+      "name": "ui_capture_channels",
+      "value": "麦克风声道"
+    },
+    {
+      "name": "ui_capture_readback",
+      "value": "%1$d Hz · %2$s"
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+{
+  "string": [
+    {
+      "name": "svc_ui_back",
+      "value": "Back"
+    },
+    {
+      "name": "svc_ui_camera",
+      "value": "Camera"
+    },
+    {
+      "name": "svc_ui_camera_hint",
+      "value": "Lens, resolution, frame rate and orientation"
+    },
+    {
+      "name": "svc_ui_encoder",
+      "value": "Encoder settings"
+    },
+    {
+      "name": "svc_ui_overlay_hint",
+      "value": "Text, location and image watermark"
+    },
+    {
+      "name": "svc_ui_lan_hint",
+      "value": "LAN announcements and manual port mapping"
+    },
+    {
+      "name": "svc_ui_switch_lens",
+      "value": "Switch front or rear camera"
+    },
+    {
+      "name": "svc_ui_more",
+      "value": "More actions"
+    },
+    {
+      "name": "svc_ui_close_menu",
+      "value": "Close menu"
+    },
+    {
+      "name": "svc_ui_size_fps",
+      "value": "Resolution and frame rate"
+    },
+    {
+      "name": "svc_ui_diagnostics",
+      "value": "Test pattern and service log"
+    },
+    {
+      "name": "svc_ui_rtmp_active",
+      "value": "RTMP •"
+    },
+    {
+      "name": "svc_ui_connect",
+      "value": "Connect"
+    },
+    {
+      "name": "svc_ui_share",
+      "value": "Share"
+    },
+    {
+      "name": "svc_ui_qr_hint",
+      "value": "Scan the code on the same network. Only the address is included; sign-in details are not shared."
+    },
+    {
+      "name": "svc_ui_protocol",
+      "value": "Address type"
+    },
+    {
+      "name": "svc_ui_format",
+      "value": "MP4 format"
+    },
+    {
+      "name": "svc_ui_storage",
+      "value": "Recording storage"
+    },
+    {
+      "name": "svc_ui_cloud_hint",
+      "value": "Manually archive completed recordings to OneDrive."
+    },
+    {
+      "name": "svc_ui_motion_category",
+      "value": "Motion detection"
+    },
+    {
+      "name": "svc_ui_viewer",
+      "value": "Viewer"
+    },
+    {
+      "name": "svc_ui_server",
+      "value": "Server"
+    },
+    {
+      "name": "svc_ui_clients",
+      "value": "Client: %d"
+    },
+    {
+      "name": "svc_ui_done",
+      "value": "OK"
+    },
+    {
+      "name": "svc_ui_torch",
+      "value": "Toggle camera light"
+    },
+    {
+      "name": "svc_ui_torch_failed",
+      "value": "This camera could not switch its light."
+    }
+  ]
+}

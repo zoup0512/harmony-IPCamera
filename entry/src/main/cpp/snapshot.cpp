@@ -212,6 +212,13 @@ void Snapshotter::FeedVideo(const uint8_t* data, size_t size) {
   }
 }
 
+void Snapshotter::ResetVideoInput() {
+  std::lock_guard<std::mutex> lk(stateMu_);
+  h265_ = false;
+  params_.clear();
+  lastIdr_.clear();
+}
+
 void Snapshotter::SetParams(bool h265, const std::vector<uint8_t>& paramsAnnexB) {
   std::lock_guard<std::mutex> lk(stateMu_);
   h265_ = h265;
@@ -223,32 +230,40 @@ void Snapshotter::CaptureAsync(const std::string& bmpPath, int width, int height
   std::vector<uint8_t> params;
   std::vector<uint8_t> idr;
   bool h265 = false;
+  const char* error = nullptr;
+  std::thread finished;
   {
-    std::lock_guard<std::mutex> lk(stateMu_);
-    params = params_;
-    idr = lastIdr_;
-    h265 = h265_;
+    std::lock_guard<std::mutex> workerLock(workerMu_);
+    {
+      std::lock_guard<std::mutex> lk(stateMu_);
+      if (lastIdr_.empty() || params_.empty()) {
+        error = "no keyframe cached yet";
+      } else if (IsBusy()) {
+        error = "snapshot already in progress";
+      } else {
+        params = params_;
+        idr = lastIdr_;
+        h265 = h265_;
+        workerBusy_->store(true);
+      }
+    }
+    if (!error) {
+      finished = std::move(worker_);
+      try {
+        auto busy = workerBusy_;
+        worker_ = std::thread([busy, bmpPath, width, height, done, params = std::move(params),
+                               idr = std::move(idr), h265]() mutable {
+          Snapshotter::DecodeWorker(bmpPath, width, height, done, std::move(params), std::move(idr), h265);
+          busy->store(false);
+        });
+      } catch (...) {
+        workerBusy_->store(false);
+        error = "snapshot worker start failed";
+      }
+    }
   }
-  if (idr.empty() || params.empty()) {
-    if (done) done(false, "no keyframe cached yet");
-    return;
-  }
-  if (workerBusy_->exchange(true)) {
-    if (done) done(false, "snapshot already in progress");
-    return;
-  }
-  std::lock_guard<std::mutex> workerLock(workerMu_);
-  if (worker_.joinable()) worker_.join();
-  try {
-    auto busy = workerBusy_;
-    worker_ = std::thread([busy, bmpPath, width, height, done, params, idr, h265]() {
-      Snapshotter::DecodeWorker(bmpPath, width, height, done, params, idr, h265);
-      busy->store(false);
-    });
-  } catch (...) {
-    workerBusy_->store(false);
-    if (done) done(false, "snapshot worker start failed");
-  }
+  if (finished.joinable()) finished.join();
+  if (error && done) done(false, error);
 }
 
 void Snapshotter::Stop() {

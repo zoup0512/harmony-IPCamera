@@ -1,9 +1,16 @@
 {
   "src": [
+    "pages/Devices",
     "pages/Index",
     "pages/OnvifScan",
     "pages/Playback",
     "pages/Player",
-    "pages/RtmpAddrs"
+    "pages/RtmpAddrs",
+    "pages/RemoteArchives",
+    "pages/OnvifManaged",
+    "pages/Delivery",
+    "pages/CloudArchive",
+    "pages/LanServiceSettings",
+    "pages/IgdLeaseSettings"
   ]
 }

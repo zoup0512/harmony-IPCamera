@@ -190,25 +190,34 @@ function setInterval(callback, delay) {
 function clearInterval(id) { timers.delete(id); }
 const fileIo = { accessSync: () => true, mkdirSync: () => {} };
 function getContext() { return { filesDir: '/test' }; }
-const RtspEvent = { Connected: 0, Disconnected: 1, Playing: 2, Error: 3 };
+const RtspEvent = { Connected: 0, Disconnected: 1, Playing: 2, Error: 3, CameraSizeChanged: 4 };
 const RtmpState = { Idle: 0 };
 class Page {
   constructor() {
-    Object.assign(this, { running: true, cameraRunning: true, pageActive: true,
+    this.motionRecordGate = new (require(process.argv[2]).MotionRecordingGate)();
+    Object.assign(this, { running: true, cameraRunning: true, pageActive: true, pageVisible: true,
       motionEnabled: false, motionRecording: false, recording: false,
       motionTimerId: -1, motionGeneration: 0, motionRecordPath: '',
-      motionTimeout: '15', segMinutes: '10', segFourGb: true, logs: [] });
+      recordVideo: 0, motionTimeout: '15', segMinutes: '10', segFourGb: true, logs: [],
+      manualRecordTimerId: -1 });
+    this.recorder = { reserve: () => 1, start: (id,path,opts) => this.server.startRecord(path,opts),
+      stop: id => { if (id) this.server.stopRecord(); } };
     this.server = {
       enabled: false, active: false, running: true, starts: 0, stops: 0, queries: 0,
       motionActive() { this.queries++; return this.running && this.enabled && this.active; },
       setMotion(enabled) { this.enabled = enabled; this.active = false; },
-      startRecord(path) { assert.match(path, /\/MD\/IPS_.*\.mp4$/); this.starts++; return true; },
-      stopRecord() { this.stops++; if (this.failStop) throw new Error('stop failed'); }
+      writerRunning: false,
+      isRecording() { return this.writerRunning; },
+      startRecord(path) { assert.match(path, /\/MD\/IPS_.*\.mp4$/); this.starts++; this.writerRunning = true; return true; },
+      stopRecord() { this.stops++; if (this.failStop) throw new Error('stop failed'); this.writerRunning = false; }
     };
   }
+  msg(key) { return key; }
+  requestMotionSnapshot() {}
   appendLog(message) { this.logs.push(message); }
   motionTimestamp() { return 'test'; }
   saveSetting() {}
+  syncRemoteCameraSize() {} // Size broadcasts are exercised in service_page_test.cjs.
   startCameraNow() { return true; }
   onStartServer() { this.running = true; }
 __METHODS__
@@ -297,12 +306,58 @@ test('start guards and stopped native server', () => {
   assert.equal(p.server.starts, 0);
   p.pageActive = true;
   p.recording = true;
+  p.server.writerRunning = true;
   tick(p);
   assert.equal(p.server.starts, 0, 'manual recorder is not replaced');
   p.recording = false;
   tick(p);
   p.server.running = false;
   tick(p);
+  assert.equal(p.server.stops, 1);
+});
+test('lost writer error does not claim a saved file or retry continuously', () => {
+  const p = activePage();
+  p.server.writerRunning = false; // Writer failed without an N-API event.
+  tick(p); tick(p);
+  assert.equal(p.motionRecording, false);
+  assert.equal(p.motionRecordPath, '');
+  assert.equal(p.server.starts, 1);
+  assert.equal(p.server.stops, 1);
+  assert.ok(!p.logs.some(msg => msg.includes('record saved')));
+  p.server.active = false;
+  tick(p);
+  p.server.active = true;
+  tick(p);
+  assert.equal(p.server.starts, 2);
+  assert.equal(p.motionRecording, true);
+  p.onStatus(RtspEvent.Error, 0, 'record: old writer');
+  assert.equal(p.motionRecording, true, 'stale error cannot stop the successor');
+  assert.equal(p.server.stops, 1);
+});
+test('reservation failure consumes this hit; next episode can open', () => {
+  const p = new Page(); p.onToggleMotion(); p.server.active = true;
+  let reservations = 0;
+  p.recorder.reserve = () => ++reservations === 1 ? 0 : 1;
+  tick(p); tick(p); tick(p);
+  assert.equal(reservations, 1); assert.equal(p.server.starts, 0);
+  p.server.active = false; tick(p);
+  p.server.active = true; tick(p);
+  assert.equal(reservations, 2); assert.equal(p.server.starts, 1);
+});
+test('hidden episode cannot open later on show but a fresh visible hit can', () => {
+  const p = new Page(); p.onToggleMotion(); p.pageVisible = false; p.server.active = true;
+  tick(p); p.pageVisible = true; tick(p); assert.equal(p.server.starts, 0);
+  p.server.active = false; tick(p); p.server.active = true; tick(p); assert.equal(p.server.starts, 1);
+});
+test('current manual writer error clears control and polling timer', () => {
+  const p = new Page();
+  p.recording = true; p.recordTicket = p.recorder.reserve();
+  p.server.writerRunning = false;
+  p.manualRecordTimerId = setInterval(() => {}, 250);
+  p.onStatus(RtspEvent.Error, 0, 'record: write failed');
+  assert.equal(p.recording, false);
+  assert.equal(p.manualRecordTimerId, -1);
+  assert.equal(timers.size, 0);
   assert.equal(p.server.stops, 1);
 });
 test('native disable still runs when recorder stop throws', () => {
@@ -342,11 +397,12 @@ class MotionRegression(unittest.TestCase):
     def test_ui_control_from_production_methods(self):
         source = (ETS / "pages/Index.ets").read_text(encoding="utf-8")
         names = ["onToggleMotion", "startMotionTimer", "stopMotionTimer",
-                 "onMotionStart", "onMotionStop", "stopMotionMode"]
+                 "onMotionStart", "onMotionStop", "stopMotionMode", "syncRecordingState",
+                 "stopManualRecordTimer", "releaseRecording", "recordingOptions", "validRecordingVideo", "reportProblem"]
         methods = "\n".join(definition(source, f"\n  {name}(") for name in names)
         callback = definition(source, "(event: number, clients: number, detail: string) => {")
         methods += "\n  onStatus(event, clients, detail) " + callback.split("=>", 1)[1]
-        methods = re.sub(r":\s*(?:void|boolean|number|string|RecordOptions)\b", "", methods)
+        methods = re.sub(r":\s*(?:void|boolean|number|string|RecordingSettings|RecordOptions)\b", "", methods)
         methods = methods.replace(" as common.UIAbilityContext", "")
         deveco = Path("C:/Program Files/Huawei/DevEco Studio/tools/node/node.exe")
         node = os.environ.get("NODE") or (str(deveco) if deveco.is_file() else shutil.which("node"))
@@ -355,7 +411,7 @@ class MotionRegression(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="motion-ui-test-") as temp:
             js = Path(temp) / "motion.cjs"
             js.write_text(UI_FIXTURE.replace("__METHODS__", methods) + UI_TESTS, encoding="utf-8")
-            print(run([node, str(js)], Path(temp)), end="")
+            print(run([node, str(js), str(ETS / "util/MotionRecordingGate.ts")], Path(temp)), end="")
 
     def test_api_and_lifecycle_wiring(self):
         napi = (CPP / "napi_init.cpp").read_text(encoding="utf-8")

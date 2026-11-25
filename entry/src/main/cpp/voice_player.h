@@ -9,9 +9,8 @@
 
 namespace ipcam {
 
-// Talk-back playback for /put_voice: HTTP bodies contain AAC ADTS bytes. Feed
-// accepts arbitrary chunk boundaries and queues complete raw AAC frames for the
-// system decoder.
+// Feed is for streaming ADTS (including split frames). FeedUpload validates one
+// complete Android AAC-LC M4A or ADTS message before replacing prior playback.
 class VoicePlayer {
  public:
   enum class FeedResult {
@@ -25,6 +24,7 @@ class VoicePlayer {
   ~VoicePlayer();
 
   FeedResult Feed(const uint8_t* data, size_t size);
+  FeedResult FeedUpload(const uint8_t* data, size_t size);
   void Stop();
   bool Active() const { return active_.load(); }
 

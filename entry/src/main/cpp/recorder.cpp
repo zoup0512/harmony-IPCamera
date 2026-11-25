@@ -21,6 +21,7 @@
 #include <multimedia/player_framework/native_avmemory.h>
 
 #include "codec_records.h"
+#include "archive_writer_lock.h"
 
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "StreamRecorder"
@@ -113,9 +114,16 @@ void StreamRecorder::SetOptions(const Options& options) {
   options_ = options;
 }
 
+void StreamRecorder::SetArchiveSink(std::function<void(const std::string&)> sink) {
+  std::lock_guard<std::mutex> lk(queueMu_);
+  defaultSink_ = sink ? CompletedSink([sink = std::move(sink)](const CompletedFile& file) {
+    sink(file.path);
+  }) : CompletedSink{};
+}
+
 bool StreamRecorder::Enqueue(Item item) {
   std::lock_guard<std::mutex> lk(queueMu_);
-  if (!accepting_.load()) return false;
+  if (!accepting_.load() || (item.audio && !activeOptions_.includeAudio)) return false;
   if (queue_.size() >= kQueueLimit) {
     OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
                  "recorder queue full; dropping %{public}s sample",
@@ -150,15 +158,17 @@ void StreamRecorder::ReportFatalError(const std::string& message) {
   }
 }
 
-bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink onError) {
+bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink onError,
+                           CompletedSink onCompleted) {
   if (accepting_.load() || running_.load()) return false;
   if (writerThread_.joinable()) {
     if (writerThread_.get_id() == std::this_thread::get_id()) return false;
     writerThread_.join();
   }
-  DestroyMuxerAndClose();
-
-  filePath_ = filePath;
+  {
+    std::lock_guard<std::mutex> lk(pathMu_);
+    filePath_ = filePath;
+  }
   rotation_ = rotation;
   segmentIndex_ = 1;
   pendingBaseReset_ = true;
@@ -173,6 +183,8 @@ bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink 
   {
     std::lock_guard<std::mutex> lk(queueMu_);
     queue_.clear();
+    activeOptions_ = options_;
+    onCompleted_ = onCompleted ? std::move(onCompleted) : defaultSink_;
   }
   {
     std::lock_guard<std::mutex> lk(errMu_);
@@ -180,8 +192,14 @@ bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink 
     errorReported_ = false;
   }
 
-  outputFd_ = open(filePath_.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+  if (filePath.empty() || filePath.find('\0') != std::string::npos) {
+    ReportFatalError("invalid recording path");
+    return false;
+  }
+  writingSegment_.store(1);
+  outputFd_ = OpenRecordingExclusive(filePath_.c_str());
   if (outputFd_ < 0) {
+    writingSegment_.store(0);
     ReportFatalError("open output failed, errno=" + std::to_string(errno));
     return false;
   }
@@ -192,7 +210,7 @@ bool StreamRecorder::Start(const std::string& filePath, int rotation, ErrorSink 
     writerThread_ = std::thread(&StreamRecorder::WriterLoop, this);
   } catch (...) {
     ReportFatalError("failed to start recorder writer thread");
-    DestroyMuxerAndClose();
+    CloseSegment(CloseReason::Stop, false);
     return false;
   }
 
@@ -301,7 +319,7 @@ void StreamRecorder::WriterLoop() {
 
       const bool graceExpired =
           startupWallSet && std::chrono::steady_clock::now() - startupWall >= kStartupGrace;
-      const bool settled = audioSeen || graceExpired || stopping;
+      const bool settled = !activeOptions_.includeAudio || audioSeen || graceExpired || stopping;
       if (videoParams.ready && settled && !startupPending.empty()) {
         std::stable_sort(startupPending.begin(), startupPending.end(),
                          [](const Item& lhs, const Item& rhs) { return lhs.tsUs < rhs.tsUs; });
@@ -353,8 +371,8 @@ void StreamRecorder::WriterLoop() {
     queue_.clear();
   }
   accepting_.store(false);
+  CloseSegment(CloseReason::Stop, !fatal);
   running_.store(false);
-  DestroyMuxerAndClose();
 }
 
 bool StreamRecorder::CreateMuxer(const VideoParams& videoParams, bool audioSeen,
@@ -566,11 +584,10 @@ bool StreamRecorder::WriteItem(const Item& item, bool videoIsH265) {
 
 bool StreamRecorder::ShouldRotate() {
   if (!started_) return false;
-  std::lock_guard<std::mutex> lk(queueMu_);
-  if (options_.fourGbLimit && segmentBytes_ >= kFourGbLimitBytes) return true;
-  if (options_.segmentMinutes > 0) {
+  if (activeOptions_.fourGbLimit && segmentBytes_ >= kFourGbLimitBytes) return true;
+  if (activeOptions_.segmentMinutes > 0) {
     auto elapsed = std::chrono::steady_clock::now() - segmentStart_;
-    if (elapsed >= std::chrono::minutes(options_.segmentMinutes)) return true;
+    if (elapsed >= std::chrono::minutes(activeOptions_.segmentMinutes)) return true;
   }
   return false;
 }
@@ -588,11 +605,13 @@ std::string StreamRecorder::SegmentPath(const std::string& basePath, int index) 
 bool StreamRecorder::RotateSegment(const VideoParams& videoParams, bool audioSeen,
                                    const AudioCfg& audioCfg) {
   std::string previous = SegmentPath(filePath_, segmentIndex_);
-  DestroyMuxerAndClose();
+  if (!CloseSegment(CloseReason::Rotation, true)) return false;
   segmentIndex_++;
   std::string next = SegmentPath(filePath_, segmentIndex_);
-  outputFd_ = open(next.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+  writingSegment_.store(segmentIndex_);
+  outputFd_ = OpenRecordingExclusive(next.c_str());
   if (outputFd_ < 0) {
+    writingSegment_.store(0);
     ReportFatalError("open segment output failed, errno=" + std::to_string(errno));
     return false;
   }
@@ -604,33 +623,52 @@ bool StreamRecorder::RotateSegment(const VideoParams& videoParams, bool audioSee
   return true;
 }
 
-void StreamRecorder::DestroyMuxerAndClose() {
+bool StreamRecorder::CloseSegment(CloseReason reason, bool publish) {
+  const bool hasSamples = started_ && segmentBytes_ > 0;
+  std::string completedPath;
+  std::string error;
+  uint64_t size = 0;
   if (muxer_ != nullptr) {
     if (started_) {
-      OH_AVErrCode stopErr = OH_AVMuxer_Stop(muxer_);
-      if (stopErr != AV_ERR_OK) {
-        ReportFatalError("OH_AVMuxer_Stop failed, err=" +
-                         std::to_string(static_cast<int>(stopErr)));
-      }
+      const auto err = OH_AVMuxer_Stop(muxer_);
+      if (err != AV_ERR_OK) error = "OH_AVMuxer_Stop failed, err=" + std::to_string(err);
     }
-    OH_AVErrCode destroyErr = OH_AVMuxer_Destroy(muxer_);
+    const auto err = OH_AVMuxer_Destroy(muxer_);
+    if (err != AV_ERR_OK && error.empty()) error = "OH_AVMuxer_Destroy failed, err=" + std::to_string(err);
     muxer_ = nullptr;
     started_ = false;
-    if (destroyErr != AV_ERR_OK) {
-      ReportFatalError("OH_AVMuxer_Destroy failed, err=" +
-                       std::to_string(static_cast<int>(destroyErr)));
-    }
   }
   videoTrack_ = -1;
   audioTrack_ = -1;
-
   if (outputFd_ >= 0) {
-    int fd = outputFd_;
+    if (publish && hasSamples && error.empty()) {
+      completedPath = SegmentPath(filePath_, segmentIndex_);
+      struct stat st {}, named {};
+      // An unlinked or replaced file may still be nonempty through its open fd.
+      if (fstat(outputFd_, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+          lstat(completedPath.c_str(), &named) == 0 && S_ISREG(named.st_mode) &&
+          st.st_dev == named.st_dev && st.st_ino == named.st_ino) {
+        size = static_cast<uint64_t>(st.st_size);
+      } else {
+        error = "finalized recording is missing, unreadable or empty";
+      }
+    }
+    if (close(outputFd_) != 0 && error.empty()) error = "close output failed, errno=" + std::to_string(errno);
     outputFd_ = -1;
-    if (close(fd) != 0) {
-      ReportFatalError("close output failed, errno=" + std::to_string(errno));
+  }
+  writingSegment_.store(0);
+  if (!error.empty()) {
+    ReportFatalError(error);
+    return false;
+  }
+  if (size && onCompleted_) {
+    try {
+      onCompleted_({std::move(completedPath), segmentIndex_, size, reason});
+    } catch (...) {
+      OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "recording completion sink threw");
     }
   }
+  return true;
 }
 
 void StreamRecorder::SetVideoParams(bool h265, const std::vector<uint8_t>& vps,
@@ -668,15 +706,19 @@ void StreamRecorder::FeedAudio(const uint8_t* adts, size_t size, int64_t tsUs) {
 }
 
 void StreamRecorder::Stop() {
-  accepting_.store(false);
-  running_.store(false);
+  { // Change the wait predicate under its mutex, including Stop-before-first-sample.
+    std::lock_guard<std::mutex> lk(queueMu_);
+    accepting_.store(false);
+  }
   queueCv_.notify_all();
 
   if (writerThread_.joinable()) {
     if (writerThread_.get_id() == std::this_thread::get_id()) return;
     writerThread_.join();
   }
-  DestroyMuxerAndClose();
+  CloseSegment(CloseReason::Stop, true);  // normally already drained and closed by the writer
+  onCompleted_ = nullptr;
+  running_.store(false);
 
   {
     std::lock_guard<std::mutex> lk(queueMu_);

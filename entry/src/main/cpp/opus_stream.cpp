@@ -15,14 +15,13 @@
 #include <multimedia/player_framework/native_avformat.h>
 #include <multimedia/player_framework/native_avmemory.h>
 
+#undef LOG_DOMAIN
+#undef LOG_TAG
 #define LOG_DOMAIN 0xC010
 #define LOG_TAG "OpusStream"
 
 namespace {
 
-constexpr int kSampleRate = 48000;
-constexpr int kChannels = 1;
-constexpr int kBitrate = 32000;
 constexpr size_t kPcmQueueLimit = 1u << 19;  // 512 KiB ≈ 5.4s of mono S16 @48k
 constexpr size_t kClientPageLimit = 400;     // ≈ 8s of 20ms pages per client
 
@@ -56,15 +55,15 @@ namespace ipcam {
 
 OpusStream::~OpusStream() { Shutdown(); }
 
-std::vector<uint8_t> OpusStream::BuildOpusHead() {
+std::vector<uint8_t> OpusStream::BuildOpusHead(int inputRate, int encodedChannels) {
   std::vector<uint8_t> p;
   p.insert(p.end(), {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd'});
   p.push_back(1);                        // version
-  p.push_back(static_cast<uint8_t>(kChannels));
+  p.push_back(static_cast<uint8_t>(encodedChannels));
   p.push_back(0x38);                     // pre-skip 0x0138 = 312 (libopus delay)
   p.push_back(0x01);
   for (int i = 0; i < 4; ++i) {          // input sample rate
-    p.push_back(static_cast<uint8_t>((kSampleRate >> (8 * i)) & 0xFF));
+    p.push_back(static_cast<uint8_t>((inputRate >> (8 * i)) & 0xFF));
   }
   p.push_back(0);                        // output gain lsb
   p.push_back(0);                        // output gain msb
@@ -119,257 +118,112 @@ std::vector<uint8_t> OpusStream::BuildOggPage(uint8_t headerType, uint64_t granu
 }
 
 bool OpusStream::CreateEncoderLocked() {
-  if (encoder_ != nullptr) return true;
-  encoderDestroying_ = false;
-  // Log what the system opus encoder actually supports so configuration can
-  // be adapted per device (some builds reject S16LE or explicit bitrates).
-  OH_AVCapability* cap = OH_AVCodec_GetCapability(OH_AVCODEC_MIMETYPE_AUDIO_OPUS, true);
-  if (cap == nullptr) {
-    OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
-                 "no opus encoder capability registered");
-    return false;
-  }
-  {
-    const int32_t* rates = nullptr;
-    uint32_t rateCount = 0;
-    if (OH_AVCapability_GetAudioSupportedSampleRates(cap, &rates, &rateCount) ==
-            AV_ERR_OK &&
-        rates != nullptr) {
-      std::string list;
-      for (uint32_t i = 0; i < rateCount && i < 24; ++i) {
-        list += std::to_string(rates[i]);
-        list += " ";
-      }
-      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                   "opus encoder supports %{public}u rates: %{public}s", rateCount,
-                   list.c_str());
-    }
-    OH_AVRange chRange{};
-    if (OH_AVCapability_GetAudioChannelCountRange(cap, &chRange) == AV_ERR_OK) {
-      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                   "opus channel range [%{public}lld, %{public}lld]",
-                   static_cast<long long>(chRange.minVal),
-                   static_cast<long long>(chRange.maxVal));
-    }
-    OH_AVRange brRange{};
-    if (OH_AVCapability_GetEncoderBitrateRange(cap, &brRange) == AV_ERR_OK) {
-      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                   "opus bitrate range [%{public}lld, %{public}lld]",
-                   static_cast<long long>(brRange.minVal),
-                   static_cast<long long>(brRange.maxVal));
-    }
-  }
-
-  // Opus input format differs across builds (S16LE vs F32LE). Configure is a
-  // one-shot state transition — after a failed Configure the codec instance
-  // stays unusable (next Configure returns INVALID_STATE), so each variant
-  // gets a freshly created encoder.
-  struct ConfigVariant {
-    int channels;
-    bool setFormat;
-    int32_t sampleFormat;
-    bool floatInput;
-    const char* label;
-  };
-  const ConfigVariant variants[] = {
-      {1, true, SAMPLE_S16LE, false, "mono/S16LE"},
-      {1, false, 0, false, "mono/bare"},
-      {2, true, SAMPLE_S16LE, false, "stereo/S16LE"},
-      {2, false, 0, false, "stereo/bare"},
-      {1, true, SAMPLE_F32LE, true, "mono/F32LE"},
-      {2, true, SAMPLE_F32LE, true, "stereo/F32LE"},
-  };
-  bool configured = false;
-  OH_AVErrCode lastErr = AV_ERR_UNKNOWN;
-  // Diagnostic: some codec builds only accept the new buffer API; an old-style
-  // SetCallback before Configure can lock the state machine. Try Configure on
-  // a bare instance first to isolate the cause.
-  if (encoder_ != nullptr) {
-    OH_AudioEncoder_Destroy(encoder_);
-    encoder_ = nullptr;
-  }
-  // Some vendor builds register opus only under its explicit codec name (or
-  // only in the SOFTWARE category); CreateByMime then yields an unusable
-  // instance whose Configure always returns UNSUPPORT. Probe both and create
-  // by name when available.
-  OH_AVCapability* softCap =
-      OH_AVCodec_GetCapabilityByCategory(OH_AVCODEC_MIMETYPE_AUDIO_OPUS, true,
-                                          SOFTWARE);
-  if (softCap != nullptr) {
-    const char* name = OH_AVCapability_GetName(softCap);
-    OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                 "opus software codec name: %{public}s", name != nullptr ? name : "(null)");
-    if (name != nullptr && name[0] != '\0') {
-      encoder_ = OH_AudioEncoder_CreateByName(name);
-      OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                   "CreateByName -> %{public}p", encoder_);
-      if (encoder_ != nullptr) {
-        OH_AVCodecAsyncCallback cb0{};
-        cb0.onError = OnError;
-        cb0.onStreamChanged = OnStreamChanged;
-        cb0.onNeedInputData = OnNeedInputData;
-        cb0.onNeedOutputData = OnNewOutputData;
-        if (OH_AudioEncoder_SetCallback(encoder_, cb0, this) == AV_ERR_OK) {
-          OH_AVFormat* f = OH_AVFormat_Create();
-          OH_AVFormat_SetIntValue(f, OH_MD_KEY_AUD_SAMPLE_RATE, kSampleRate);
-          OH_AVFormat_SetIntValue(f, OH_MD_KEY_AUD_CHANNEL_COUNT, kChannels);
-          OH_AVFormat_SetIntValue(f, OH_MD_KEY_AUDIO_SAMPLE_FORMAT, SAMPLE_S16LE);
-          lastErr = OH_AudioEncoder_Configure(encoder_, f);
-          OH_AVFormat_Destroy(f);
-          OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                       "Configure(by-name)=%{public}d", static_cast<int>(lastErr));
-          if (lastErr == AV_ERR_OK) {
-            inputFloat_ = false;
-            encChannels_ = kChannels;
-            configured = true;
-
+  if (encoder_) return true;
+  OH_AVCodecAsyncCallback cb{};
+  cb.onError = OnError;
+  cb.onStreamChanged = OnStreamChanged;
+  cb.onNeedInputData = OnNeedInputData;
+  cb.onNeedOutputData = OnNewOutputData;
+  OH_AVCapability* soft = OH_AVCodec_GetCapabilityByCategory(OH_AVCODEC_MIMETYPE_AUDIO_OPUS, true, SOFTWARE);
+  if (!soft && !OH_AVCodec_GetCapability(OH_AVCODEC_MIMETYPE_AUDIO_OPUS, true)) return false;
+  const char* name = soft ? OH_AVCapability_GetName(soft) : nullptr;
+  const int preferred = IsOpusRate(sampleRate_) ? sampleRate_ : 48000;
+  const int rates[] = {preferred, 48000, 24000, 16000, 12000, 8000};
+  // Rate conversion can preserve stereo; only mix channels if no matching
+  // channel count works at ANY native Opus input rate.
+  for (int channels : {channels_, 3 - channels_}) {
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); ++i) {
+      if (i && rates[i] == preferred) continue;
+      for (bool byName : {true, false}) {
+        if (byName && (!name || !*name)) continue;
+        for (bool asFloat : {false, true}) {
+          OH_AVCodec* codec = byName ? OH_AudioEncoder_CreateByName(name) :
+                                       OH_AudioEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_AUDIO_OPUS);
+          if (!codec) break;
+          OH_AVFormat* format = OH_AVFormat_Create();
+          bool ok = format && OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_SAMPLE_RATE, rates[i]) &&
+                    OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_CHANNEL_COUNT, channels) &&
+                    OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUDIO_SAMPLE_FORMAT,
+                                            asFloat ? SAMPLE_F32LE : SAMPLE_S16LE) &&
+                    OH_AudioEncoder_SetCallback(codec, cb, this) == AV_ERR_OK &&
+                    OH_AudioEncoder_Configure(codec, format) == AV_ERR_OK &&
+                    OH_AudioEncoder_Prepare(codec) == AV_ERR_OK;
+          if (format) OH_AVFormat_Destroy(format);
+          if (!ok) {
+            OH_AudioEncoder_Destroy(codec);
+            continue;
           }
+          {
+            std::lock_guard<std::mutex> lk(pcmMu_);
+            converter_.Reset(sampleRate_, channels_, rates[i], channels);
+            encRate_ = rates[i]; encChannels_ = channels; inputFloat_ = asFloat;
+            nextSampleFrame_ = 0;
+            encoderFailed_ = false;
+            encoderDestroying_ = false;
+            encoder_ = codec;
+          }
+          // Native Start/Stop may wait for callbacks: neither the PCM mutex
+          // nor the clients mutex can be held across these calls.
+          if (OH_AudioEncoder_Start(codec) != AV_ERR_OK || encoderFailed_) {
+            DestroyEncoderLocked();
+            continue;
+          }
+          headPages_ = BuildOggPage(0x02, 0, pageSerial_, 0, BuildOpusHead(sampleRate_, channels));
+          auto tags = BuildOggPage(0x00, 0, pageSerial_, 1, BuildOpusTags());
+          headPages_.insert(headPages_.end(), tags.begin(), tags.end());
+          return true;
         }
       }
     }
   }
-  if (!configured && encoder_ != nullptr) {
-    OH_AudioEncoder_Destroy(encoder_);
-    encoder_ = nullptr;
-  }
-  encoder_ = OH_AudioEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_AUDIO_OPUS);
-  if (encoder_ != nullptr) {
-    OH_AVFormat* format = OH_AVFormat_Create();
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_SAMPLE_RATE, kSampleRate);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_CHANNEL_COUNT, kChannels);
-    lastErr = OH_AudioEncoder_Configure(encoder_, format);
-    OH_AVFormat_Destroy(format);
-    OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                 "Configure(no-callback)=%{public}d", static_cast<int>(lastErr));
-    if (lastErr == AV_ERR_OK) {
-      // State machine accepts configure without prior callback; the old-style
-      // SetCallback was the blocker. Register callbacks now (INITIALIZED state
-      // after configure still accepts them on most builds).
-      OH_AVCodecAsyncCallback cb{};
-      cb.onError = OnError;
-      cb.onStreamChanged = OnStreamChanged;
-      cb.onNeedInputData = OnNeedInputData;
-      cb.onNeedOutputData = OnNewOutputData;
-      if (OH_AudioEncoder_SetCallback(encoder_, cb, this) == AV_ERR_OK) {
-        inputFloat_ = false;
-        encChannels_ = kChannels;
-        configured = true;
-
-      }
-    }
-  }
-  if (!configured) {
-  for (const ConfigVariant& variant : variants) {
-    if (encoder_ != nullptr) {
-      OH_AudioEncoder_Destroy(encoder_);
-      encoder_ = nullptr;
-    }
-    encoder_ = OH_AudioEncoder_CreateByMime(OH_AVCODEC_MIMETYPE_AUDIO_OPUS);
-    if (encoder_ == nullptr) {
-      OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "CreateByMime null");
-      return false;
-    }
-    OH_AVCodecAsyncCallback cb{};
-    cb.onError = OnError;
-    cb.onStreamChanged = OnStreamChanged;
-    cb.onNeedInputData = OnNeedInputData;
-    cb.onNeedOutputData = OnNewOutputData;
-    if (OH_AudioEncoder_SetCallback(encoder_, cb, this) != AV_ERR_OK) {
-      OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "SetCallback failed");
-      OH_AudioEncoder_Destroy(encoder_);
-      encoder_ = nullptr;
-      return false;
-    }
-    OH_AVFormat* format = OH_AVFormat_Create();
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_SAMPLE_RATE, kSampleRate);
-    OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUD_CHANNEL_COUNT, variant.channels);
-    if (variant.setFormat) {
-      OH_AVFormat_SetIntValue(format, OH_MD_KEY_AUDIO_SAMPLE_FORMAT, variant.sampleFormat);
-    }
-    lastErr = OH_AudioEncoder_Configure(encoder_, format);
-    OH_AVFormat_Destroy(format);
-    OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "Configure(%{public}s)=%{public}d",
-                 variant.label, static_cast<int>(lastErr));
-    if (lastErr == AV_ERR_OK) {
-      inputFloat_ = variant.floatInput;
-      encChannels_ = variant.channels;
-      configured = true;
-      break;
-    }
-  }  // variant loop
-  }  // !configured guard (diagnostic path first)
-  if (!configured) {
-    OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
-                 "Configure all variants failed");
-    OH_AudioEncoder_Destroy(encoder_);
-    encoder_ = nullptr;
-    return false;
-  }
-  if (OH_AudioEncoder_Prepare(encoder_) != AV_ERR_OK ||
-      OH_AudioEncoder_Start(encoder_) != AV_ERR_OK) {
-    OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "Prepare/Start failed");
-    OH_AudioEncoder_Destroy(encoder_);
-    encoder_ = nullptr;
-    return false;
-  }
-  nextSampleFrame_ = 0;
-  pcmQueue_.clear();
-  pendingInputs_.clear();
-  encoderFailed_.store(false);
-  pageSequence_ = 0;
-  headPages_.clear();
-  headPages_ = BuildOggPage(0x02, 0, pageSerial_, pageSequence_++, BuildOpusHead());
-  std::vector<uint8_t> tagsPage =
-      BuildOggPage(0x00, 0, pageSerial_, pageSequence_++, BuildOpusTags());
-  headPages_.insert(headPages_.end(), tagsPage.begin(), tagsPage.end());
-  OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-               "opus encoder started (%{public}dHz x%{public}d @%{public}d)", kSampleRate,
-               kChannels, kBitrate);
-  return true;
+  return false;
 }
 
-void OpusStream::DestroyEncoderLocked(std::unique_lock<std::mutex>& lk) {
-  // PushInputData runs with pcmMu_ released; block new drain iterations and
-  // wait out the in-flight one before the codec handle is destroyed.
-  encoderDestroying_ = true;
-  pcmCv_.wait(lk, [this] { return !drainActive_; });
-  if (encoder_ != nullptr) {
-    OH_AudioEncoder_Stop(encoder_);
-    OH_AudioEncoder_Destroy(encoder_);
+void OpusStream::DestroyEncoderLocked() {
+  OH_AVCodec* codec;
+  {
+    std::unique_lock<std::mutex> lk(pcmMu_);
+    encoderDestroying_ = true;
+    pcmCv_.wait(lk, [this] { return !drainActive_; });
+    codec = encoder_;
     encoder_ = nullptr;
-    OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "opus encoder stopped");
+    pendingInputs_.clear();
+    pcmQueue_.clear();
   }
-  pcmQueue_.clear();
-  pendingInputs_.clear();
+  if (codec) {
+    OH_AudioEncoder_Stop(codec);
+    OH_AudioEncoder_Destroy(codec);
+  }
 }
 
 bool OpusStream::EnsureReady() {
-  std::unique_lock<std::mutex> lk(pcmMu_);
-  if (readyChecked_) return encoderAvailable_;
-  // One-time probe: create and immediately destroy; the real encoder is
-  // created when the first client connects.
-  encoderAvailable_ = CreateEncoderLocked();
-  DestroyEncoderLocked(lk);
-  readyChecked_ = true;
+  std::lock_guard<std::mutex> lk(controlMu_);
+  if (!SourceActive()) return false;
+  if (encoder_) return !encoderFailed_;
+  if (!readyChecked_) {
+    encoderAvailable_ = CreateEncoderLocked();
+    DestroyEncoderLocked();
+    readyChecked_ = true;
+  }
   return encoderAvailable_;
 }
 
-void OpusStream::OnError(OH_AVCodec*, int32_t errorCode, void* userData) {
+void OpusStream::OnError(OH_AVCodec* codec, int32_t errorCode, void* userData) {
   auto self = static_cast<OpusStream*>(userData);
-  OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "encoder error %{public}d",
-               errorCode);
+  OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "encoder error %{public}d", errorCode);
   std::lock_guard<std::mutex> lk(self->pcmMu_);
-  self->encoderFailed_ = true;
+  if (self->encoder_ == codec) self->encoderFailed_ = true;
+  self->clientsCv_.notify_all();
 }
 
 void OpusStream::OnStreamChanged(OH_AVCodec*, OH_AVFormat*, void*) {}
 
-void OpusStream::OnNeedInputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data,
+void OpusStream::OnNeedInputData(OH_AVCodec* codec, uint32_t index, OH_AVMemory* data,
                                  void* userData) {
   auto self = static_cast<OpusStream*>(userData);
   {
     std::lock_guard<std::mutex> lk(self->pcmMu_);
-    if (self->encoder_ == nullptr) return;
+    if (self->encoder_ != codec || self->encoderDestroying_) return;
     self->pendingInputs_.push_back({index, data});
   }
   self->DrainPendingInputs();
@@ -401,39 +255,32 @@ void OpusStream::DrainPendingInputs() {
         pendingInputs_.pop_front();
         continue;
       }
-      // The PCM tap is mono S16LE; the encoder may be mono or stereo, S16 or F32.
-      const size_t srcSamples = pcmQueue_.size() / 2;
-      const size_t bytesPerSampleOut = inputFloat_ ? 4 : 2;
-      const size_t outCapacity =
-          static_cast<size_t>(capacity) / (bytesPerSampleOut * encChannels_);
-      size_t samples = std::min(srcSamples, outCapacity);
-      if (samples == 0) {
+      const size_t frameBytes = 2 * encChannels_;
+      const size_t outFrameBytes = (inputFloat_ ? 4 : 2) * encChannels_;
+      const size_t outCapacity = static_cast<size_t>(capacity) / outFrameBytes;
+      // One complete Opus frame per buffer (20, 10, 5 or 2.5 ms).
+      size_t samples = encRate_ / 50;
+      while (samples > outCapacity && samples > static_cast<size_t>(encRate_ / 400)) samples /= 2;
+      const size_t filled = samples * frameBytes;
+      if (samples > outCapacity || pcmQueue_.size() < filled) {
+        if (samples > outCapacity) encoderFailed_ = true;
         drainActive_ = false;
         pcmCv_.notify_all();
         return;
       }
-      const size_t filled = samples * 2;  // bytes consumed from the mono tap
-      pushBytes = samples * bytesPerSampleOut * encChannels_;
-      const int16_t* src = reinterpret_cast<const int16_t*>(pcmQueue_.data());
+      pushBytes = samples * outFrameBytes;
       if (inputFloat_) {
-        float* out = reinterpret_cast<float*>(dst);
-        for (size_t i = 0; i < samples; ++i) {
-          float v = static_cast<float>(src[i]) / 32768.0f;
-          for (int c = 0; c < encChannels_; ++c) out[i * encChannels_ + c] = v;
+        for (size_t i = 0; i < samples * encChannels_; ++i) {
+          float v = OpusPcmConverter::Read(pcmQueue_.data() + 2 * i) / 32768.0f;
+          memcpy(dst + 4 * i, &v, sizeof(v));
         }
-      } else if (encChannels_ == 1) {
-        memcpy(dst, pcmQueue_.data(), filled);
       } else {
-        int16_t* out = reinterpret_cast<int16_t*>(dst);
-        for (size_t i = 0; i < samples; ++i) {
-          out[i * 2] = src[i];
-          out[i * 2 + 1] = src[i];
-        }
+        memcpy(dst, pcmQueue_.data(), filled);
       }
       pcmQueue_.erase(pcmQueue_.begin(),
                       pcmQueue_.begin() + static_cast<long>(filled));
       pendingInputs_.pop_front();
-      ptsUs = static_cast<uint64_t>(nextSampleFrame_ * 1000000ULL) / kSampleRate;
+      ptsUs = static_cast<uint64_t>(nextSampleFrame_ * 1000000ULL) / encRate_;
       nextSampleFrame_ += samples;
     }
     OH_AVCodecBufferAttr attr{};
@@ -441,6 +288,7 @@ void OpusStream::DrainPendingInputs() {
     attr.pts = static_cast<int64_t>(ptsUs);
     attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
     if (OH_AudioEncoder_PushInputData(encoder_, pending.index, attr) != AV_ERR_OK) {
+      encoderFailed_ = true;
       std::lock_guard<std::mutex> lk(pcmMu_);
       drainActive_ = false;
       pcmCv_.notify_all();
@@ -449,51 +297,49 @@ void OpusStream::DrainPendingInputs() {
   }
 }
 
-void OpusStream::OnNewOutputData(OH_AVCodec*, uint32_t index, OH_AVMemory* data,
+void OpusStream::OnNewOutputData(OH_AVCodec* codec, uint32_t index, OH_AVMemory* data,
                                  OH_AVCodecBufferAttr* attr, void* userData) {
   auto self = static_cast<OpusStream*>(userData);
-  if (attr != nullptr && !(attr->flags & AVCODEC_BUFFER_FLAGS_EOS) && attr->size > 0 &&
-      data != nullptr) {
-    const uint8_t* packet = OH_AVMemory_GetAddr(data);
-    if (packet != nullptr) {
-      // Opus granule position = PCM samples @48k; derive it from the source
-      // pts so encoder-internal delay handling does not matter.
-      uint64_t granule = static_cast<uint64_t>(attr->pts) * kSampleRate / 1000000ULL;
-      std::vector<uint8_t> body(packet, packet + attr->size);
-      std::vector<uint8_t> page =
-          BuildOggPage(0x00, granule, self->pageSerial_, self->pageSequence_++, body);
-      self->BroadcastPage(page);
+  if (attr && data && !(attr->flags & (AVCODEC_BUFFER_FLAGS_EOS | AVCODEC_BUFFER_FLAGS_CODEC_DATA)) &&
+      attr->size > 0 && attr->size < 255 * 255 && attr->offset >= 0) {
+    const auto* base = OH_AVMemory_GetAddr(data);
+    const int capacity = OH_AVMemory_GetSize(data);
+    if (base && attr->offset <= capacity && attr->size <= capacity - attr->offset) {
+      const uint8_t* packet = base + attr->offset;
+      const unsigned ticks = OpusPacketTicks(packet, attr->size);
+      if (ticks) self->BroadcastPacket({packet, packet + attr->size}, ticks);
     }
   }
-  OH_AudioEncoder_FreeOutputData(self->encoder_, index);
+  OH_AudioEncoder_FreeOutputData(codec, index);
 }
 
-void OpusStream::BroadcastPage(const std::vector<uint8_t>& page) {
+void OpusStream::BroadcastPacket(const std::vector<uint8_t>& packet, unsigned ticks) {
   std::lock_guard<std::mutex> lk(clientsMu_);
   for (auto& client : clients_) {
     if (client->closed) continue;
     if (client->pages.size() >= kClientPageLimit) {
-      client->closed = true;  // slow consumer: drop the connection
+      client->closed = true;
       continue;
     }
-    client->pages.push_back(page);
+    client->granule += ticks;
+    client->pages.push_back(BuildOggPage(0, client->granule, pageSerial_, client->sequence++, packet));
   }
   clientsCv_.notify_all();
 }
 
 void OpusStream::FeedPcm(const uint8_t* pcm, size_t bytes, int sampleRate, int channels) {
-  if (!sourceActive_.load() || bytes == 0) return;
-  if (sampleRate != sampleRate_ || channels != channels_) return;
-  bool needDrain = false;
+  if (!SourceActive() || !pcm || !bytes) return;
+  bool needDrain;
   {
     std::lock_guard<std::mutex> lk(pcmMu_);
-    if (encoder_ == nullptr || encoderFailed_.load()) return;
-    pcmQueue_.insert(pcmQueue_.end(), pcm, pcm + bytes);
+    if (!encoder_ || encoderDestroying_ || encoderFailed_ || sampleRate != sampleRate_ || channels != channels_) return;
+    converter_.Append(pcm, bytes / (2 * channels), pcmQueue_);
     if (pcmQueue_.size() > kPcmQueueLimit) {
+      const size_t frameBytes = 2 * encChannels_;
       size_t drop = pcmQueue_.size() - kPcmQueueLimit / 2;
-      drop -= drop % (2 * kChannels);
-      pcmQueue_.erase(pcmQueue_.begin(), pcmQueue_.begin() + static_cast<long>(drop));
-      nextSampleFrame_ += drop / (2 * kChannels);
+      drop -= drop % frameBytes;
+      pcmQueue_.erase(pcmQueue_.begin(), pcmQueue_.begin() + drop);
+      nextSampleFrame_ += drop / frameBytes;
     }
     needDrain = !pendingInputs_.empty();
   }
@@ -501,19 +347,13 @@ void OpusStream::FeedPcm(const uint8_t* pcm, size_t bytes, int sampleRate, int c
 }
 
 bool OpusStream::Serve(int fd, const std::atomic<bool>& serverRunning) {
-  if (!EnsureReady()) return false;
-
   auto client = std::make_shared<Client>();
   client->fd = fd;
   std::vector<uint8_t> headPages;
   {
-    std::lock_guard<std::mutex> lk(pcmMu_);
-    if (encoder_ == nullptr && !CreateEncoderLocked()) {
-      return false;
-    }
+    std::lock_guard<std::mutex> lifecycle(controlMu_);
+    if (!SourceActive() || !CreateEncoderLocked()) return false;
     headPages = headPages_;
-  }
-  {
     std::lock_guard<std::mutex> lk(clientsMu_);
     clients_.push_back(client);
   }
@@ -557,27 +397,44 @@ bool OpusStream::Serve(int fd, const std::atomic<bool>& serverRunning) {
   }
 
   {
-    std::lock_guard<std::mutex> lk(clientsMu_);
-    clients_.erase(std::remove(clients_.begin(), clients_.end(), client), clients_.end());
-    bool none = clients_.empty();
-    clientsCv_.notify_all();
-    if (none) {
-      std::unique_lock<std::mutex> lk2(pcmMu_);
-      DestroyEncoderLocked(lk2);
+    std::lock_guard<std::mutex> lifecycle(controlMu_);
+    bool last = false;
+    {
+      std::lock_guard<std::mutex> lk(clientsMu_);
+      auto it = std::find(clients_.begin(), clients_.end(), client);
+      if (it != clients_.end()) {
+        clients_.erase(it);
+        last = clients_.empty();
+      }
     }
+    if (last) DestroyEncoderLocked();
   }
   return !client->closed;
 }
 
-void OpusStream::Shutdown() {
-  {
-    std::lock_guard<std::mutex> lk(clientsMu_);
-    for (auto& client : clients_) client->closed = true;
-    clients_.clear();
-    clientsCv_.notify_all();
-  }
-  std::unique_lock<std::mutex> lk(pcmMu_);
-  DestroyEncoderLocked(lk);
+void OpusStream::CloseClientsLocked() {
+  std::lock_guard<std::mutex> lk(clientsMu_);
+  for (auto& client : clients_) client->closed = true;
+  clients_.clear();
+  clientsCv_.notify_all();
 }
+
+void OpusStream::SetSourceActive(bool active, int sampleRate, int channels) {
+  std::lock_guard<std::mutex> lifecycle(controlMu_);
+  if (active && (sampleRate <= 0 || (channels != 1 && channels != 2))) active = false;
+  if (active && SourceActive() && sampleRate_ == sampleRate && channels_ == channels) return;
+  sourceActive_ = false;
+  CloseClientsLocked();
+  DestroyEncoderLocked();
+  readyChecked_ = false;
+  if (active) {
+    std::lock_guard<std::mutex> lk(pcmMu_);
+    sampleRate_ = sampleRate;
+    channels_ = channels;
+    sourceActive_ = true;
+  }
+}
+
+void OpusStream::Shutdown() { SetSourceActive(false); }
 
 }  // namespace ipcam

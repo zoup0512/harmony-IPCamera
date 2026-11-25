@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "ui_capture_rate",
+      "value": "Microphone sample rate"
+    },
+    {
+      "name": "ui_capture_channels",
+      "value": "Microphone channels"
+    },
+    {
+      "name": "ui_capture_readback",
+      "value": "%1$d Hz · %2$s"
+    }
+  ]
+}

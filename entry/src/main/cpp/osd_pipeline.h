@@ -7,12 +7,14 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <native_buffer/native_buffer.h>
 #include <native_image/native_image.h>
 #include <native_window/external_window.h>
 
+#include "capture_orientation.h"
 #include "osd_renderer.h"
 
 namespace ipcam {
@@ -31,6 +33,11 @@ class OsdPipeline {
   using FrameSink = std::function<void(const uint8_t* nv12, size_t size)>;
   using ErrorSink = std::function<void(const std::string&)>;
 
+  // Configure before Start, never while running. Called on the worker with a
+  // tightly packed, rotated (not yet mirrored) NV12 frame. False drops it for all sinks.
+  using PreOverlay = std::function<bool(uint8_t*, size_t, int, int)>;
+  void SetPreOverlay(PreOverlay cb) { preOverlay_ = std::move(cb); }
+
   OsdPipeline() = default;
   ~OsdPipeline();
   OsdPipeline(const OsdPipeline&) = delete;
@@ -39,11 +46,11 @@ class OsdPipeline {
   // Creates the consumer surface, boots the worker thread and returns the
   // surface id the camera PreviewOutput must render into. Blocks until init
   // finished. uiSurfaceId (local XComponent preview, 0 = none) is adopted
-  // first: its display transform decides how far frames rotate so the encoded
-  // picture stands upright — for a 90/270 rotation the encoder dimensions
-  // become (reqHeight, reqWidth), exposed via OutWidth()/OutHeight().
+  // first: only Auto samples its original rotation (no surface = 0). The
+  // session's 90/270 output is (reqHeight, reqWidth) for both sinks.
   bool Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
-             uint64_t* cameraSurfaceId, FrameSink sink, ErrorSink onError);
+             uint64_t* cameraSurfaceId, FrameSink sink, ErrorSink onError,
+             CaptureOrientation orientation = {});
   void Stop();
 
   int rotation() const { return rotation_; }
@@ -93,6 +100,7 @@ class OsdPipeline {
   int inH_ = 0;
   int outW_ = 0;  // encoder-facing output (swapped when rotating 90/270)
   int outH_ = 0;
+  CaptureOrientation orientation_;  // Latched before starting either worker.
   int rotation_ = 0;         // 0/90/180/270 applied to every frame
   int uiOrigTransform_ = -1;  // display transform to restore on ClearUiSurface
 
@@ -120,6 +128,7 @@ class OsdPipeline {
   std::vector<uint8_t> presentFrame_;
   bool presentPending_ = false;
   bool presentQuit_ = false;
+  PreOverlay preOverlay_;
   FrameSink sink_;
   ErrorSink onError_;
   std::atomic<bool> stopped_{false};

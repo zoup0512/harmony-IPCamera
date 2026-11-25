@@ -45,18 +45,6 @@ inline void RgbToYuv(int r, int g, int b, uint8_t* y, uint8_t* u, uint8_t* v) {
   *v = static_cast<uint8_t>(((r * 112) - (g * 94) - (b * 18) + 128) >> 8) + 128;
 }
 
-inline void YuvToRgb(int y, int u, int v, int* r, int* g, int* b) {
-  int yy = (y - 16) * 0x2568;
-  int uu = u - 128;
-  int vv = v - 128;
-  *r = (yy + 0x3343 * vv) >> 13;
-  *g = (yy - 0x0c92 * vv - 0x1a1e * uu) >> 13;
-  *b = (yy + 0x40cf * uu) >> 13;
-  if (*r < 0) *r = 0; else if (*r > 255) *r = 255;
-  if (*g < 0) *g = 0; else if (*g > 255) *g = 255;
-  if (*b < 0) *b = 0; else if (*b > 255) *b = 255;
-}
-
 // Per-buffer-slot mapping cache. Camera buffers cycle through a small fixed
 // set of queue slots; each slot is mapped exactly once via
 // FromNativeWindowBuffer + Map. Per-frame Unmap/Unreference is fatal here:
@@ -168,9 +156,12 @@ bool OsdPipeline::SetUiSurface(uint64_t surfaceId) {
     return false;
   }
   int transform = 0;
-  OH_NativeWindow_NativeWindowHandleOpt(window, GET_TRANSFORM, &transform);
+  if (OH_NativeWindow_NativeWindowHandleOpt(window, GET_TRANSFORM, &transform) != 0) {
+    OH_NativeWindow_DestroyNativeWindow(window);
+    return false;
+  }
   int rot = RotationFromTransform(transform);
-  if (rot != rotation_) {
+  if (orientation_.rotation == CaptureRotation::Auto && rot != rotation_) {
     // The encoder geometry is fixed for this run; only the preview would be
     // able to follow the new orientation.
     OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
@@ -201,6 +192,11 @@ bool OsdPipeline::SetUiSurface(uint64_t surfaceId) {
                "usage=0x%{public}llx",
                usageRet, geomRet, fmtRet, transformRet, transform, gotW, gotH,
                gotFmt, static_cast<unsigned long long>(gotUsage));
+  if (transformRet != 0 || geomRet != 0 || fmtRet != 0 || usageRet != 0) {
+    OH_NativeWindow_NativeWindowHandleOpt(window, SET_TRANSFORM, transform);
+    OH_NativeWindow_DestroyNativeWindow(window);
+    return false;
+  }
   ClearUiSurfaceLocked();
   uiWindow_ = window;
   uiSurfaceId_ = surfaceId;
@@ -391,7 +387,8 @@ void OsdPipeline::Fail(const char* what) {
 
 bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
                         uint64_t* cameraSurfaceId, FrameSink sink,
-                        ErrorSink onError) {
+                        ErrorSink onError, CaptureOrientation orientation) {
+  if (!orientation.Valid()) return false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     sink_ = std::move(sink);
@@ -406,25 +403,33 @@ bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
     Fail("invalid OSD output dimensions");
     return false;
   }
-  // Adopt the local preview surface first: its display transform tells how far
-  // sensor frames must rotate for the encoded picture to stand upright, and
-  // that fixes the encoder dimensions before anything is configured.
+  // Sample the preview's original angle for Auto only. Fixed choices replace
+  // it, not add to it. Resolve encoder geometry before either worker starts.
   std::unique_lock<std::mutex> uiLock(uiMu_);
-  rotation_ = 0;
+  orientation_ = orientation;
+  rotation_ = orientation.Resolve(0);  // Fixed modes also work headless.
   uiOrigTransform_ = -1;
   if (uiSurfaceId != 0) {
     OHNativeWindow* window = nullptr;
     if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(uiSurfaceId, &window) == 0 &&
         window != nullptr) {
       int transform = 0;
-      OH_NativeWindow_NativeWindowHandleOpt(window, GET_TRANSFORM, &transform);
-      rotation_ = RotationFromTransform(transform);
+      if (OH_NativeWindow_NativeWindowHandleOpt(window, GET_TRANSFORM, &transform) != 0) {
+        OH_NativeWindow_DestroyNativeWindow(window);
+        uiLock.unlock();
+        Fail("cannot read original preview transform");
+        return false;
+      }
+      rotation_ = orientation.Resolve(RotationFromTransform(transform));
       // The pipeline delivers already-rotated frames; the render service must
       // not rotate them again. ClearUiSurface restores the original transform
       // so the raw camera path keeps its selfie view.
-      OH_NativeWindow_NativeWindowHandleOpt(window, SET_TRANSFORM,
-                                            NATIVEBUFFER_ROTATE_NONE);
-      OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE, kCpuUsage);
+      if (OH_NativeWindow_NativeWindowHandleOpt(window, SET_TRANSFORM, NATIVEBUFFER_ROTATE_NONE) != 0) {
+        OH_NativeWindow_DestroyNativeWindow(window);
+        uiLock.unlock();
+        Fail("cannot disable second preview rotation");
+        return false;
+      }
       uiWindow_ = window;
       uiSurfaceId_ = uiSurfaceId;
       uiOrigTransform_ = transform;
@@ -432,10 +437,9 @@ bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
                    "ui preview surface transform=%{public}d -> rotate %{public}d",
                    transform, rotation_);
     } else {
-      OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG,
-                   "ui preview surface %{public}llu unavailable, OSD stays "
-                   "unrotated",
-                   static_cast<unsigned long long>(uiSurfaceId));
+      uiLock.unlock();
+      Fail("requested composited preview unavailable");
+      return false;
     }
   }
   inW_ = reqWidth;
@@ -444,11 +448,15 @@ bool OsdPipeline::Start(int reqWidth, int reqHeight, uint64_t uiSurfaceId,
   outH_ = (rotation_ % 180 != 0) ? reqWidth : reqHeight;
   if (uiWindow_ != nullptr) {
     OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_TIMEOUT, 100);
-    OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_BUFFER_GEOMETRY, outW_,
-                                          outH_);
-    OH_NativeWindow_NativeWindowHandleOpt(
-        uiWindow_, SET_FORMAT,
-        static_cast<int32_t>(NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP));
+    if (OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_USAGE, kCpuUsage) != 0 ||
+        OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_BUFFER_GEOMETRY, outW_, outH_) != 0 ||
+        OH_NativeWindow_NativeWindowHandleOpt(uiWindow_, SET_FORMAT,
+            static_cast<int32_t>(NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP)) != 0) {
+      ClearUiSurfaceLocked();
+      uiLock.unlock();
+      Fail("cannot configure composited preview");
+      return false;
+    }
   }
   uiFailCount_ = 0;
   uiLogged_ = false;
@@ -551,6 +559,7 @@ void OsdPipeline::Stop() {
   }
   presentCv_.notify_all();
   if (previewThread_.joinable()) previewThread_.join();
+  preOverlay_ = {};  // No more workers can invoke the capture callback.
   ClearUiSurface();  // drop the preview window before its surface may die
   ClearMapCache();  // drop borrowed buffer pointers before the surface dies
   if (image_ != nullptr) {
@@ -656,16 +665,6 @@ void OsdPipeline::CompositeOne() {
   }
 
   ++frameCount_;
-  OsdSnapshot snap = GetOsd();
-  renderer_.RefreshIfNeeded(snap, outW_, outH_);
-  if (frameCount_ <= 2 || frameCount_ % 300 == 0) {
-    const OsdRenderer::Layer& tl = renderer_.text();
-    OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
-                 "cam %{public}dx%{public}d stride=%{public}d fmt=%{public}d frame=%{public}d "
-                 "osd=%{public}d rot=%{public}d text=%{public}dx%{public}d",
-                 camW, camH, camStride, ch->format, frameCount_,
-                 snap.enabled ? 1 : 0, rotation_, tl.width, tl.height);
-  }
 
   // 1) Copy the camera frame into the tightly packed NV12 target, scaled to
   //    the requested size and rotated so the encoded picture stands upright
@@ -743,7 +742,25 @@ void OsdPipeline::CompositeOne() {
     }
   }
 
-  // 2) Burn the overlays into the NV12 copy.
+  if (preOverlay_ && !preOverlay_(nv12_.data(), outputBytes, outW_, outH_)) {
+    OH_NativeImage_ReleaseNativeWindowBuffer(image_, latest, -1);
+    return;
+  }
+
+  // Mirror the assembled scene (including PiP/layout), never the text or watermark.
+  if (orientation_.mirror) MirrorPackedNv12(nv12_.data(), outW_, outH_);
+
+  // 2) Burn the overlays into the final composition, not individual inputs.
+  OsdSnapshot snap = GetOsd();
+  renderer_.RefreshIfNeeded(snap, outW_, outH_);
+  if (frameCount_ <= 2 || frameCount_ % 300 == 0) {
+    const OsdRenderer::Layer& tl = renderer_.text();
+    OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
+                 "cam %{public}dx%{public}d stride=%{public}d fmt=%{public}d frame=%{public}d "
+                 "osd=%{public}d rot=%{public}d text=%{public}dx%{public}d",
+                 camW, camH, camStride, ch->format, frameCount_,
+                 snap.enabled ? 1 : 0, rotation_, tl.width, tl.height);
+  }
   const OsdRenderer::Layer& text = renderer_.text();
   if (snap.enabled && !text.empty()) {
     OsdRenderer::Rect tr = renderer_.TextRect(snap, outW_, outH_);
@@ -825,7 +842,7 @@ void OsdPipeline::EnsureWmScaled(int dstW, int dstH, const OsdSnapshot& snap) {
 
 // Alpha-blend an RGBA layer (srcW x srcH, scaled to dstW x dstH at dstX/dstY)
 // directly into 4:2:0 semi-planar planes. Per-pixel Y is exact; chroma is
-// computed from the 2x2 block's average blended RGB. Output is always NV12.
+// alpha-weighted across each 2x2 chroma block. Output is always NV12.
 void OsdPipeline::BlendRgbaIntoYuv(const uint8_t* rgba, int srcW, int srcH,
                                    bool premul, int dstX, int dstY, int dstW,
                                    int dstH, uint8_t* yPlane, uint8_t* uvPlane,
@@ -876,42 +893,27 @@ void OsdPipeline::BlendRgbaIntoYuv(const uint8_t* rgba, int srcW, int srcH,
   };
   for (int by = y0 & ~1; by < y1; by += 2) {
     for (int bx = x0 & ~1; bx < x1; bx += 2) {
-      long sr = 0, sg = 0, sb = 0;
-      int n = 0;
+      uint8_t* uv = uvPlane + static_cast<size_t>(uvStride) * (by / 2) + bx;
+      // Four luma pixels share this UV pair. Uncovered pixels keep their
+      // original chroma, also when a layer starts on an odd coordinate.
+      int sumU = uv[0] * 1020, sumV = uv[1] * 1020;
       for (int py = by; py < by + 2 && py < y1; ++py) {
         if (py < y0) continue;
         for (int px = bx; px < bx + 2 && px < x1; ++px) {
           if (px < x0) continue;
           uint8_t* yp = yPlane + static_cast<size_t>(yStride) * py + px;
-          const uint8_t* uvp =
-              uvPlane + static_cast<size_t>(uvStride) * (py / 2) + (px / 2) * 2;
-          int u = uvp[0];
-          int v = uvp[1];
           int r, g, b, a;
           sample(px, py, &r, &g, &b, &a);
-          int dr, dg, db;
-          YuvToRgb(*yp, u, v, &dr, &dg, &db);
-          int outR = (r * a + dr * (255 - a) + 127) / 255;
-          int outG = (g * a + dg * (255 - a) + 127) / 255;
-          int outB = (b * a + db * (255 - a) + 127) / 255;
+          if (!a) continue;  // transparent watermark pixels leave the camera untouched
           uint8_t yy, uu, vv;
-          RgbToYuv(outR, outG, outB, &yy, &uu, &vv);
-          *yp = yy;
-          sr += outR;
-          sg += outG;
-          sb += outB;
-          ++n;
+          RgbToYuv(r, g, b, &yy, &uu, &vv);
+          *yp = static_cast<uint8_t>((yy * a + *yp * (255 - a) + 127) / 255);
+          sumU += (uu - uv[0]) * a;
+          sumV += (vv - uv[1]) * a;
         }
       }
-      if (n > 0) {
-        uint8_t yy, uu, vv;
-        RgbToYuv(static_cast<int>(sr / n), static_cast<int>(sg / n),
-                 static_cast<int>(sb / n), &yy, &uu, &vv);
-        uint8_t* uvp =
-            uvPlane + static_cast<size_t>(uvStride) * (by / 2) + (bx / 2) * 2;
-        uvp[0] = uu;
-        uvp[1] = vv;
-      }
+      uv[0] = static_cast<uint8_t>((sumU + 510) / 1020);
+      uv[1] = static_cast<uint8_t>((sumV + 510) / 1020);
     }
   }
 }

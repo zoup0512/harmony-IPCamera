@@ -1,34 +1,29 @@
-import { abilityAccessCtrl, AbilityConstant, Permissions, UIAbility, Want } from '@kit.AbilityKit';
+import { ConfigurationConstant, UIAbility } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 
 const TAG: string = 'IPCameraEntry';
 const DOMAIN: number = 0x0000;
 
-const PERMISSIONS: Array<Permissions> = [
-  'ohos.permission.CAMERA',
-  'ohos.permission.MICROPHONE'
-];
-
 export default class EntryAbility extends UIAbility {
-  onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onCreate');
-    const atManager = abilityAccessCtrl.createAtManager();
-    atManager.requestPermissionsFromUser(this.context, PERMISSIONS)
-      .then((result) => {
-        hilog.info(DOMAIN, TAG, 'permissions granted: %{public}d', result.authResults.length);
-      })
-      .catch((err: Error) => {
-        hilog.error(DOMAIN, TAG, 'permission request failed');
-      });
-  }
 
   onDestroy(): void {
     hilog.info(DOMAIN, TAG, '%{public}s', 'Ability onDestroy');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    windowStage.loadContent('pages/Index', (err) => {
+    try {
+      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
+      const main = windowStage.getMainWindowSync();
+      main.setWindowBackgroundColor('#303030');
+      main.setWindowSystemBarProperties({
+        statusBarColor: '#000000', statusBarContentColor: '#FFFFFF',
+        navigationBarColor: '#000000', navigationBarContentColor: '#FFFFFF'
+      }).catch(() => hilog.warn(DOMAIN, TAG, 'System bar theme unavailable'));
+    } catch (_) {
+      hilog.warn(DOMAIN, TAG, 'Window theme unavailable');
+    }
+    windowStage.loadContent('pages/Devices', (err) => {
       if (err.code) {
         hilog.error(DOMAIN, TAG, 'loadContent failed: %{public}s', JSON.stringify(err));
         return;

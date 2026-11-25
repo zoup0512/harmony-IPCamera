@@ -1,7 +1,7 @@
 #include "rtsp_server.h"
 
 #include <arpa/inet.h>
-#include <netdb.h>
+#include "tcp_listeners.h"
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -35,9 +36,44 @@ constexpr size_t kRtpPayloadMax = 1400;
 constexpr size_t kSessionQueueMaxBytes = 2 * 1024 * 1024;
 constexpr size_t kControlQueueReserveBytes = 64 * 1024;
 constexpr int kTcpSendDeadlineMs = 1500;
+constexpr size_t kMaxSessions = 16;  // shared across IPv4 and IPv6, even before SETUP
+constexpr size_t kMaxQueueItems = 4096;  // byte limits alone don't bound tiny frame overhead
+
+// Keep the kernel-supplied sockaddr, including sin6_scope_id for link-local
+// interfaces. Numeric text is for SDP/logging only (no libc zone-name lookup).
+struct Endpoint {
+  sockaddr_storage addr{};
+  socklen_t len = sizeof(addr);
+  sockaddr* ptr() { return reinterpret_cast<sockaddr*>(&addr); }
+  void SetPort(int port) {
+    if (addr.ss_family == AF_INET6) reinterpret_cast<sockaddr_in6*>(&addr)->sin6_port = htons(port);
+    else reinterpret_cast<sockaddr_in*>(&addr)->sin_port = htons(port);
+  }
+  int Port() const {
+    if (addr.ss_family == AF_INET6) return ntohs(reinterpret_cast<const sockaddr_in6*>(&addr)->sin6_port);
+    return ntohs(reinterpret_cast<const sockaddr_in*>(&addr)->sin_port);
+  }
+  std::string Ip(bool scope = false) const {
+    char text[INET6_ADDRSTRLEN];
+    if (addr.ss_family == AF_INET6) {
+      const auto& v6 = *reinterpret_cast<const sockaddr_in6*>(&addr);
+      if (!inet_ntop(AF_INET6, &v6.sin6_addr, text, sizeof(text))) return {};
+      if (scope && v6.sin6_scope_id) return std::string(text) + "%" + std::to_string(v6.sin6_scope_id);
+    } else if (addr.ss_family != AF_INET ||
+               !inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(&addr)->sin_addr, text, sizeof(text))) return {};
+    return text;
+  }
+};
 
 const int kAacSampleRates[16] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
                                  22050, 16000, 12000, 11025, 8000,  7350,  0, 0, 0};
+
+// Both media tracks use the common monotonic sampling domain (media_time.h).
+// Divide first so large timestamps retain their modulo-2^32 RTP value.
+uint32_t RtpTime(TimestampUs us, uint32_t rate) {
+  const auto t = static_cast<uint64_t>(us);
+  return static_cast<uint32_t>((t / 1000000) * rate + (t % 1000000) * rate / 1000000);
+}
 
 struct NalView {
   const uint8_t* data = nullptr;
@@ -124,13 +160,12 @@ std::string Base64Encode(const uint8_t* data, size_t len) {
 }
 
 bool Base64Decode(const std::string& in, std::string* out) {
-  static int8_t table[256];
-  static bool init = false;
-  if (!init) {
-    for (int i = 0; i < 256; ++i) table[i] = -1;
-    for (int i = 0; i < 64; ++i) table[static_cast<uint8_t>(kBase64Chars[i])] = static_cast<int8_t>(i);
-    init = true;
-  }
+  static const auto table = [] {
+    std::array<int8_t, 256> values;
+    values.fill(-1);
+    for (int i = 0; i < 64; ++i) values[static_cast<uint8_t>(kBase64Chars[i])] = static_cast<int8_t>(i);
+    return values;
+  }();
   out->clear();
   uint32_t buf = 0;
   int bits = 0;
@@ -172,8 +207,60 @@ std::vector<std::string> SplitString(const std::string& s, char delim) {
   return parts;
 }
 
+std::string Trim(const std::string& s) {
+  const auto a = s.find_first_not_of(" \t");
+  return a == std::string::npos ? "" : s.substr(a, s.find_last_not_of(" \t") - a + 1);
+}
+
+struct TransportSpec {
+  bool tcp = false;
+  int rtp = -1, rtcp = -1;
+};
+
+bool ParsePair(const std::string& s, int min, int max, TransportSpec& spec) {
+  auto number = [&](size_t& i, int& out) {
+    if (i == s.size() || s[i] < '0' || s[i] > '9') return false;
+    out = 0;
+    do {
+      out = out * 10 + (s[i++] - '0');
+      if (out > max) return false;
+    } while (i < s.size() && s[i] >= '0' && s[i] <= '9');
+    return out >= min;
+  };
+  size_t i = 0;
+  if (!number(i, spec.rtp)) return false;
+  if (i == s.size()) { spec.rtcp = spec.rtp + 1; return spec.rtcp <= max; }
+  return s[i++] == '-' && number(i, spec.rtcp) && i == s.size() && spec.rtp != spec.rtcp;
+}
+
+// Only unicast PLAY. Never honor a client-selected destination/source. Reject
+// malformed/duplicate pair parameters rather than atoi-truncating or wrapping.
+bool ParseTransport(const std::string& header, bool audio, TransportSpec& spec) {
+  for (const auto& choice : SplitString(ToLower(header), ',')) {
+    const auto fields = SplitString(choice, ';');
+    if (fields.empty()) continue;
+    const auto proto = Trim(fields[0]);
+    TransportSpec t;
+    t.tcp = proto == "rtp/avp/tcp";
+    if (!t.tcp && proto != "rtp/avp" && proto != "rtp/avp/udp") continue;
+    bool ok = true;
+    for (size_t i = 1; i < fields.size() && ok; ++i) {
+      const auto f = Trim(fields[i]);
+      if (f == "unicast" || f == "mode=play" || f == "mode=\"play\"") continue;
+      const std::string key = t.tcp ? "interleaved=" : "client_port=";
+      ok = t.rtp < 0 && f.rfind(key, 0) == 0 && ParsePair(f.substr(key.size()), t.tcp ? 0 : 1,
+                                                           t.tcp ? 255 : 65535, t);
+    }
+    if (!ok || (!t.tcp && t.rtp < 0)) continue;
+    if (t.rtp < 0) { t.rtp = audio ? 2 : 0; t.rtcp = t.rtp + 1; }
+    spec = t;
+    return true;
+  }
+  return false;
+}
+
 uint32_t RandomU32() {
-  static std::mt19937 rng(static_cast<uint32_t>(
+  static thread_local std::mt19937 rng(static_cast<uint32_t>(
       std::chrono::steady_clock::now().time_since_epoch().count() ^ getpid()));
   return rng();
 }
@@ -233,10 +320,26 @@ bool RtspPathMatches(const std::string& url, const std::string& path) {
   return p == want || p.rfind(want + "/", 0) == 0;
 }
 
+// SDP advertises relative track controls: resolve them below the stream path,
+// not next to the last segment of the DESCRIBE URI (RFC 2326 Appendix C).
+std::string StreamBase(const std::string& url) {
+  std::string base = url.substr(0, url.find_first_of("?#"));
+  if (!base.empty() && base.back() != '/') base += '/';
+  return base;
+}
+
+std::string TrackUrl(const std::string& setup, const std::string& base) {
+  if (setup.empty() || setup.find("://") != std::string::npos) return setup;
+  if (setup.front() != '/') return base + setup;
+  const auto scheme = base.find("://");
+  if (scheme == std::string::npos) return setup;
+  return base.substr(0, base.find('/', scheme + 3)) + setup;
+}
+
 }  // namespace
 
 struct RtspServer::Session : std::enable_shared_from_this<Session> {
-  enum class QueueItemType { kResponse, kVideo, kAudio };
+  enum class QueueItemType { kResponse, kVideo, kAudio, kTimer };
   enum class PlaybackChange { kNone, kStart, kStop };
 
   struct SharedFrame {
@@ -253,7 +356,7 @@ struct RtspServer::Session : std::enable_shared_from_this<Session> {
     PlaybackChange playbackChange = PlaybackChange::kNone;
     bool playbackWasActive = false;
     bool closeAfter = false;
-    bool includeRtpInfo = false;
+    std::string videoUrl, audioUrl;  // SETUP targets as of this PLAY
   };
 
   struct UdpSocket {
@@ -267,20 +370,28 @@ struct RtspServer::Session : std::enable_shared_from_this<Session> {
     int fd = -1;
   };
 
-  struct TransportState {
-    bool videoSetup = false;
-    bool videoTcp = false;
-    int videoChan = 0;
-    std::shared_ptr<UdpSocket> videoRtpSocket;
-
-    bool audioSetup = false;
-    bool audioTcp = false;
-    int audioChan = 2;
-    std::shared_ptr<UdpSocket> audioRtpSocket;
+  struct Track {
+    bool setup = false;
+    TransportSpec spec;
+    std::shared_ptr<UdpSocket> rtp, rtcp;
   };
+  struct Sender {  // writer-owned; SR counts wrap modulo 2^32, per SSRC
+    uint32_t packets = 0, octets = 0, rate = 0;
+    TimestampUs nextReport = 0;
+    bool dirty = false;
+    void Sent(size_t payloadBytes, uint32_t clockRate) {
+      ++packets;
+      octets += static_cast<uint32_t>(payloadBytes);
+      rate = clockRate;
+      dirty = true;
+      if (!nextReport) nextReport = NowMonotonicUs() + 1000000;
+    }
+  };
+  Sender videoSender, audioSender;
 
   RtspServer* server = nullptr;
   std::atomic<int> fd{-1};
+  Endpoint peer, local;
   std::string peerIp;
   std::string id;
   std::atomic<bool> active{true};
@@ -295,8 +406,9 @@ struct RtspServer::Session : std::enable_shared_from_this<Session> {
   uint32_t audioSsrc = 0;
 
   mutable std::mutex stateMu;
-  TransportState transport;
-  std::string controlUrl;  // URL seen on DESCRIBE, used for RTP-Info
+  Track videoTrack, audioTrack;
+  // Reader-owned; the writer receives snapshots on the PLAY queue item.
+  std::string contentBase, videoSetupUrl, audioSetupUrl;
 
   std::mutex queueMu;
   std::condition_variable queueCv;
@@ -333,17 +445,19 @@ struct RtspServer::Session : std::enable_shared_from_this<Session> {
   bool SendResponse(const std::string& cseq, int code, const std::string& reason,
                     const std::string& extraHeaders, const std::string& body,
                     PlaybackChange playbackChange = PlaybackChange::kNone,
-                    bool closeAfter = false, bool includeRtpInfo = false);
+                    bool closeAfter = false);
   bool EnqueueMedia(QueueItemType type,
                     const std::shared_ptr<const SharedFrame>& frame);
   bool EnqueueControl(QueueItem item);
-  bool PopQueueItem(QueueItem* item);
+  bool PopQueueItem(QueueItem* item, TimestampUs waitUs);
+  TimestampUs ReportWait();
+  bool OpenUdpPair(Track& track, int& serverPort);
   void HandleSlowConsumer();
   void SendVideoFrame(const SharedFrame& frame);
   void SendAudioFrame(const SharedFrame& frame);
   bool DispatchPacket(bool tcp, int chan,
                       const std::shared_ptr<UdpSocket>& udpSocket,
-                      const uint8_t* pkt, size_t len);
+                      const uint8_t* pkt, size_t len, bool report = false);
 };
 
 RtspServer::~RtspServer() { Stop(); }
@@ -382,31 +496,19 @@ bool RtspServer::Start(const RtspConfig& config, RtspStatusCallback callback) {
     std::lock_guard<std::mutex> lk(cbMu_);
     callback_ = std::move(callback);
   }
-  int listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listenFd < 0) {
-    Notify(RtspEvent::kServerError, 0, "socket() failed");
+  CloseListeners();
+  listenerCount_ = OpenTcpListeners(config.port, 8, listeners_, config.loopbackOnly);
+  if (!listenerCount_) {
+    Notify(RtspEvent::kServerError, 0, "bind/listen failed");
     return false;
   }
-  listenFd_.store(listenFd);
-  int one = 1;
-  ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(static_cast<uint16_t>(config.port));
-  if (::bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
-      ::listen(listenFd, 8) < 0) {
-    ::close(listenFd_.exchange(-1));
-    Notify(RtspEvent::kServerError, 0, "bind/listen failed (port busy?)");
-    return false;
-  }
+  boundV4Port_ = PublicV4ListenerPort(listeners_);
   running_ = true;
   try {
     acceptThread_ = std::thread(&RtspServer::AcceptLoop, this);
   } catch (...) {
     running_.store(false);
-    int failedFd = listenFd_.exchange(-1);
-    if (failedFd >= 0) ::close(failedFd);
+    CloseListeners();
     Notify(RtspEvent::kServerError, 0, "accept worker start failed");
     return false;
   }
@@ -416,12 +518,9 @@ bool RtspServer::Start(const RtspConfig& config, RtspStatusCallback callback) {
 void RtspServer::Stop() {
   std::lock_guard<std::mutex> lifecycleLock(lifecycleMu_);
   running_.store(false);
-  int listenFd = listenFd_.exchange(-1);
-  if (listenFd >= 0) {
-    ::shutdown(listenFd, SHUT_RDWR);
-    ::close(listenFd);
-  }
+  for (int i = 0; i < listenerCount_; ++i) ::shutdown(listeners_[i], SHUT_RDWR);
   if (acceptThread_.joinable()) acceptThread_.join();
+  CloseListeners();
 
   std::vector<std::shared_ptr<Session>> snapshot;
   {
@@ -447,68 +546,80 @@ int RtspServer::ClientCount() {
   return static_cast<int>(sessions_.size());
 }
 
+void RtspServer::CloseListeners() {
+  for (int i = 0; i < listenerCount_; ++i) { ::close(listeners_[i]); listeners_[i] = -1; }
+  listenerCount_ = 0;
+}
+
 void RtspServer::AcceptLoop() {
+  pollfd p[2]{};
+  for (int i = 0; i < listenerCount_; ++i) p[i] = {listeners_[i], POLLIN, 0};
   while (running_.load()) {
     ReapFinishedSessions();
-    int listenFd = listenFd_.load();
-    if (listenFd < 0) break;
-    pollfd p{listenFd, POLLIN, 0};
-    int pr = ::poll(&p, 1, 250);
-    if (pr < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    if (pr == 0) continue;
+    int pr = ::poll(p, listenerCount_, 250);
     if (!running_.load()) break;
-    if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-      if (running_.load()) {
-        Notify(RtspEvent::kServerError, ClientCount(), "listener poll failed");
-      }
+    if (pr < 0 && errno == EINTR) continue;
+    bool failed = pr < 0;
+    for (int i = 0; !failed && i < listenerCount_; ++i) {
+      failed = p[i].revents & (POLLERR | POLLHUP | POLLNVAL);
+      if (!failed && (p[i].revents & POLLIN)) AcceptOne(p[i].fd);
+    }
+    if (failed) {
+      Notify(RtspEvent::kServerError, ClientCount(), "listener poll failed");
+      running_.store(false);
       break;
-    }
-    if (!(p.revents & POLLIN)) continue;
-
-    sockaddr_in cli{};
-    socklen_t clen = sizeof(cli);
-    int cfd = ::accept(listenFd, reinterpret_cast<sockaddr*>(&cli), &clen);
-    if (cfd < 0) continue;
-    if (!running_.load()) {
-      ::close(cfd);
-      break;
-    }
-    int one = 1;
-    ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    auto s = std::make_shared<Session>();
-    s->server = this;
-    s->fd = cfd;
-    s->peerIp = ::inet_ntoa(cli.sin_addr);
-    s->videoSsrc = RandomU32() | 1;
-    s->audioSsrc = RandomU32() | 1;
-    char sid[16];
-    snprintf(sid, sizeof(sid), "%08x", RandomU32());
-    s->id = sid;
-    AddSession(s);
-    if (s->Start()) {
-      Notify(RtspEvent::kClientConnected, ClientCount(), s->peerIp);
-    } else {
-      ReapFinishedSessions();
-      Notify(RtspEvent::kServerError, ClientCount(), "session start failed");
-    }
-  }
-  if (running_.load()) {
-    running_.store(false);
-    int listenFd = listenFd_.exchange(-1);
-    if (listenFd >= 0) {
-      ::shutdown(listenFd, SHUT_RDWR);
-      ::close(listenFd);
     }
   }
   ReapFinishedSessions();
 }
 
-void RtspServer::AddSession(const std::shared_ptr<Session>& session) {
+void RtspServer::AcceptOne(int listenFd) {
+  Endpoint peer, local;
+  int cfd = ::accept(listenFd, peer.ptr(), &peer.len);
+  if (cfd < 0) return;
+  if (!running_.load() || ::getsockname(cfd, local.ptr(), &local.len) < 0) { ::close(cfd); return; }
+  int one = 1;
+  ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  auto s = std::make_shared<Session>();
+  s->server = this;
+  s->fd = cfd;
+  s->peer = peer;
+  s->local = local;
+  s->peerIp = peer.Ip(true);
+  s->videoSsrc = RandomU32() | 1;
+  do { s->audioSsrc = RandomU32() | 1; } while (s->audioSsrc == s->videoSsrc);
+  char sid[16];
+  snprintf(sid, sizeof(sid), "%08x", RandomU32());
+  s->id = sid;
+  if (!TryAddSession(s)) { ::close(cfd); return; }
+  if (s->Start()) {
+    Notify(RtspEvent::kClientConnected, ClientCount(), s->peerIp);
+  } else {
+    ReapFinishedSessions();
+    Notify(RtspEvent::kServerError, ClientCount(), "session start failed");
+  }
+}
+
+bool RtspServer::TryBeginVideoChange() {
   std::lock_guard<std::mutex> lk(sessionsMu_);
+  if (videoChangeInProgress_) return false;
+  for (const auto& session : sessions_) {
+    if (!session->IsFinished()) return false;
+  }
+  videoChangeInProgress_ = true;
+  return true;
+}
+
+void RtspServer::EndVideoChange() {
+  std::lock_guard<std::mutex> lk(sessionsMu_);
+  videoChangeInProgress_ = false;
+}
+
+bool RtspServer::TryAddSession(const std::shared_ptr<Session>& session) {
+  std::lock_guard<std::mutex> lk(sessionsMu_);
+  if (videoChangeInProgress_ || sessions_.size() >= kMaxSessions) return false;
   sessions_.push_back(session);
+  return true;
 }
 
 void RtspServer::ReapFinishedSessions() {
@@ -552,9 +663,8 @@ bool RtspServer::DetectH265(const uint8_t* data, size_t size) {
          h265Type == 20 || h265Type == 0 || h265Type == 1;
 }
 
-void RtspServer::UpdateParamSets(const uint8_t* nal, size_t size) {
+void RtspServer::UpdateParamSetsLocked(const uint8_t* nal, size_t size) {
   if (nal == nullptr || size < 2) return;
-  std::lock_guard<std::mutex> lk(paramMu_);
   if (codec_ == VideoCodec::H265) {
     uint8_t type = (nal[0] >> 1) & 0x3F;
     if (type == 32) {
@@ -574,9 +684,11 @@ void RtspServer::UpdateParamSets(const uint8_t* nal, size_t size) {
   }
 }
 
-RtspServer::ParamSets RtspServer::GetParamSets() const {
+void RtspServer::ResetVideoParams(bool hevc) {
   std::lock_guard<std::mutex> lk(paramMu_);
-  return params_;
+  codec_ = hevc ? VideoCodec::H265 : VideoCodec::H264;
+  codecDetected_ = false;
+  params_ = {};
 }
 
 RtspServer::VideoParams RtspServer::GetVideoParams() const {
@@ -586,9 +698,14 @@ RtspServer::VideoParams RtspServer::GetVideoParams() const {
   vp.vps = params_.vps;
   vp.sps = params_.sps;
   vp.pps = params_.pps;
-  vp.ready = codecDetected_ && !params_.sps.empty() &&
-             (vp.h265 ? !params_.vps.empty() : !params_.pps.empty());
+  vp.ready = codecDetected_ && !vp.sps.empty() && !vp.pps.empty() &&
+             (!vp.h265 || !vp.vps.empty());
   return vp;
+}
+
+void RtspServer::ResetAudioParams() {
+  std::lock_guard<std::mutex> lk(paramMu_);
+  aac_ = {};
 }
 
 void RtspServer::UpdateAacInfo(int profile, int sfIndex, int channels) {
@@ -652,6 +769,11 @@ void RtspServer::PushH264(const uint8_t* data, size_t size, TimestampUs tsUs) {
     }
     h265 = codec_ == VideoCodec::H265;
     codecDetected = codecDetected_;
+    for (const auto& nal : nals) {
+      size_t len = nal.size;
+      while (len > 1 && nal.data[len - 1] == 0x00) --len;
+      UpdateParamSetsLocked(nal.data, len);
+    }
   }
   if (!codecDetected) {
     for (const auto& nal : nals) {
@@ -660,10 +782,6 @@ void RtspServer::PushH264(const uint8_t* data, size_t size, TimestampUs tsUs) {
         break;
       }
     }
-  }
-  for (auto& nal : nals) {
-    while (nal.size > 1 && nal.data[nal.size - 1] == 0x00) nal.size--;
-    if (nal.size >= 1) UpdateParamSets(nal.data, nal.size);
   }
 
   auto frame = std::make_shared<Session::SharedFrame>();
@@ -686,9 +804,9 @@ void RtspServer::PushAdts(const uint8_t* data, size_t size, TimestampUs tsUs) {
   if (tsUs < 0) return;
   AdtsHeader h;
   if (!ParseAdts(data, size, &h)) return;
-  UpdateAacInfo(h.profile, h.sfIndex, h.channels);
   size_t payloadLen = static_cast<size_t>(h.frameLength) - static_cast<size_t>(h.headerLen);
   if (payloadLen == 0 || payloadLen > kRtpPayloadMax) return;
+  UpdateAacInfo(h.profile, h.sfIndex, h.channels);
 
   auto frame = std::make_shared<Session::SharedFrame>();
   frame->bytes.assign(data, data + h.frameLength);
@@ -703,20 +821,18 @@ void RtspServer::PushAdts(const uint8_t* data, size_t size, TimestampUs tsUs) {
   for (const auto& session : snapshot) session->EnqueueAudio(immutableFrame);
 }
 
-std::string RtspServer::BuildSdp() const {
-  ParamSets spsPps = GetParamSets();
-  AacInfo aac = GetAacInfo();
-  bool h265 = false;
-  {
-    std::lock_guard<std::mutex> lk(paramMu_);
-    h265 = (codec_ == VideoCodec::H265);
-  }
+std::string RtspServer::BuildSdp(bool ipv6, const std::string& localIp) const {
+  const VideoParams spsPps = GetVideoParams();
+  const AacInfo aac = GetAacInfo();
+  const bool h265 = spsPps.h265;
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "BuildSdp codec=%{public}s vps=%{public}zu sps=%{public}zu pps=%{public}zu",
                h265 ? "H265" : "H264", spsPps.vps.size(), spsPps.sps.size(),
                spsPps.pps.size());
   std::ostringstream sdp;
+  const char* family = ipv6 ? "IP6 " : "IP4 ";
+  const char* unspecified = ipv6 ? "::" : "0.0.0.0";
   sdp << "v=0\r\n";
-  sdp << "o=- " << NowUs() << " 0 IN IP4 0.0.0.0\r\n";
+  sdp << "o=- " << NowUs() << " 0 IN " << family << localIp << "\r\n";
   sdp << "s=IPCamera Live\r\n";
   sdp << "i=harmony-ipcamera streaming\r\n";
   sdp << "t=0 0\r\n";
@@ -724,31 +840,24 @@ std::string RtspServer::BuildSdp() const {
   sdp << "a=type:broadcast\r\n";
   sdp << "a=control:*\r\n";
   sdp << "m=video 0 RTP/AVP " << kVideoPt << "\r\n";
-  sdp << "c=IN IP4 0.0.0.0\r\n";
+  sdp << "c=IN " << family << unspecified << "\r\n";
   if (h265) {
     sdp << "a=rtpmap:" << kVideoPt << " H265/90000\r\n";
-    sdp << "a=fmtp:" << kVideoPt << " ";
-    bool first = true;
-    auto sprop = [&sdp, &first](const char* name, const std::vector<uint8_t>& v) {
-      if (v.empty()) return;
-      sdp << (first ? "" : ";") << name << "=" << Base64Encode(v.data(), v.size());
-      first = false;
-    };
-    sprop("sprop-vps", spsPps.vps);
-    sprop("sprop-sps", spsPps.sps);
-    sprop("sprop-pps", spsPps.pps);
-    sdp << "\r\n";
+    if (spsPps.ready) {
+      sdp << "a=fmtp:" << kVideoPt
+          << " sprop-vps=" << Base64Encode(spsPps.vps.data(), spsPps.vps.size())
+          << ";sprop-sps=" << Base64Encode(spsPps.sps.data(), spsPps.sps.size())
+          << ";sprop-pps=" << Base64Encode(spsPps.pps.data(), spsPps.pps.size()) << "\r\n";
+    }
   } else {
     sdp << "a=rtpmap:" << kVideoPt << " H264/90000\r\n";
     sdp << "a=fmtp:" << kVideoPt << " packetization-mode=1";
-    if (spsPps.sps.size() >= 4) {
+    if (spsPps.ready && spsPps.sps.size() >= 4) {
       char plid[8];
       snprintf(plid, sizeof(plid), "%02x%02x%02x", spsPps.sps[1], spsPps.sps[2], spsPps.sps[3]);
       sdp << ";profile-level-id=" << plid;
       sdp << ";sprop-parameter-sets=" << Base64Encode(spsPps.sps.data(), spsPps.sps.size());
-      if (!spsPps.pps.empty()) {
-        sdp << "," << Base64Encode(spsPps.pps.data(), spsPps.pps.size());
-      }
+      sdp << "," << Base64Encode(spsPps.pps.data(), spsPps.pps.size());
     }
     sdp << "\r\n";
   }
@@ -761,7 +870,7 @@ std::string RtspServer::BuildSdp() const {
       cfg[0] = static_cast<uint8_t>((aot << 3) | (aac.sfIndex >> 1));
       cfg[1] = static_cast<uint8_t>(((aac.sfIndex & 1) << 7) | (aac.channels << 3));
       sdp << "m=audio 0 RTP/AVP " << kAudioPt << "\r\n";
-      sdp << "c=IN IP4 0.0.0.0\r\n";
+      sdp << "c=IN " << family << unspecified << "\r\n";
       sdp << "a=rtpmap:" << kAudioPt << " MPEG4-generic/" << rate << "/" << aac.channels << "\r\n";
       sdp << "a=fmtp:" << kAudioPt
           << " streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;"
@@ -789,8 +898,11 @@ bool RtspServer::Session::Start() {
 }
 
 void RtspServer::Session::RequestStop(const std::string& detail) {
-  active.store(false);
-  playing.store(false);
+  {
+    std::lock_guard<std::mutex> lk(queueMu);
+    active.store(false);
+    playing.store(false);
+  }
   if (!detail.empty()) {
     std::lock_guard<std::mutex> lk(stopMu);
     if (stopDetail.empty()) stopDetail = detail;
@@ -817,7 +929,7 @@ bool RtspServer::Session::EnqueueVideo(
   if (!IsActive() || !IsPlaying() || !frame) return true;
   {
     std::lock_guard<std::mutex> lk(stateMu);
-    if (!transport.videoSetup) return true;
+    if (!videoTrack.setup) return true;
   }
   return EnqueueMedia(QueueItemType::kVideo, frame);
 }
@@ -827,7 +939,7 @@ bool RtspServer::Session::EnqueueAudio(
   if (!IsActive() || !IsPlaying() || !frame) return true;
   {
     std::lock_guard<std::mutex> lk(stateMu);
-    if (!transport.audioSetup) return true;
+    if (!audioTrack.setup) return true;
   }
   return EnqueueMedia(QueueItemType::kAudio, frame);
 }
@@ -841,7 +953,7 @@ bool RtspServer::Session::EnqueueMedia(
     if (!active.load() || !playing.load() || closeQueued) return true;
     const size_t frameBytes = frame->bytes.size();
     const size_t mediaLimit = kSessionQueueMaxBytes - kControlQueueReserveBytes;
-    if (frameBytes > mediaLimit || queuedMediaBytes > mediaLimit - frameBytes ||
+    if (queue.size() >= kMaxQueueItems || frameBytes > mediaLimit || queuedMediaBytes > mediaLimit - frameBytes ||
         queuedBytes > kSessionQueueMaxBytes - frameBytes) {
       overflow = true;
     } else {
@@ -867,8 +979,8 @@ bool RtspServer::Session::EnqueueControl(QueueItem item) {
   {
     std::lock_guard<std::mutex> lk(queueMu);
     if (!active.load() || closeQueued) return false;
-    item.queuedBytes = item.response.size();
-    if (item.queuedBytes > kSessionQueueMaxBytes ||
+    item.queuedBytes = item.response.size() + item.videoUrl.size() + item.audioUrl.size();
+    if (queue.size() >= kMaxQueueItems || item.queuedBytes > kSessionQueueMaxBytes ||
         queuedBytes > kSessionQueueMaxBytes - item.queuedBytes) {
       overflow = true;
     } else {
@@ -903,10 +1015,66 @@ bool RtspServer::Session::EnqueueControl(QueueItem item) {
   return true;
 }
 
-bool RtspServer::Session::PopQueueItem(QueueItem* item) {
+// Do not queue RTCP behind media or add a per-track timer thread. The sole
+// writer checks deadlines between frames/responses and also wakes when idle.
+TimestampUs RtspServer::Session::ReportWait() {
+  TimestampUs wait = -1;
+  if (!active.load() || !playing.load()) return wait;
+  auto report = [&](Sender& sender, bool audio) {
+    if (!sender.dirty) return;
+    auto remaining = sender.nextReport - NowMonotonicUs();
+    if (remaining <= 0) {
+      Track track;
+      {
+        std::lock_guard<std::mutex> lk(stateMu);
+        track = audio ? audioTrack : videoTrack;
+      }
+      timespec wall{};
+      if (track.setup && clock_gettime(CLOCK_REALTIME, &wall) == 0) {
+        const auto samplingTime = NowMonotonicUs();
+        const uint32_t ssrc = audio ? audioSsrc : videoSsrc;
+        // RFC 3550: SR (no reception blocks), followed by one SDES CNAME
+        // chunk shared in name, not SSRC, between audio and video. END + pad.
+        uint8_t pkt[64]{};
+        auto put32 = [&](size_t off, uint32_t value) {
+          value = htonl(value);
+          memcpy(pkt + off, &value, sizeof(value));
+        };
+        pkt[0] = 0x80; pkt[1] = 200; pkt[3] = 6;
+        put32(4, ssrc);
+        put32(8, static_cast<uint32_t>(wall.tv_sec) + 2208988800U);
+        put32(12, static_cast<uint32_t>((static_cast<uint64_t>(wall.tv_nsec) << 32) / 1000000000));
+        put32(16, RtpTime(samplingTime, sender.rate));
+        put32(20, sender.packets); put32(24, sender.octets);
+        pkt[28] = 0x81; pkt[29] = 202;
+        put32(32, ssrc);
+        const std::string cname = id + "@ipcam";  // 8 hex digits plus suffix
+        pkt[36] = 1; pkt[37] = static_cast<uint8_t>(cname.size());
+        memcpy(pkt + 38, cname.data(), cname.size());
+        const size_t len = (38 + cname.size() + 1 + 3) & ~size_t(3);
+        pkt[31] = static_cast<uint8_t>((len - 28) / 4 - 1);
+        DispatchPacket(track.spec.tcp, track.spec.rtcp, track.rtcp, pkt, len, true);
+      }
+      sender.dirty = false;
+      sender.nextReport = NowMonotonicUs() + 5000000;
+    } else if (wait < 0 || remaining < wait) {
+      wait = remaining;
+    }
+  };
+  report(videoSender, false);
+  report(audioSender, true);
+  return wait;
+}
+
+bool RtspServer::Session::PopQueueItem(QueueItem* item, TimestampUs waitUs) {
   std::unique_lock<std::mutex> lk(queueMu);
-  queueCv.wait(lk, [this]() { return !queue.empty() || !active.load(); });
-  if (queue.empty()) return false;
+  auto ready = [this] { return !queue.empty() || !active.load(); };
+  if (waitUs < 0) queueCv.wait(lk, ready);
+  else if (!queueCv.wait_for(lk, std::chrono::microseconds(waitUs), ready)) {
+    item->type = QueueItemType::kTimer;
+    return true;
+  }
+  if (!active.load() || queue.empty()) return false;
   *item = std::move(queue.front());
   queue.pop_front();
   queuedBytes -= item->queuedBytes;
@@ -917,8 +1085,12 @@ bool RtspServer::Session::PopQueueItem(QueueItem* item) {
 }
 
 void RtspServer::Session::HandleSlowConsumer() {
-  bool shouldNotify = active.exchange(false);
-  playing.store(false);
+  bool shouldNotify;
+  {
+    std::lock_guard<std::mutex> lk(queueMu);
+    shouldNotify = active.exchange(false);
+    playing.store(false);
+  }
   {
     std::lock_guard<std::mutex> lk(stopMu);
     if (stopDetail.empty()) stopDetail = "slow consumer";
@@ -944,7 +1116,8 @@ void RtspServer::Session::ReaderLoop() {
     if (pr == 0) continue;
     if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
     if (!(p.revents & POLLIN)) continue;
-    ssize_t n = ::recv(socketFd, tmp, sizeof(tmp), 0);
+    ssize_t n = ::recv(socketFd, tmp, sizeof(tmp), MSG_DONTWAIT);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
     if (n <= 0) break;
     buf.append(tmp, static_cast<size_t>(n));
     bool fatal = false;
@@ -962,6 +1135,7 @@ void RtspServer::Session::ReaderLoop() {
         if (buf.size() > 64 * 1024) fatal = true;
         break;
       }
+      if (hdrEnd > 64 * 1024) { fatal = true; break; }
       std::string req = buf.substr(0, hdrEnd);
       buf.erase(0, hdrEnd + 4);
       if (!HandleRequestText(req)) {
@@ -979,18 +1153,23 @@ void RtspServer::Session::ReaderLoop() {
 void RtspServer::Session::WriterLoop() {
   const int socketFd = fd.load();
   QueueItem item;
-  while (socketFd >= 0 && PopQueueItem(&item)) {
+  while (socketFd >= 0 && PopQueueItem(&item, ReportWait())) {
     if (item.type == QueueItemType::kResponse) {
-      if (item.includeRtpInfo) {
-        const std::string separator = "\r\n\r\n";
-        size_t end = item.response.rfind(separator);
-        if (end != std::string::npos) {
-          item.response.insert(end,
-              "RTP-Info: url=" +
-              (controlUrl.empty() ? std::string("trackID=0")
-                                  : controlUrl + "/trackID=0") +
-              ";seq=" + std::to_string(videoSeq) + "\r\n");
+      if (item.playbackChange == PlaybackChange::kStop) {
+        videoSender.dirty = audioSender.dirty = false;
+        videoSender.nextReport = audioSender.nextReport = 0;
+      }
+      if (item.playbackChange == PlaybackChange::kStart) {
+        // Only the writer knows the next sequence after all preceding RTP.
+        item.response += "RTP-Info: ";
+        if (!item.videoUrl.empty()) {
+          item.response += "url=" + item.videoUrl + ";seq=" + std::to_string(videoSeq);
         }
+        if (!item.audioUrl.empty()) {
+          if (!item.videoUrl.empty()) item.response += ',';
+          item.response += "url=" + item.audioUrl + ";seq=" + std::to_string(audioSeq);
+        }
+        item.response += "\r\n\r\n";
       }
       if (!SendAll(socketFd,
                    reinterpret_cast<const uint8_t*>(item.response.data()),
@@ -1026,9 +1205,7 @@ void RtspServer::Session::WriterLoop() {
 
 void RtspServer::Session::WorkerDone() {
   if (workersRemaining.fetch_sub(1) == 1) {
-    CloseUdp();
-    int socketFd = fd.exchange(-1);
-    if (socketFd >= 0) ::close(socketFd);
+    // Finalize closes fd only after join, so Stop never shuts down a recycled fd.
     finished.store(true);
   }
 }
@@ -1053,8 +1230,42 @@ void RtspServer::Session::Finalize(int clientsAfterRemoval) {
 
 void RtspServer::Session::CloseUdp() {
   std::lock_guard<std::mutex> lk(stateMu);
-  transport.videoRtpSocket.reset();
-  transport.audioRtpSocket.reset();
+  videoTrack = {};
+  audioTrack = {};
+}
+
+bool RtspServer::Session::OpenUdpPair(Track& track, int& serverPort) {
+  auto makeSocket = [&] {
+    auto sock = std::make_shared<UdpSocket>(-1);
+    sock->fd = ::socket(peer.addr.ss_family, SOCK_DGRAM, 0);
+    return sock;
+  };
+  // Bind both on the TCP connection's actual local interface, without reuse.
+  // The kernel chooses one ephemeral port; reserve its even/odd partner before
+  // replying. On a collision retry only a bounded number of times.
+  for (int i = 0; i < 16; ++i) {
+    auto first = makeSocket(), second = makeSocket();
+    if (first->fd < 0 || second->fd < 0) return false;
+    Endpoint a = local, dst = peer;
+    a.SetPort(0);
+    if (::bind(first->fd, a.ptr(), a.len) < 0 || ::getsockname(first->fd, a.ptr(), &a.len) < 0) return false;
+    const int port = a.Port();
+    a.SetPort(port ^ 1);
+    if (::bind(second->fd, a.ptr(), a.len) < 0) {
+      if (errno == EADDRINUSE) continue;
+      return false;
+    }
+    if (port & 1) std::swap(first, second);
+    dst.SetPort(track.spec.rtp);
+    if (::connect(first->fd, dst.ptr(), dst.len) < 0) return false;
+    dst.SetPort(track.spec.rtcp);
+    if (::connect(second->fd, dst.ptr(), dst.len) < 0) return false;
+    track.rtp = std::move(first);
+    track.rtcp = std::move(second);
+    serverPort = port & ~1;
+    return true;
+  }
+  return false;
 }
 
 bool RtspServer::Session::HandleRequestText(const std::string& text) {
@@ -1073,17 +1284,11 @@ bool RtspServer::Session::HandleRequestText(const std::string& text) {
     size_t colon = line.find(':');
     if (colon == std::string::npos) continue;
     std::string key = ToLower(line.substr(0, colon));
-    size_t vstart = colon + 1;
-    while (vstart < line.size() && line[vstart] == ' ') vstart++;
-    headers[key] = line.substr(vstart);
+    size_t start = line.find_first_not_of(" \t", colon + 1);
+    headers[key] = start == std::string::npos ? "" :
+        line.substr(start, line.find_last_not_of(" \t") - start + 1);
   }
   std::string cseq = headers.count("cseq") ? headers["cseq"] : "0";
-
-  // OPTIONS is a capability probe; every other method must address the
-  // configured stream path.
-  if (method != "OPTIONS" && !StreamUrlAllowed(url)) {
-    return SendResponse(cseq, 404, "Stream not found", "", "");
-  }
 
   if (method == "OPTIONS") {
     return SendResponse(cseq, 200, "OK",
@@ -1091,123 +1296,69 @@ bool RtspServer::Session::HandleRequestText(const std::string& text) {
                         "GET_PARAMETER, SET_PARAMETER\r\n",
                         "");
   }
+  if (!CheckAuth(headers)) {
+    return SendResponse(cseq, 401, "Unauthorized",
+                        "WWW-Authenticate: Basic realm=\"IPCamera\"\r\n", "");
+  }
+  if (!StreamUrlAllowed(url)) {
+    return SendResponse(cseq, 404, "Stream not found", "", "");
+  }
+  // Older clients omit Session on this persistent connection. If supplied,
+  // however, it must refer to an established SETUP on this connection.
+  const auto session = headers.find("session");
+  if (session != headers.end() &&
+      ((videoSetupUrl.empty() && audioSetupUrl.empty()) ||
+       session->second.substr(0, session->second.find(';')) != id)) {
+    return SendResponse(cseq, 454, "Session Not Found", "", "");
+  }
   if (method == "DESCRIBE") {
-    if (!CheckAuth(headers)) {
-      return SendResponse(cseq, 401, "Unauthorized",
-                          "WWW-Authenticate: Basic realm=\"IPCamera\"\r\n", "");
-    }
-    controlUrl = url;
-    std::string sdp = server->BuildSdp();
-    // SendResponse appends Content-Length itself for a non-empty body.
-    return SendResponse(cseq, 200, "OK",
-                        "Content-Type: application/sdp\r\n",
-                        sdp);
+    contentBase = url.find("://") == std::string::npos ? "" : StreamBase(url);
+    std::string extra = "Content-Type: application/sdp\r\n";
+    if (!contentBase.empty()) extra += "Content-Base: " + contentBase + "\r\n";
+    return SendResponse(cseq, 200, "OK", extra, server->BuildSdp(local.addr.ss_family == AF_INET6, local.Ip()));
   }
   if (method == "SETUP") {
-    if (!CheckAuth(headers)) {
-      return SendResponse(cseq, 401, "Unauthorized",
-                          "WWW-Authenticate: Basic realm=\"IPCamera\"\r\n", "");
-    }
-    bool audioTrack = url.find("trackID=1") != std::string::npos;
-    std::string transportHeader =
-        headers.count("transport") ? headers["transport"] : "";
-    bool tcp = transportHeader.find("TCP") != std::string::npos;
-
-    if (tcp) {
-      int chan = audioTrack ? 2 : 0;
-      {
-        std::lock_guard<std::mutex> lk(stateMu);
-        chan = audioTrack ? transport.audioChan : transport.videoChan;
-      }
-      size_t pos = transportHeader.find("interleaved=");
-      if (pos != std::string::npos) {
-        chan = atoi(transportHeader.c_str() + pos + 12);
-      }
-      {
-        std::lock_guard<std::mutex> lk(stateMu);
-        if (audioTrack) {
-          transport.audioSetup = true;
-          transport.audioTcp = true;
-          transport.audioChan = chan;
-          transport.audioRtpSocket.reset();
-        } else {
-          transport.videoSetup = true;
-          transport.videoTcp = true;
-          transport.videoChan = chan;
-          transport.videoRtpSocket.reset();
-        }
-      }
-      char extra[160];
-      snprintf(extra, sizeof(extra), "Transport: RTP/AVP/TCP;interleaved=%d-%d\r\n",
-               chan, chan + 1);
-      std::string extraHdr = std::string(extra) + "Session: " + id + "\r\n";
-      return SendResponse(cseq, 200, "OK", extraHdr, "");
-    }
-
-    size_t pos = transportHeader.find("client_port=");
-    int p0 = 0;
-    if (pos != std::string::npos) {
-      p0 = atoi(transportHeader.c_str() + pos + 12);
-    }
-    if (p0 <= 0) {
+    auto path = url.substr(0, url.find_first_of("?#"));
+    while (!path.empty() && path.back() == '/') path.pop_back();
+    const auto trackName = path.substr(path.rfind('/') + 1);
+    const bool audio = trackName == "trackID=1";
+    if ((!audio && trackName != "trackID=0") || (audio && !server->GetAacInfo().valid))
+      return SendResponse(cseq, 404, "Track not found", "", "");
+    if (playing.load()) return SendResponse(cseq, 455, "Method Not Valid in This State", "", "");
+    Track next;
+    if (!ParseTransport(headers["transport"], audio, next.spec))
       return SendResponse(cseq, 461, "Unsupported transport", "", "");
+    const auto& t = next.spec;
+    std::ostringstream extra;
+    if (t.tcp) {
+      // Track changes only on this reader. Writer takes read-only snapshots.
+      const Track& other = audio ? videoTrack : audioTrack;
+      if (other.setup && other.spec.tcp &&
+          (other.spec.rtp == t.rtp || other.spec.rtp == t.rtcp ||
+           other.spec.rtcp == t.rtp || other.spec.rtcp == t.rtcp))
+        return SendResponse(cseq, 461, "Channel in use", "", "");
+      extra << "Transport: RTP/AVP/TCP;unicast;interleaved=" << t.rtp << '-' << t.rtcp;
+    } else {
+      int serverPort;
+      if (!OpenUdpPair(next, serverPort)) return SendResponse(cseq, 500, "UDP pair unavailable", "", "");
+      extra << "Transport: RTP/AVP;unicast;client_port=" << t.rtp << '-' << t.rtcp
+            << ";server_port=" << serverPort << '-' << serverPort + 1;
     }
-    sockaddr_in cliAddr{};
-    cliAddr.sin_family = AF_INET;
-    cliAddr.sin_port = htons(static_cast<uint16_t>(p0));
-    if (::inet_pton(AF_INET, peerIp.c_str(), &cliAddr.sin_addr) != 1) {
-      return SendResponse(cseq, 461, "Unsupported transport", "", "");
-    }
-    int rtpSock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (rtpSock < 0) return SendResponse(cseq, 500, "Internal server error", "", "");
-    std::unique_ptr<UdpSocket> newRtpSocket(
-        new (std::nothrow) UdpSocket(rtpSock));
-    if (!newRtpSocket) {
-      ::close(rtpSock);
-      return SendResponse(cseq, 500, "Internal server error", "", "");
-    }
-    int one = 1;
-    ::setsockopt(rtpSock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (::bind(rtpSock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) < 0 ||
-        ::connect(rtpSock, reinterpret_cast<sockaddr*>(&cliAddr), sizeof(cliAddr)) < 0) {
-      return SendResponse(cseq, 500, "Internal server error", "", "");
-    }
-    sockaddr_in bound{};
-    socklen_t blen = sizeof(bound);
-    ::getsockname(rtpSock, reinterpret_cast<sockaddr*>(&bound), &blen);
-    int serverPort = ntohs(bound.sin_port);
+    extra << "\r\nSession: " << id << "\r\n";
+    next.setup = true;
     {
       std::lock_guard<std::mutex> lk(stateMu);
-      if (audioTrack) {
-        transport.audioSetup = true;
-        transport.audioTcp = false;
-        transport.audioRtpSocket =
-            std::shared_ptr<UdpSocket>(std::move(newRtpSocket));
-      } else {
-        transport.videoSetup = true;
-        transport.videoTcp = false;
-        transport.videoRtpSocket =
-            std::shared_ptr<UdpSocket>(std::move(newRtpSocket));
-      }
+      (audio ? audioTrack : videoTrack) = std::move(next);
     }
-    char extra[160];
-    snprintf(extra, sizeof(extra),
-             "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%d-%d\r\n",
-             p0, p0 + 1, serverPort, serverPort + 1);
-    std::string extraHdr = std::string(extra) + "Session: " + id + "\r\n";
-    return SendResponse(cseq, 200, "OK", extraHdr, "");
+    (audio ? audioSetupUrl : videoSetupUrl) = TrackUrl(url, contentBase);
+    return SendResponse(cseq, 200, "OK", extra.str(), "");
   }
   if (method == "PLAY") {
-    if (!CheckAuth(headers)) {
-      return SendResponse(cseq, 401, "Unauthorized",
-                          "WWW-Authenticate: Basic realm=\"IPCamera\"\r\n", "");
+    if (videoSetupUrl.empty() && audioSetupUrl.empty()) {
+      return SendResponse(cseq, 455, "Method Not Valid in This State", "", "");
     }
-    std::string extraHdr = "Session: " + id + "\r\n";
-    return SendResponse(cseq, 200, "OK", extraHdr, "", PlaybackChange::kStart,
-                        false, true);
+    if (contentBase.empty()) contentBase = StreamBase(url);
+    return SendResponse(cseq, 200, "OK", "Session: " + id + "\r\n", "", PlaybackChange::kStart);
   }
   if (method == "PAUSE") {
     return SendResponse(cseq, 200, "OK", "Session: " + id + "\r\n", "",
@@ -1218,7 +1369,7 @@ bool RtspServer::Session::HandleRequestText(const std::string& text) {
                         PlaybackChange::kStop, true);
   }
   if (method == "GET_PARAMETER" || method == "SET_PARAMETER") {
-    return SendResponse(cseq, 200, "OK", "", "");
+    return SendResponse(cseq, 200, "OK", session == headers.end() ? "" : "Session: " + id + "\r\n", "");
   }
   return SendResponse(cseq, 501, "Not implemented", "", "");
 }
@@ -1255,36 +1406,36 @@ bool RtspServer::Session::SendResponse(const std::string& cseq, int code,
                                        const std::string& extraHeaders,
                                        const std::string& body,
                                        PlaybackChange playbackChange,
-                                       bool closeAfter,
-                                       bool includeRtpInfo) {
+                                       bool closeAfter) {
   std::ostringstream rsp;
   rsp << "RTSP/1.0 " << code << " " << reason << "\r\n";
   rsp << "CSeq: " << cseq << "\r\n";
   rsp << "Server: harmony-ipcamera\r\n";
   rsp << extraHeaders;
-  if (!body.empty()) {
-    rsp << "Content-Length: " << body.size() << "\r\n\r\n";
-    rsp << body;
-  } else {
-    rsp << "\r\n";
-  }
   QueueItem item;
+  if (playbackChange == PlaybackChange::kStart) {
+    // WriterLoop appends RTP-Info and the terminating blank line.
+    item.videoUrl = TrackUrl(videoSetupUrl, contentBase);
+    item.audioUrl = TrackUrl(audioSetupUrl, contentBase);
+  } else {
+    if (!body.empty()) rsp << "Content-Length: " << body.size() << "\r\n";
+    rsp << "\r\n" << body;
+  }
   item.type = QueueItemType::kResponse;
   item.response = rsp.str();
   item.playbackChange = playbackChange;
   item.closeAfter = closeAfter;
-  item.includeRtpInfo = includeRtpInfo;
   return EnqueueControl(std::move(item));
 }
 
 void RtspServer::Session::SendVideoFrame(const SharedFrame& frame) {
   if (!active.load() || fd.load() < 0 || frame.bytes.empty()) return;
-  TransportState state;
+  Track track;
   {
     std::lock_guard<std::mutex> lk(stateMu);
-    state = transport;
+    track = videoTrack;
   }
-  if (!state.videoSetup) return;
+  if (!track.setup) return;
 
   std::vector<NalView> nals = SplitAnnexB(frame.bytes.data(), frame.bytes.size());
   if (nals.empty()) return;
@@ -1293,8 +1444,7 @@ void RtspServer::Session::SendVideoFrame(const SharedFrame& frame) {
   }
   const bool h265 = frame.h265;
   if (frame.tsUs < 0) return;
-  const uint32_t ts90k = static_cast<uint32_t>(
-      (static_cast<uint64_t>(frame.tsUs) * 9ULL) / 100ULL);
+  const uint32_t ts90k = RtpTime(frame.tsUs, 90000);
   uint8_t pkt[16 + kRtpPayloadMax];
   auto writeRtp = [&](bool marker, const uint8_t* body, size_t bodyLen) {
     pkt[0] = 0x80;
@@ -1311,8 +1461,9 @@ void RtspServer::Session::SendVideoFrame(const SharedFrame& frame) {
     pkt[11] = static_cast<uint8_t>(videoSsrc & 0xFF);
     videoSeq++;
     memcpy(pkt + 12, body, bodyLen);
-    return DispatchPacket(state.videoTcp, state.videoChan,
-                          state.videoRtpSocket, pkt, 12 + bodyLen);
+    if (!DispatchPacket(track.spec.tcp, track.spec.rtp, track.rtp, pkt, 12 + bodyLen)) return false;
+    videoSender.Sent(bodyLen, 90000);
+    return true;
   };
   for (size_t ni = 0; ni < nals.size(); ++ni) {
     const NalView& nal = nals[ni];
@@ -1367,12 +1518,12 @@ void RtspServer::Session::SendVideoFrame(const SharedFrame& frame) {
 
 void RtspServer::Session::SendAudioFrame(const SharedFrame& frame) {
   if (!active.load() || fd.load() < 0 || frame.bytes.empty()) return;
-  TransportState state;
+  Track track;
   {
     std::lock_guard<std::mutex> lk(stateMu);
-    state = transport;
+    track = audioTrack;
   }
-  if (!state.audioSetup) return;
+  if (!track.setup) return;
 
   AdtsHeader h;
   if (!ParseAdts(frame.bytes.data(), frame.bytes.size(), &h)) return;
@@ -1380,10 +1531,7 @@ void RtspServer::Session::SendAudioFrame(const SharedFrame& frame) {
   if (size == 0 || size > kRtpPayloadMax) return;
   const uint8_t* payload = frame.bytes.data() + h.headerLen;
   if (frame.tsUs < 0) return;
-  const uint32_t tsSamples = static_cast<uint32_t>(
-      (static_cast<uint64_t>(h.sampleRate) *
-       static_cast<uint64_t>(frame.tsUs)) /
-      1000000ULL);
+  const uint32_t tsSamples = RtpTime(frame.tsUs, h.sampleRate);
 
   uint8_t pkt[12 + 4 + kRtpPayloadMax];
   pkt[0] = 0x80;
@@ -1404,13 +1552,13 @@ void RtspServer::Session::SendAudioFrame(const SharedFrame& frame) {
   pkt[14] = static_cast<uint8_t>(size >> 5);
   pkt[15] = static_cast<uint8_t>((size & 0x1F) << 3);
   memcpy(pkt + 16, payload, size);
-  DispatchPacket(state.audioTcp, state.audioChan, state.audioRtpSocket,
-                 pkt, 12 + 4 + size);
+  if (DispatchPacket(track.spec.tcp, track.spec.rtp, track.rtp, pkt, 16 + size))
+    audioSender.Sent(4 + size, h.sampleRate);
 }
 
 bool RtspServer::Session::DispatchPacket(
     bool tcp, int chan, const std::shared_ptr<UdpSocket>& udpSocket,
-    const uint8_t* pkt, size_t len) {
+    const uint8_t* pkt, size_t len, bool report) {
   if (!active.load()) return false;
   if (tcp) {
     const int socketFd = fd.load();
@@ -1432,10 +1580,12 @@ bool RtspServer::Session::DispatchPacket(
   ssize_t n = ::send(udpSocket->fd, pkt, len,
                      MSG_NOSIGNAL | MSG_DONTWAIT);
   if (n == static_cast<ssize_t>(len)) return true;
-  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-    return true;
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOBUFS)) {
+    return false;  // dropped datagram; not part of SR counters
   }
-  RequestStop("RTP/UDP send failed");
+  // A receiver/firewall can drop RTCP only (including connected-UDP ICMP
+  // errors). A lost report is not grounds for stopping a healthy RTP stream.
+  if (!report) RequestStop("RTP/UDP send failed");
   return false;
 }
 

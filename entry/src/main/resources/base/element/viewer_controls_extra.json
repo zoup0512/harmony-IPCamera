@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "viewer_tcp_transport", "value": "Transport: TCP (default)" },
+    { "name": "viewer_udp_only", "value": "UDP unicast · Video only (no AAC)" },
+    { "name": "viewer_udp_hint", "value": "Tap the transport to switch. UDP unicast carries video only, without AAC. If unavailable, playback will not fall back to TCP." },
+    { "name": "viewer_udp_unavailable", "value": "RTSP UDP unicast is unavailable. Playback will not fall back to TCP." },
+    { "name": "viewer_pip_busy", "value": "Exit picture-in-picture before starting another video." }
+  ]
+}

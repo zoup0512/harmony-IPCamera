@@ -14,6 +14,7 @@
 #include <ohcamera/capture_session.h>
 #include <ohcamera/preview_output.h>
 
+#include "camera_capabilities.h"
 #include "osd_pipeline.h"
 
 #undef LOG_DOMAIN
@@ -62,22 +63,28 @@ void CameraStreamer::OnError(OH_AVCodec*, int32_t errorCode, void* userData) {
 
 void CameraStreamer::OnStreamChanged(OH_AVCodec*, OH_AVFormat*, void*) {}
 
-void CameraStreamer::OnNeedInputBuffer(OH_AVCodec*, uint32_t index,
+void CameraStreamer::OnNeedInputBuffer(OH_AVCodec* codec, uint32_t index,
                                        OH_AVBuffer* buffer, void* userData) {
   // Buffer mode (OSD on): pull the latest composited NV12 frame and push it.
   // Surface mode (OSD off) never gets input callbacks (camera feeds directly).
   auto self = static_cast<CameraStreamer*>(userData);
-  if (self->osd_ == nullptr || !self->running_.load()) return;
+  if (!self->bufferInput_.load() || !self->running_.load()) return;
   std::vector<uint8_t> frame;
   {
     std::unique_lock<std::mutex> lk(self->pendingMu_);
-    self->pendingCv_.wait_for(lk, std::chrono::milliseconds(200),
-                              [&self] { return self->hasPending_ || !self->running_.load(); });
+    auto ready = [self] { return self->hasPending_ || !self->running_.load(); };
+    if (self->freshInputOnly_) {
+      // Hold this codec input index until both cameras produce a usable frame.
+      // Returning unused indices on timeout would starve the codec on recovery.
+      self->pendingCv_.wait(lk, ready);
+    } else {
+      self->pendingCv_.wait_for(lk, std::chrono::milliseconds(200), ready);
+    }
     if (self->hasPending_) {
       frame.swap(self->pendingFrame_);
       self->hasPending_ = false;
-      self->lastFrame_ = frame;  // repeat-push fallback keeps the encoder fed
-    } else if (!self->lastFrame_.empty()) {
+      if (!self->freshInputOnly_) self->lastFrame_ = frame;
+    } else if (!self->freshInputOnly_ && !self->lastFrame_.empty()) {
       frame = self->lastFrame_;
     }
   }
@@ -92,15 +99,15 @@ void CameraStreamer::OnNeedInputBuffer(OH_AVCodec*, uint32_t index,
                  .count();
   attr.flags = AVCODEC_BUFFER_FLAGS_NONE;
   OH_AVBuffer_SetBufferAttr(buffer, &attr);
-  OH_VideoEncoder_PushInputBuffer(self->encoder_, index);
+  OH_VideoEncoder_PushInputBuffer(codec, index);
 }
 
-void CameraStreamer::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuffer* buffer,
+void CameraStreamer::OnNewOutputBuffer(OH_AVCodec* codec, uint32_t index, OH_AVBuffer* buffer,
                                        void* userData) {
   auto self = static_cast<CameraStreamer*>(userData);
   OH_AVCodecBufferAttr attr{};
   OH_AVBuffer_GetBufferAttr(buffer, &attr);
-  if (!(attr.flags & AVCODEC_BUFFER_FLAGS_EOS) && attr.size > 0) {
+  if (self->running_.load() && !(attr.flags & AVCODEC_BUFFER_FLAGS_EOS) && attr.size > 0) {
     FrameSink sink;
     {
       std::lock_guard<std::mutex> lk(self->stateMu_);
@@ -110,10 +117,22 @@ void CameraStreamer::OnNewOutputBuffer(OH_AVCodec*, uint32_t index, OH_AVBuffer*
       sink(OH_AVBuffer_GetAddr(buffer), static_cast<size_t>(attr.size), attr.pts);
     }
   }
-  OH_VideoEncoder_FreeOutputBuffer(self->encoder_, index);
+  OH_VideoEncoder_FreeOutputBuffer(codec, index);
 }
 
 void CameraStreamer::Cleanup() {
+  {
+    // Synchronize the final notification with the sleeping dual input callback.
+    std::lock_guard<std::mutex> lk(pendingMu_);
+    running_ = false;
+  }
+  {
+    std::lock_guard<std::mutex> lk(stateMu_);
+    sink_ = nullptr;
+    onError_ = nullptr;
+  }
+  bufferInput_ = false;
+  pendingCv_.notify_all();
   // Tear the producer down first: stop the camera preview outputs and the
   // capture session BEFORE stopping the OSD pipeline. The OSD consumer
   // surface must not be unmapped/destroyed while the camera is still pushing
@@ -142,138 +161,101 @@ void CameraStreamer::Cleanup() {
     OH_Camera_DeleteCameraManager(manager_);
     manager_ = nullptr;
   }
+  if (dual_) dual_->Stop();  // Both producers off; the primary worker may still be in Composite.
   if (osd_ != nullptr) {
     osd_->Stop();
     osd_.reset();
-    pendingCv_.notify_all();  // wake a blocked buffer-mode input callback
   }
+  dual_.reset();  // The primary hook has now drained and cannot touch this object again.
   if (encoder_ != nullptr) {
     OH_VideoEncoder_Stop(encoder_);
     OH_VideoEncoder_Destroy(encoder_);
     encoder_ = nullptr;
   }
+  if (window_) OH_NativeWindow_DestroyNativeWindow(window_);
   window_ = nullptr;
+  encW_ = encH_ = 0;
+  orientation_ = 0;
+  // Producer and codec callbacks have stopped. Neither an unconsumed NV12
+  // frame nor the repeat-frame slot belongs to the next encoder geometry.
+  std::lock_guard<std::mutex> lk(pendingMu_);
+  hasPending_ = false;
+  freshInputOnly_ = false;
+  pendingFrame_.clear();
+  lastFrame_.clear();
 }
 
 bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeType,
                            bool frontCamera, int iFrameIntervalMs,
                            uint64_t previewSurfaceId, bool osdEnabled, FrameSink sink,
-                           ErrorSink onError) {
-  if (running_.load()) return false;
+                           ErrorSink onError, const std::string& deviceId,
+                           const std::string& encoderName, int avcProfile,
+                           CaptureOrientation orientation) {
+  if (running_.load() || !orientation.Valid()) return false;
+  RunConfig config;
+  config.orientation = orientation;
+  config.width = width;
+  config.height = height;
+  config.bitrate = bitrate;
+  config.iFrameMs = iFrameIntervalMs > 0 ? iFrameIntervalMs : 2000;
+  config.mime = mimeType ? mimeType : "video/avc";
+  config.front = frontCamera;
+  config.deviceId = deviceId;
+  config.encoderName = encoderName;
+  config.avcProfile = avcProfile;
+  config.osd = osdEnabled;
+  config.previewId = previewSurfaceId ? previewSurfaceId : config_.previewId;
+  return StartRun(config, std::move(sink), std::move(onError), true);
+}
+
+bool CameraStreamer::StartRun(RunConfig config, FrameSink sink, ErrorSink onError,
+                              bool allowOsdFallback) {
   {
     std::lock_guard<std::mutex> lk(stateMu_);
     sink_ = std::move(sink);
     onError_ = std::move(onError);
   }
-  std::string mime = mimeType != nullptr ? mimeType : "video/avc";
-  lastWidth_ = width;
-  lastHeight_ = height;
-  lastBitrate_ = bitrate;
-  lastIFrameMs_ = iFrameIntervalMs > 0 ? iFrameIntervalMs : 2000;
-  lastMime_ = mime;
-  lastFront_ = frontCamera;
-  lastOsd_ = osdEnabled;
-  if (previewSurfaceId != 0) {
-    pendingPreviewId_ = previewSurfaceId;
-    hasPendingPreview_ = true;
-  }
+  const int width = config.width, height = config.height;
   running_ = true;
 
-  Camera_ErrorCode err = OH_Camera_GetCameraManager(&manager_);
-  if (err != CAMERA_OK || manager_ == nullptr) {
-    Fail("GetCameraManager", err);
+  const bool useDual = config.dualLayout != 0;
+  Camera_ErrorCode err = CAMERA_OK;
+  if (!useDual) err = OH_Camera_GetCameraManager(&manager_);
+  CameraProfiles lists(manager_);
+  auto fail = [&](const std::string& step, int code) {
+    Fail(step, code);
+    lists.Free();  // SDK lists must be freed before Cleanup releases manager_.
     Cleanup();
-    running_ = false;
     return false;
-  }
-
-  Camera_Device* devices = nullptr;
-  uint32_t devCount = 0;
-  err = OH_CameraManager_GetSupportedCameras(manager_, &devices, &devCount);
-  if (err != CAMERA_OK || devices == nullptr || devCount == 0) {
-    Fail("GetSupportedCameras", err);
-    Cleanup();
-    running_ = false;
-    return false;
-  }
-  Camera_Position wanted =
-      frontCamera ? CAMERA_POSITION_FRONT : CAMERA_POSITION_BACK;
-  Camera_Device* chosen = &devices[0];
-  for (uint32_t i = 0; i < devCount; ++i) {
-    if (devices[i].cameraPosition == wanted) {
-      chosen = &devices[i];
-      break;
-    }
-  }
-
-  // `chosen` borrows from `devices`, so these lists must stay alive until
-  // CreateCameraInput. They must be freed BEFORE Cleanup() deletes the
-  // manager: error paths call Free() first, and the destructor only acts while
-  // the manager is still alive (it references manager_, never a stale copy).
-  struct CameraListsGuard {
-    Camera_Manager*& mgr;
-    Camera_Device* devs;
-    uint32_t count;
-    Camera_OutputCapability* cap;
-    void Free() {
-      if (mgr != nullptr && devs != nullptr) {
-        OH_CameraManager_DeleteSupportedCameras(mgr, devs, count);
-      }
-      if (mgr != nullptr && cap != nullptr) {
-        OH_CameraManager_DeleteSupportedCameraOutputCapability(mgr, cap);
-      }
-      devs = nullptr;
-      cap = nullptr;
-    }
-    ~CameraListsGuard() { Free(); }
   };
-  CameraListsGuard lists{manager_, devices, devCount, nullptr};
-
-  Camera_OutputCapability* capability = nullptr;
-  err = OH_CameraManager_GetSupportedCameraOutputCapability(manager_, chosen, &capability);
-  lists.cap = capability;
-  if (err != CAMERA_OK || capability == nullptr || capability->previewProfilesSize == 0) {
-    Fail("GetSupportedCameraOutputCapability", err);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
+  const Camera_Device* chosen = nullptr;
+  Camera_Profile profile{};
+  if (!useDual) {
+    if (err != CAMERA_OK || !manager_) return fail("GetCameraManager", err);
+    const char* step = nullptr;
+    err = lists.Load(config.front, step, config.deviceId);
+    if (err != CAMERA_OK) return fail(step, err);
+    const Camera_Profile* exact = lists.Exact(width, height);
+    if (!exact) return fail("Unsupported preview resolution " + std::to_string(width) + "x" +
+                            std::to_string(height), CAMERA_INVALID_ARGUMENT);
+    chosen = lists.Device();  // borrowed through CreateCameraInput
+    profile = *exact;
+    config.deviceId = chosen->cameraId;
   }
-  // Pick the preview profile closest to the requested size (prefer >=).
-  Camera_Profile profile = *capability->previewProfiles[0];
-  long bestScore = -1;
-  for (uint32_t i = 0; i < capability->previewProfilesSize; ++i) {
-    const Camera_Profile* p = capability->previewProfiles[i];
-    long w = static_cast<long>(p->size.width);
-    long h = static_cast<long>(p->size.height);
-    long score = (w >= width && h >= height ? 0 : 1000000) + (w - width) * (w - width) +
-                 (h - height) * (h - height);
-    if (bestScore < 0 || score < bestScore) {
-      bestScore = score;
-      profile = *p;
-    }
+  bool requestCbr = false;
+  if (!CheckEncoderChoice(config.mime, config.encoderName, config.avcProfile, config.bitrate, requestCbr)) {
+    return fail("Unsupported encoder, bitrate or AVC profile", CAMERA_INVALID_ARGUMENT);
   }
-  encoder_ = OH_VideoEncoder_CreateByMime(mime.c_str());
-  if (encoder_ == nullptr) {
-    Fail("CreateVideoEncoder", 0);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  encoder_ = config.encoderName.empty() ? OH_VideoEncoder_CreateByMime(config.mime.c_str()) :
+      OH_VideoEncoder_CreateByName(config.encoderName.c_str());
+  if (!encoder_) return fail("CreateVideoEncoder", 0);
   OH_AVCodecCallback cb{};
   cb.onError = OnError;
   cb.onStreamChanged = OnStreamChanged;
   cb.onNeedInputBuffer = OnNeedInputBuffer;
   cb.onNewOutputBuffer = OnNewOutputBuffer;
   OH_AVErrCode aerr = OH_VideoEncoder_RegisterCallback(encoder_, cb, this);
-  if (aerr != AV_ERR_OK) {
-    Fail("EncoderRegisterCallback", aerr);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  if (aerr != AV_ERR_OK) return fail("EncoderRegisterCallback", aerr);
   // Pick the input path before configuring the encoder: the buffer (OSD) path
   // must declare its pixel format, the surface path must not (the format then
   // travels on the surface buffers, and an explicit buffer format makes the
@@ -281,10 +263,17 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   // so starting it here is independent of the encoder configuration below.
   uint64_t cameraSurfaceId = 0;
   bool osdOwnsPreview = false;
-  if (osdEnabled) {
+  const bool requirePixels = config.orientation.RequiresPixels();
+  if (config.osd || useDual || requirePixels) {
     osd_ = std::make_unique<OsdPipeline>();
+    if (useDual) {
+      dual_ = std::make_unique<DualCameraCapture>();
+      osd_->SetPreOverlay([capture = dual_.get()](uint8_t* frame, size_t bytes, int w, int h) {
+        return capture->Composite(frame, bytes, w, h);
+      });
+    }
     bool ok = osd_->Start(
-        width, height, hasPendingPreview_ ? pendingPreviewId_ : 0,
+        width, height, config.previewId,
         &cameraSurfaceId,
         [this](const uint8_t* nv12, size_t size) {
           std::lock_guard<std::mutex> lk(pendingMu_);
@@ -295,11 +284,16 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
         [](const std::string& err) {
           OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG, "osd: %{public}s",
                        err.c_str());
-        });
-    if (ok) {
-      // The pipeline owns the XComponent surface when one was handed over.
-      osdOwnsPreview = hasPendingPreview_ && pendingPreviewId_ != 0;
-      g_lastKnownRotation.store(osd_->rotation());
+        }, config.orientation);
+    if (ok && cameraSurfaceId != 0) {
+      osdOwnsPreview = config.previewId != 0;
+      if (!allowOsdFallback && osdOwnsPreview && !osd_->SetUiSurface(config.previewId)) {
+        return fail("Restore OSD preview", CAMERA_INVALID_ARGUMENT);
+      }
+      // Never feed a user's baked-in angle into a later raw recording.
+      if (!useDual && config.previewId && config.orientation.rotation == CaptureRotation::Auto) {
+        g_lastKnownRotation.store(osd_->rotation());
+      }
       // Already-rotated pixels: rotation metadata would double-rotate.
       orientation_.store(0);
       OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
@@ -308,6 +302,8 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
                    osd_->rotation(), osd_->OutWidth(), osd_->OutHeight(),
                    static_cast<unsigned long long>(cameraSurfaceId));
     } else {
+      if (useDual || requirePixels || !allowOsdFallback) return fail("Start OSD pipeline", CAMERA_INVALID_ARGUMENT);
+      config.osd = false;  // Preserve the actual path on later reconfiguration.
       OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, LOG_TAG,
                    "OSD pipeline init failed, streaming without OSD");
       osd_.reset();
@@ -326,14 +322,18 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   encW_ = encW;
   encH_ = encH;
   OH_AVFormat* format = OH_AVFormat_Create();
+  if (!format) return fail("CreateEncoderFormat", 0);
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_WIDTH, encW);
   OH_AVFormat_SetIntValue(format, OH_MD_KEY_HEIGHT, encH);
-  OH_AVFormat_SetIntValue(format, OH_MD_KEY_BITRATE, bitrate);
-  OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE, BITRATE_MODE_CBR);
+  // The SDK bitrate key is int64_t; I-frame interval is int32 milliseconds.
+  if (!OH_AVFormat_SetLongValue(format, OH_MD_KEY_BITRATE, config.bitrate) ||
+      !OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, config.iFrameMs) ||
+      (requestCbr && !OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_ENCODE_BITRATE_MODE, BITRATE_MODE_CBR)) ||
+      (config.avcProfile >= 0 && !OH_AVFormat_SetIntValue(format, OH_MD_KEY_PROFILE, config.avcProfile))) {
+    OH_AVFormat_Destroy(format);
+    return fail("Set encoder options", CAMERA_INVALID_ARGUMENT);
+  }
   OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE, 30.0);
-  // Unit is MILLISECONDS per the NDK header (an Android-style seconds value of
-  // 2 here would make every frame a keyframe).
-  OH_AVFormat_SetIntValue(format, OH_MD_KEY_I_FRAME_INTERVAL, lastIFrameMs_);
   if (cameraSurfaceId != 0) {
     // Buffer mode: pin the input layout to the tightly-packed NV12 the OSD
     // pipeline produces. Without this the codec falls back to its default
@@ -343,39 +343,46 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   }
   aerr = OH_VideoEncoder_Configure(encoder_, format);
   OH_AVFormat_Destroy(format);
-  if (aerr != AV_ERR_OK) {
-    Fail("EncoderConfigure", aerr);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
-  }
-  aerr = OH_VideoEncoder_Prepare(encoder_);
-  if (aerr != AV_ERR_OK) {
-    Fail("EncoderPrepare", aerr);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  if (aerr != AV_ERR_OK) return fail("EncoderConfigure", aerr);
   if (cameraSurfaceId == 0) {
     // Surface mode: camera renders into the encoder's producer surface.
     aerr = OH_VideoEncoder_GetSurface(encoder_, &window_);
-    if (aerr != AV_ERR_OK || window_ == nullptr) {
-      Fail("EncoderGetSurface", aerr);
-      lists.Free();
-      Cleanup();
-      running_ = false;
-      return false;
+    if (aerr != AV_ERR_OK || window_ == nullptr) return fail("EncoderGetSurface", aerr);
+  }
+  aerr = OH_VideoEncoder_Prepare(encoder_);
+  if (aerr != AV_ERR_OK) return fail("EncoderPrepare", aerr);
+  bufferInput_ = cameraSurfaceId != 0;
+  if (useDual) {
+    {
+      std::lock_guard<std::mutex> lk(pendingMu_);
+      freshInputOnly_ = true;
+    }
+    // Overlapping cameras cannot be inferred from two single-camera profiles.
+    // The dual owner opens both sessions using the pair's concurrent plan.
+    if (!dual_->Start(config.dualPlan, config.dualLayout, cameraSurfaceId, osd_->rotation())) {
+      return fail("Start concurrent cameras", CAMERA_INVALID_ARGUMENT);
+    }
+    // Wait before starting the buffer-input codec: dropping all early input
+    // callbacks while the second camera warms up could starve this encoder.
+    constexpr auto timeout = std::chrono::milliseconds(3000);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if (!dual_->WaitForComposite(timeout)) {
+      return fail("No composite from concurrent cameras", CAMERA_INVALID_ARGUMENT);
+    }
+    // Composite signals before OSD draws. Do not consume an input callback
+    // until at least the first finished frame has actually reached the slot.
+    std::unique_lock<std::mutex> lk(pendingMu_);
+    if (!pendingCv_.wait_until(lk, deadline, [this] { return hasPending_; })) {
+      lk.unlock();
+      return fail("No composite delivered to encoder input", CAMERA_INVALID_ARGUMENT);
     }
   }
+  if (formatSink_) formatSink_(encW, encH);
   aerr = OH_VideoEncoder_Start(encoder_);
-  if (aerr != AV_ERR_OK) {
-    Fail("EncoderStart", aerr);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
+  if (aerr != AV_ERR_OK) return fail("EncoderStart", aerr);
+  if (useDual) {
+    config_ = std::move(config);
+    return true;
   }
   uint64_t surfaceId = cameraSurfaceId;
   if (surfaceId == 0) {
@@ -385,67 +392,32 @@ bool CameraStreamer::Start(int width, int height, int bitrate, const char* mimeT
   snprintf(sidStr, sizeof(sidStr), "%llu", static_cast<unsigned long long>(surfaceId));
 
   err = OH_CameraManager_CreatePreviewOutput(manager_, &profile, sidStr, &preview_);
-  if (err != CAMERA_OK || preview_ == nullptr) {
-    Fail("CreatePreviewOutput", err);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  if (err != CAMERA_OK || preview_ == nullptr) return fail("CreatePreviewOutput", err);
   err = OH_CameraManager_CreateCameraInput(manager_, chosen, &input_);
-  if (err != CAMERA_OK || input_ == nullptr) {
-    Fail("CreateCameraInput", err);
-    lists.Free();
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  if (err != CAMERA_OK || input_ == nullptr) return fail("CreateCameraInput", err);
   lists.Free();
   err = OH_CameraInput_Open(input_);
-  if (err != CAMERA_OK) {
-    Fail("CameraInputOpen (permission?)", err);
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  if (err != CAMERA_OK) return fail("CameraInputOpen (permission?)", err);
   err = OH_CameraManager_CreateCaptureSession(manager_, &session_);
-  if (err != CAMERA_OK || session_ == nullptr) {
-    Fail("CreateCaptureSession", err);
-    Cleanup();
-    running_ = false;
-    return false;
-  }
-  uiProfile_ = profile;
+  if (err != CAMERA_OK || session_ == nullptr) return fail("CreateCaptureSession", err);
   err = OH_CaptureSession_BeginConfig(session_);
   if (err == CAMERA_OK) err = OH_CaptureSession_AddInput(session_, input_);
   if (err == CAMERA_OK) err = OH_CaptureSession_AddPreviewOutput(session_, preview_);
-  if (err == CAMERA_OK && hasPendingPreview_ && !osdOwnsPreview) {
-    char sidStr2[32];
-    snprintf(sidStr2, sizeof(sidStr2), "%llu",
-             static_cast<unsigned long long>(pendingPreviewId_));
-    err = OH_CameraManager_CreatePreviewOutput(manager_, &profile, sidStr2, &previewUi_);
-    if (err == CAMERA_OK && previewUi_ != nullptr) {
-      err = OH_CaptureSession_AddPreviewOutput(session_, previewUi_);
-    }
-    hasPendingPreview_ = false;
+  if (err == CAMERA_OK && config.previewId && !osdOwnsPreview) {
+    const std::string uiId = std::to_string(config.previewId);
+    err = OH_CameraManager_CreatePreviewOutput(manager_, &profile, uiId.c_str(), &previewUi_);
+    if (err == CAMERA_OK && !previewUi_) return fail("Create UI preview", CAMERA_INVALID_ARGUMENT);
+    if (err == CAMERA_OK) err = OH_CaptureSession_AddPreviewOutput(session_, previewUi_);
   }
   if (err == CAMERA_OK) err = OH_CaptureSession_CommitConfig(session_);
-  if (err != CAMERA_OK) {
-    Fail("CaptureSessionConfig", err);
-    Cleanup();
-    running_ = false;
-    return false;
-  }
+  if (err != CAMERA_OK) return fail("CaptureSessionConfig", err);
   err = OH_PreviewOutput_Start(preview_);
-  if (err != CAMERA_OK) {
-    Fail("PreviewOutputStart", err);
-    Cleanup();
-    running_ = false;
-    return false;
+  if (err != CAMERA_OK) return fail("PreviewOutputStart", err);
+  if (previewUi_) {
+    err = OH_PreviewOutput_Start(previewUi_);
+    if (err != CAMERA_OK) return fail("UI preview start", err);
   }
-  if (previewUi_ != nullptr) {
-    OH_PreviewOutput_Start(previewUi_);
-  }
+  config_ = std::move(config);  // Commit only after all outputs started.
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG,
                "camera streaming %{public}ux%{public}u -> encoder %{public}dx%{public}d",
                profile.size.width, profile.size.height, encW, encH);
@@ -463,8 +435,60 @@ bool CameraStreamer::SetTorch(bool on) {
   return true;
 }
 
-bool CameraStreamer::SwitchFacing() {
-  if (!running_.load()) return false;
+std::vector<std::pair<int, int>> CameraStreamer::AvailableResolutions() const {
+  if (!IsRunning() || DualLayout()) return {};
+  CameraProfiles profiles(manager_);
+  const char* step = nullptr;
+  if (profiles.Load(config_.front, step, config_.deviceId) != CAMERA_OK) return {};
+  return profiles.Resolutions();
+}
+
+CameraStreamer::ResizeResult CameraStreamer::ChangeResolution(int width, int height) {
+  if (!IsRunning()) return ResizeResult::Stopped;
+  if (DualLayout()) return ResizeResult::Rejected;
+  if (width == config_.width && height == config_.height) return ResizeResult::Unchanged;
+  {
+    CameraProfiles profiles(manager_);
+    const char* step = nullptr;
+    if (profiles.Load(config_.front, step, config_.deviceId) != CAMERA_OK ||
+        !profiles.Exact(width, height)) return ResizeResult::Rejected;
+  }
+  RunConfig next = config_;
+  next.width = width;
+  next.height = height;
+  return ReplaceRun(next);
+}
+
+CameraStreamer::ResizeResult CameraStreamer::SetDualLayout(int layout, const DualCameraPlan* plan) {
+  if (!IsRunning()) return ResizeResult::Stopped;
+  if (layout < 0 || layout > 3) return ResizeResult::Rejected;
+  RunConfig next = config_;
+  if (layout == 0) {
+    if (!config_.dualLayout) return ResizeResult::Unchanged;
+    next.dualPlan = {};
+  } else {
+    if (!plan && config_.dualLayout) plan = &config_.dualPlan;
+    if (!plan || plan->primaryId.empty() || plan->primaryId != config_.deviceId ||
+        plan->width != config_.width || plan->height != config_.height ||
+        plan->secondaryId.empty() || plan->primaryId == plan->secondaryId ||
+        plan->primaryType < 0 || plan->primaryType > 1 ||
+        plan->secondaryType < 0 || plan->secondaryType > 1 ||
+        plan->secondaryWidth <= 0 || plan->secondaryHeight <= 0 ||
+        ((plan->secondaryWidth | plan->secondaryHeight) & 1)) return ResizeResult::Rejected;
+    const auto& prev = config_.dualPlan;
+    if (layout == config_.dualLayout && plan->secondaryId == prev.secondaryId &&
+        plan->primaryType == prev.primaryType && plan->secondaryType == prev.secondaryType &&
+        plan->secondaryWidth == prev.secondaryWidth && plan->secondaryHeight == prev.secondaryHeight) {
+      return ResizeResult::Unchanged;
+    }
+    next.dualPlan = *plan;
+  }
+  next.dualLayout = layout;  // Keep single-camera osd, codec settings and latest preview id.
+  return ReplaceRun(next);
+}
+
+CameraStreamer::ResizeResult CameraStreamer::ReplaceRun(const RunConfig& next) {
+  const RunConfig previous = config_;
   FrameSink sink;
   ErrorSink onError;
   {
@@ -472,73 +496,71 @@ bool CameraStreamer::SwitchFacing() {
     sink = sink_;
     onError = onError_;
   }
-  bool next = !lastFront_;
   Stop();
-  return Start(lastWidth_, lastHeight_, lastBitrate_, lastMime_.c_str(), next,
-               lastIFrameMs_, pendingPreviewId_, lastOsd_, sink, onError);
+  if (StartRun(next, sink, onError, false)) return ResizeResult::Changed;
+  if (StartRun(previous, sink, onError, false)) return ResizeResult::Restored;
+  // Concurrency can disappear altogether (e.g. one lens became unavailable).
+  // If both dual layouts failed, try the pinned primary on its original path.
+  if (next.dualLayout && previous.dualLayout && next.dualLayout != previous.dualLayout) {
+    RunConfig single = previous;
+    single.dualLayout = 0;
+    single.dualPlan = {};
+    if (StartRun(single, sink, onError, false)) return ResizeResult::Restored;
+  }
+  return ResizeResult::Stopped;
+}
+
+bool CameraStreamer::SwitchFacing() {
+  if (!IsRunning() || DualLayout()) return false;
+  RunConfig next = config_;
+  next.front = !next.front;
+  {
+    CameraProfiles profiles(manager_);
+    const char* step = nullptr;
+    if (profiles.Load(next.front, step) != CAMERA_OK || !profiles.Exact(next.width, next.height)) {
+      return false;
+    }
+    next.deviceId = profiles.Device()->cameraId;
+  }
+  return ReplaceRun(next) == ResizeResult::Changed;
 }
 
 bool CameraStreamer::Restart() {
-  if (!running_.load()) return false;
-  FrameSink sink;
-  ErrorSink onError;
-  {
-    std::lock_guard<std::mutex> lk(stateMu_);
-    sink = sink_;
-    onError = onError_;
-  }
-  Stop();
-  return Start(lastWidth_, lastHeight_, lastBitrate_, lastMime_.c_str(), lastFront_,
-               lastIFrameMs_, pendingPreviewId_, lastOsd_, sink, onError);
+  return IsRunning() && ReplaceRun(config_) != ResizeResult::Stopped;
 }
 
 bool CameraStreamer::AttachPreview(uint64_t surfaceId) {
+  if (surfaceId == 0) {
+    config_.previewId = 0;
+    if (osd_) osd_->ClearUiSurface();
+    return true;
+  }
   if (osd_ != nullptr) {
     // OSD mode: the pipeline owns the local preview and adopts surfaces live
     // (switching pages destroys and recreates the XComponent), so no camera
     // restart is needed here. Keep the id pending so a later start without OSD
     // re-attaches the camera output to the same surface.
-    pendingPreviewId_ = surfaceId;
-    bool ok = osd_->SetUiSurface(surfaceId);
-    g_lastKnownRotation.store(osd_->rotation());
-    return ok;
-  }
-  if (previewUi_ != nullptr) {
-    // Keep the newest surface id — a later Restart/SwitchFacing must attach
-    // the recreated XComponent, not the stale one.
-    pendingPreviewId_ = surfaceId;
-    hasPendingPreview_ = true;
+    if (!osd_->SetUiSurface(surfaceId)) return false;
+    config_.previewId = surfaceId;
+    // Attaching a surface does not change the run's baked rotation. In
+    // particular, don't publish that angle as raw MP4 metadata here.
     return true;
   }
-  if (!running_.load() || session_ == nullptr || manager_ == nullptr) {
-    pendingPreviewId_ = surfaceId;
-    hasPendingPreview_ = true;
+  if (previewUi_ && config_.previewId == surfaceId) return true;
+  if (!IsRunning()) {
+    config_.previewId = surfaceId;
     return true;
   }
   // A live BeginConfig/CommitConfig reconfig breaks the encoder's surface
   // producer (frames stop). Restart the whole camera with both surfaces
   // configured in one pass instead.
-  FrameSink sink;
-  ErrorSink onError;
-  {
-    std::lock_guard<std::mutex> lk(stateMu_);
-    sink = sink_;
-    onError = onError_;
-  }
-  Stop();
-  pendingPreviewId_ = surfaceId;
-  hasPendingPreview_ = true;
-  return Start(lastWidth_, lastHeight_, lastBitrate_, lastMime_.c_str(), lastFront_,
-               lastIFrameMs_, surfaceId, lastOsd_, sink, onError);
+  RunConfig next = config_;
+  next.previewId = surfaceId;
+  return ReplaceRun(next) == ResizeResult::Changed;
 }
 
 void CameraStreamer::Stop() {
   if (!running_.exchange(false)) return;
-  {
-    std::lock_guard<std::mutex> lk(stateMu_);
-    sink_ = nullptr;
-    onError_ = nullptr;
-  }
   Cleanup();
   OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, "camera streaming stopped");
 }
